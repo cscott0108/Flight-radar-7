@@ -45,7 +45,7 @@ static float radarRangeKm = 100.0f;
 #define DEVICE_ADDR_1 0x30
 #define DEVICE_ADDR_2 0x5D
 
-#define LCD_BL_PIN 19
+#define LCD_BL_PIN 2
 
 volatile bool wifiConnectedEvent = false;
 bool wifiConnectedState = false;
@@ -936,11 +936,9 @@ void app_main()
     i2c_master_init();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    i2c_write_byte(0x30, 0x18);
-    i2c_write_byte(0x30, 0x10);
-
     gpio_reset_pin(LCD_BL_PIN);
     gpio_set_direction(LCD_BL_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LCD_BL_PIN, 1);
 
     waveshare_esp32_s3_rgb_lcd_init(); // Initialize the Waveshare ESP32-S3 RGB LCD
 

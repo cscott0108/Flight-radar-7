@@ -81,12 +81,12 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init()
             .pclk_hz = EXAMPLE_LCD_PIXEL_CLOCK_HZ, // Pixel clock frequency
             .h_res = EXAMPLE_LCD_H_RES, // Horizontal resolution
             .v_res = EXAMPLE_LCD_V_RES, // Vertical resolution
-            .hsync_pulse_width = 4, // Horizontal sync pulse width
-            .hsync_back_porch = 8, // Horizontal back porch
-            .hsync_front_porch = 8, // Horizontal front porch
-            .vsync_pulse_width = 4, // Vertical sync pulse width
-            .vsync_back_porch = 8, // Vertical back porch
-            .vsync_front_porch = 8, // Vertical front porch
+            .hsync_pulse_width = 48, // Horizontal sync pulse width
+            .hsync_back_porch = 40, // Horizontal back porch
+            .hsync_front_porch = 40, // Horizontal front porch
+            .vsync_pulse_width = 31, // Vertical sync pulse width
+            .vsync_back_porch = 13, // Vertical back porch
+            .vsync_front_porch = 1, // Vertical front porch
             .flags = {
                 .pclk_active_neg = 1, // Active low pixel clock
             },
