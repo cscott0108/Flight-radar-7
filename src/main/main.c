@@ -17,6 +17,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include <math.h>
+#include <time.h>
+#include <stdlib.h>
 
 #include "esp_sntp.h"
 
@@ -35,9 +37,51 @@ static float radarLat = 13.1993f;
 static float radarLon = 77.7067f;
 static float radarRangeKm = 100.0f;
 
+// OpenSky poll interval (seconds). 25s keeps the daily request count
+// comfortably under the 4000/day anonymous-credential ceiling.
+#define RADAR_REFRESH_DEFAULT_SEC 25
+#define RADAR_REFRESH_MIN_SEC 10
+#define RADAR_REFRESH_MAX_SEC 600
+
+// When fewer than this many aircraft were seen on the last poll, the poll
+// interval is stretched out to RADAR_LOW_TRAFFIC_INTERVAL_SEC instead, to
+// cut down on API calls during quiet periods. A threshold of 0 disables
+// this (the count can never be < 0, so the slow interval never applies).
+#define RADAR_LOW_TRAFFIC_THRESHOLD_DEFAULT 10
+#define RADAR_LOW_TRAFFIC_THRESHOLD_MIN 0
+#define RADAR_LOW_TRAFFIC_THRESHOLD_MAX 500
+
+#define RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC 60
+// Shares the same min/max as the normal refresh interval.
+
+// Optional day/night scheduling: uses a longer interval overnight, when
+// commercial air traffic is much lighter, and a shorter one during the
+// day. Disabled by default so existing single-interval behavior (above)
+// is unaffected unless explicitly turned on from the web UI. Requires
+// SNTP to have synced system time; falls back to the day interval if it
+// hasn't (see IsSystemTimeValid below).
+#define RADAR_DAY_START_HOUR_DEFAULT 6   // 6:00 local
+#define RADAR_DAY_END_HOUR_DEFAULT 22    // 22:00 local
+#define RADAR_DAY_INTERVAL_DEFAULT_SEC RADAR_REFRESH_DEFAULT_SEC
+#define RADAR_NIGHT_INTERVAL_DEFAULT_SEC 90
+
+// How often the Selected Craft panel is repainted from cached data.
+#define SELECTED_UI_REFRESH_MS 5000
+
+static volatile uint32_t radarRefreshSec = RADAR_REFRESH_DEFAULT_SEC;
+static volatile uint32_t radarLowTrafficThreshold = RADAR_LOW_TRAFFIC_THRESHOLD_DEFAULT;
+static volatile uint32_t radarLowTrafficIntervalSec = RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC;
+
+static volatile bool radarDayNightEnabled = false;
+static volatile int32_t radarUtcOffsetMinutes = 0;
+static volatile uint32_t radarDayStartHour = RADAR_DAY_START_HOUR_DEFAULT;
+static volatile uint32_t radarDayEndHour = RADAR_DAY_END_HOUR_DEFAULT;
+static volatile uint32_t radarDayIntervalSec = RADAR_DAY_INTERVAL_DEFAULT_SEC;
+static volatile uint32_t radarNightIntervalSec = RADAR_NIGHT_INTERVAL_DEFAULT_SEC;
+
 // #define I2C_MASTER_NUM              I2C_NUM_0
-#define I2C_MASTER_SDA_IO 15
-#define I2C_MASTER_SCL_IO 16
+#define I2C_MASTER_SDA_IO 19
+#define I2C_MASTER_SCL_IO 20
 // #define I2C_MASTER_FREQ_HZ         100000
 #define I2C_MASTER_TX_BUF_DISABLE 0
 #define I2C_MASTER_RX_BUF_DISABLE 0
@@ -164,15 +208,23 @@ void UpdateSelectedAircraftUI(void)
     Aircraft *a =
         Radar_GetSelectedAircraft();
 
-    if (!a)
-    {
-        return;
-    }
-
     lv_label_set_text_fmt(
         uic_LabelPlaneCount,
         "%d",
         gAircraftCount);
+
+    if (!a)
+    {
+        // No aircraft in range: blank the panel instead of leaving
+        // the last aircraft's details on screen.
+        lv_label_set_text(uic_LabelCraftName, "---");
+        lv_label_set_text(uic_LabelCraftOrigin, "---");
+        lv_label_set_text(uic_LabelCraftSpeed, "---");
+        lv_label_set_text(uic_LabelCraftAlt, "---");
+        lv_label_set_text(uic_LabelCraftHeading, "---");
+        lv_label_set_text(uic_LabelCraftCategory, "---");
+        return;
+    }
 
     lv_label_set_text(
         uic_LabelCraftName,
@@ -239,6 +291,11 @@ void setUICoords()
             uic_LabelCoords,
             buf);
 
+        if (showAircraftLabels)
+            lv_obj_add_state(ui_Switch3, LV_STATE_CHECKED);
+        else
+            lv_obj_clear_state(ui_Switch3, LV_STATE_CHECKED);
+
         ESP_LOGW("RADAR", "Radar settings updated in UI");
         lvgl_port_unlock();
     }
@@ -300,6 +357,326 @@ bool LoadRadarSettings(
     return e1 == ESP_OK &&
            e2 == ESP_OK &&
            e3 == ESP_OK;
+}
+
+static uint32_t ClampRefreshSeconds(
+    uint32_t seconds)
+{
+    if (seconds < RADAR_REFRESH_MIN_SEC)
+    {
+        return RADAR_REFRESH_MIN_SEC;
+    }
+
+    if (seconds > RADAR_REFRESH_MAX_SEC)
+    {
+        return RADAR_REFRESH_MAX_SEC;
+    }
+
+    return seconds;
+}
+
+static uint32_t ClampLowTrafficThreshold(
+    uint32_t count)
+{
+    if (count > RADAR_LOW_TRAFFIC_THRESHOLD_MAX)
+    {
+        return RADAR_LOW_TRAFFIC_THRESHOLD_MAX;
+    }
+
+    return count; // MIN is 0, so nothing can go below it.
+}
+
+static uint32_t ClampHourOfDay(
+    uint32_t hour)
+{
+    return (hour > 23) ? 23 : hour;
+}
+
+// Shared helper: NVS get/set for a single u32 setting under RADAR_NAMESPACE.
+static bool LoadRadarU32Setting(
+    const char *key,
+    uint32_t *value)
+{
+    nvs_handle_t handle;
+
+    if (nvs_open(
+            RADAR_NAMESPACE,
+            NVS_READONLY,
+            &handle) != ESP_OK)
+    {
+        return false;
+    }
+
+    uint32_t stored = 0;
+
+    esp_err_t err =
+        nvs_get_u32(
+            handle,
+            key,
+            &stored);
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        return false;
+    }
+
+    *value = stored;
+
+    return true;
+}
+
+static void SaveRadarU32Setting(
+    const char *key,
+    uint32_t value)
+{
+    nvs_handle_t handle;
+
+    if (nvs_open(
+            RADAR_NAMESPACE,
+            NVS_READWRITE,
+            &handle) == ESP_OK)
+    {
+        nvs_set_u32(
+            handle,
+            key,
+            value);
+
+        esp_err_t err = nvs_commit(handle);
+
+        ESP_LOGW(
+            "RADAR",
+            "Saving %s=%lu commit=%s",
+            key,
+            (unsigned long)value,
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+    }
+}
+
+uint32_t GetRadarRefreshSeconds(void)
+{
+    return radarRefreshSec;
+}
+
+void SaveRadarRefreshSeconds(
+    uint32_t seconds)
+{
+    SaveRadarU32Setting("refresh", seconds);
+}
+
+bool LoadRadarRefreshSeconds(
+    uint32_t *seconds)
+{
+    uint32_t stored = 0;
+
+    if (!LoadRadarU32Setting("refresh", &stored))
+    {
+        return false;
+    }
+
+    *seconds = ClampRefreshSeconds(stored);
+
+    ESP_LOGW(
+        "RADAR",
+        "Loaded refresh interval: %lus",
+        (unsigned long)*seconds);
+
+    return true;
+}
+
+void SetRadarRefreshSeconds(
+    uint32_t seconds)
+{
+    radarRefreshSec = ClampRefreshSeconds(seconds);
+
+    SaveRadarRefreshSeconds(radarRefreshSec);
+}
+
+uint32_t GetRadarLowTrafficThreshold(void)
+{
+    return radarLowTrafficThreshold;
+}
+
+uint32_t GetRadarLowTrafficIntervalSeconds(void)
+{
+    return radarLowTrafficIntervalSec;
+}
+
+void SetRadarLowTrafficThreshold(
+    uint32_t aircraftCount)
+{
+    radarLowTrafficThreshold = ClampLowTrafficThreshold(aircraftCount);
+
+    SaveRadarU32Setting("lowthresh", radarLowTrafficThreshold);
+}
+
+void SetRadarLowTrafficIntervalSeconds(
+    uint32_t seconds)
+{
+    radarLowTrafficIntervalSec = ClampRefreshSeconds(seconds);
+
+    SaveRadarU32Setting("lowint", radarLowTrafficIntervalSec);
+}
+
+bool GetRadarDayNightEnabled(void)
+{
+    return radarDayNightEnabled;
+}
+
+int32_t GetRadarUtcOffsetMinutes(void)
+{
+    return radarUtcOffsetMinutes;
+}
+
+uint32_t GetRadarDayStartHour(void)
+{
+    return radarDayStartHour;
+}
+
+uint32_t GetRadarDayEndHour(void)
+{
+    return radarDayEndHour;
+}
+
+uint32_t GetRadarDayIntervalSeconds(void)
+{
+    return radarDayIntervalSec;
+}
+
+uint32_t GetRadarNightIntervalSeconds(void)
+{
+    return radarNightIntervalSec;
+}
+
+// Clamps and applies the day/night schedule to the in-memory state only;
+// does not touch NVS. Used both by the public setter (which also
+// persists) and by the boot-time loader (which must not rewrite NVS with
+// the same values it just read back out of it on every single boot).
+static void ApplyRadarDayNightSchedule(
+    bool enabled,
+    int32_t utcOffsetMinutes,
+    uint32_t dayStartHour,
+    uint32_t dayEndHour,
+    uint32_t dayIntervalSec,
+    uint32_t nightIntervalSec)
+{
+    radarDayNightEnabled = enabled;
+
+    // Offsets run from UTC-12:00 to UTC+14:00 in real timezones.
+    if (utcOffsetMinutes < -720)
+    {
+        utcOffsetMinutes = -720;
+    }
+    else if (utcOffsetMinutes > 840)
+    {
+        utcOffsetMinutes = 840;
+    }
+
+    radarUtcOffsetMinutes = utcOffsetMinutes;
+    radarDayStartHour = ClampHourOfDay(dayStartHour);
+    radarDayEndHour = ClampHourOfDay(dayEndHour);
+    radarDayIntervalSec = ClampRefreshSeconds(dayIntervalSec);
+    radarNightIntervalSec = ClampRefreshSeconds(nightIntervalSec);
+}
+
+void SetRadarDayNightSchedule(
+    bool enabled,
+    int32_t utcOffsetMinutes,
+    uint32_t dayStartHour,
+    uint32_t dayEndHour,
+    uint32_t dayIntervalSec,
+    uint32_t nightIntervalSec)
+{
+    ApplyRadarDayNightSchedule(
+        enabled,
+        utcOffsetMinutes,
+        dayStartHour,
+        dayEndHour,
+        dayIntervalSec,
+        nightIntervalSec);
+
+    SaveRadarU32Setting("dnenabled", radarDayNightEnabled ? 1 : 0);
+    SaveRadarU32Setting("utcoff", (uint32_t)(radarUtcOffsetMinutes + 720)); // store as unsigned
+    SaveRadarU32Setting("daystart", radarDayStartHour);
+    SaveRadarU32Setting("dayend", radarDayEndHour);
+    SaveRadarU32Setting("dayint", radarDayIntervalSec);
+    SaveRadarU32Setting("nightint", radarNightIntervalSec);
+}
+
+// True once SNTP has plausibly synced. Before that, time(NULL) reads back
+// close to the epoch, which would otherwise be misread as the dead of
+// night on Jan 1 1970.
+static bool IsSystemTimeValid(
+    time_t now)
+{
+    return now > 1700000000; // ~Nov 2023; anything before this is unsynced.
+}
+
+static bool IsCurrentlyDaytime(
+    time_t now)
+{
+    struct tm utcTm;
+
+    gmtime_r(&now, &utcTm);
+
+    long localMinutesOfDay =
+        ((long)utcTm.tm_hour * 60 + utcTm.tm_min + radarUtcOffsetMinutes) % 1440;
+
+    if (localMinutesOfDay < 0)
+    {
+        localMinutesOfDay += 1440;
+    }
+
+    uint32_t localHour = (uint32_t)(localMinutesOfDay / 60);
+
+    if (radarDayStartHour <= radarDayEndHour)
+    {
+        return (localHour >= radarDayStartHour) && (localHour < radarDayEndHour);
+    }
+
+    // Day window wraps past midnight (e.g. start=20, end=6).
+    return (localHour >= radarDayStartHour) || (localHour < radarDayEndHour);
+}
+
+// Effective poll interval for the CURRENT cycle. Day/night scheduling (if
+// enabled) picks the base interval; the low-traffic threshold can then
+// stretch that base out further when few aircraft were seen on the last
+// poll, but never shortens it.
+static uint32_t GetEffectivePollIntervalSeconds(void)
+{
+    uint32_t baseInterval = radarRefreshSec;
+
+    if (radarDayNightEnabled)
+    {
+        time_t now = time(NULL);
+
+        if (IsSystemTimeValid(now))
+        {
+            baseInterval = IsCurrentlyDaytime(now) ?
+                radarDayIntervalSec : radarNightIntervalSec;
+        }
+        else
+        {
+            // Time not synced yet: default to the more frequent option so
+            // no traffic is missed during the startup window.
+            baseInterval = radarDayIntervalSec;
+        }
+    }
+
+    uint32_t threshold = radarLowTrafficThreshold;
+
+    if (threshold > 0 &&
+        (uint32_t)gAircraftCount < threshold)
+    {
+        uint32_t lowInterval = radarLowTrafficIntervalSec;
+
+        return (lowInterval > baseInterval) ? lowInterval : baseInterval;
+    }
+
+    return baseInterval;
 }
 
 float GetRadarLat(void)
@@ -414,7 +791,7 @@ void ConnectToWifi(
 
     ESP_ERROR_CHECK(
         esp_wifi_set_mode(
-            WIFI_MODE_STA));
+            WIFI_MODE_APSTA));
 
     ESP_ERROR_CHECK(
         esp_wifi_set_config(
@@ -563,6 +940,7 @@ void ScanWifiNetworks(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
 
     ESP_ERROR_CHECK(
         esp_event_handler_instance_register(
@@ -587,7 +965,15 @@ void ScanWifiNetworks(void)
         esp_wifi_init(&cfg));
 
     ESP_ERROR_CHECK(
-        esp_wifi_set_mode(WIFI_MODE_STA));
+        esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    wifi_config_t setup_ap_config = {0};
+    strcpy((char *)setup_ap_config.ap.ssid, "Flight-Radar-Setup");
+    setup_ap_config.ap.ssid_len = strlen("Flight-Radar-Setup");
+    setup_ap_config.ap.channel = 1;
+    setup_ap_config.ap.max_connection = 2;
+    setup_ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &setup_ap_config));
 
     ESP_ERROR_CHECK(
         esp_wifi_start());
@@ -624,6 +1010,10 @@ void ScanWifiNetworks(void)
         lv_obj_add_flag(
             uic_splash,
             LV_OBJ_FLAG_HIDDEN);
+
+        StartWebServer();
+        ESP_LOGI("WIFI", "Setup AP active. Open http://192.168.4.1");
+        return;
     }
 
     wifi_scan_config_t scan_config =
@@ -819,21 +1209,23 @@ static void ui_status_timer_cb(lv_timer_t *t)
                 "Has creds: %d",
                 OpenSky_HasCredentials());
 
-            if (!OpenSky_HasCredentials())
-            {
-                StartWebServer();
-            }
+            StartWebServer();
         }
         else
         {
             lv_label_set_text(
                 uic_LabelConnection,
-                "Disconnected");
+                "WiFi failed. Connect to Flight-Radar-Setup" );
 
             lv_obj_set_style_text_color(
                 uic_LabelConnection,
                 lv_palette_main(LV_PALETTE_RED),
                 LV_PART_MAIN);
+
+            StartWebServer();
+            ESP_LOGW(
+                "WIFI",
+                "Wi-Fi connection failed. Use Flight-Radar-Setup at http://192.168.4.1");
         }
     }
 }
@@ -888,21 +1280,38 @@ static void radar_update_timer_cb(void *pvParameters)
 
                 if (lvgl_port_lock(0))
                 {
-                    UpdateSelectedAircraftUI();
+                    // Re-index/re-pick the selection against the freshly
+                    // parsed gAircraft[] first, then paint it. Painting
+                    // before reconciling used a stale index.
                     Radar_ReconcileSelection();
+                    UpdateSelectedAircraftUI();
 
                     Radar_Refresh();
                     lvgl_port_unlock();
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(15000));
+
+        // Sleep in slices so a refresh interval changed from the web UI
+        // takes effect without waiting out the previous interval. The
+        // interval itself is stretched out when few aircraft were seen,
+        // to cut down on API calls during quiet periods.
+        uint32_t waitedMs = 0;
+        uint32_t effectiveIntervalSec = GetEffectivePollIntervalSeconds();
+
+        while (waitedMs < (effectiveIntervalSec * 1000))
+        {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            waitedMs += 250;
+        }
     }
 }
 
 static void RadarPredictTask(
     void *pvParameters)
 {
+    uint32_t selectedUiElapsedMs = 0;
+
     while (1)
     {
         Radar_PredictAircraft();
@@ -914,8 +1323,26 @@ static void RadarPredictTask(
         uint32_t ageSec =
             (now - lastApiUpdateMs) / 1000;
 
+        selectedUiElapsedMs += 250;
+
+        bool refreshSelected =
+            (selectedUiElapsedMs >= SELECTED_UI_REFRESH_MS);
+
+        if (refreshSelected)
+        {
+            selectedUiElapsedMs = 0;
+        }
+
         if (lvgl_port_lock(-1))
         {
+            if (refreshSelected)
+            {
+                // Cached-data refresh: no API call, just re-run the
+                // selection against gAircraft[] and repaint the panel.
+                Radar_ReconcileSelection();
+                UpdateSelectedAircraftUI();
+            }
+
             Radar_Refresh();
             lv_label_set_text_fmt(
                 uic_LabelAPIRefresh,
@@ -995,6 +1422,59 @@ void app_main()
         radarLon,
         radarRangeKm);
 
+    uint32_t storedRefresh = RADAR_REFRESH_DEFAULT_SEC;
+
+    if (LoadRadarRefreshSeconds(&storedRefresh))
+    {
+        radarRefreshSec = storedRefresh;
+    }
+    else
+    {
+        radarRefreshSec = RADAR_REFRESH_DEFAULT_SEC;
+    }
+
+    uint32_t storedLowThreshold = RADAR_LOW_TRAFFIC_THRESHOLD_DEFAULT;
+    uint32_t storedLowInterval = RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC;
+
+    if (LoadRadarU32Setting("lowthresh", &storedLowThreshold))
+    {
+        radarLowTrafficThreshold = ClampLowTrafficThreshold(storedLowThreshold);
+    }
+    else
+    {
+        radarLowTrafficThreshold = RADAR_LOW_TRAFFIC_THRESHOLD_DEFAULT;
+    }
+
+    if (LoadRadarU32Setting("lowint", &storedLowInterval))
+    {
+        radarLowTrafficIntervalSec = ClampRefreshSeconds(storedLowInterval);
+    }
+    else
+    {
+        radarLowTrafficIntervalSec = RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC;
+    }
+
+    uint32_t storedDayNightEnabled = 0;
+    uint32_t storedUtcOffset = 720; // encoded as offsetMinutes + 720
+    uint32_t storedDayStart = RADAR_DAY_START_HOUR_DEFAULT;
+    uint32_t storedDayEnd = RADAR_DAY_END_HOUR_DEFAULT;
+    uint32_t storedDayInterval = RADAR_DAY_INTERVAL_DEFAULT_SEC;
+    uint32_t storedNightInterval = RADAR_NIGHT_INTERVAL_DEFAULT_SEC;
+
+    LoadRadarU32Setting("dnenabled", &storedDayNightEnabled);
+    LoadRadarU32Setting("utcoff", &storedUtcOffset);
+    LoadRadarU32Setting("daystart", &storedDayStart);
+    LoadRadarU32Setting("dayend", &storedDayEnd);
+    LoadRadarU32Setting("dayint", &storedDayInterval);
+    LoadRadarU32Setting("nightint", &storedNightInterval);
+
+    ApplyRadarDayNightSchedule(
+        storedDayNightEnabled != 0,
+        (int32_t)storedUtcOffset - 720,
+        storedDayStart,
+        storedDayEnd,
+        storedDayInterval,
+        storedNightInterval);
     xTaskCreate(
         radar_update_timer_cb,
         "RadarTask",

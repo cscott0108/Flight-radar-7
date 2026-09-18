@@ -12,6 +12,7 @@
 #include "cJSON.h"
 
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 
 #define OPENSKY_NAMESPACE "opensky"
 
@@ -32,6 +33,12 @@ static size_t responseLength = 0;
 static size_t responseCapacity = 0;
 
 #define MAX_AIRCRAFT 200
+
+// An aircraft this low AND this slow is treated as parked/taxiing ground
+// clutter (or a ground vehicle broadcasting ADS-B) rather than a real
+// selectable target, even if OpenSky's own on_ground flag is missing.
+#define GROUND_ALTITUDE_THRESHOLD_M 15.0f  // ~49 ft
+#define GROUND_VELOCITY_THRESHOLD_MS 8.5f  // ~30.6 km/h
 
 Aircraft gAircraft[MAX_AIRCRAFT];
 int gAircraftCount = 0;
@@ -100,6 +107,9 @@ bool OpenSky_ParseAircraft(
         cJSON *hdg =
             cJSON_GetArrayItem(state, 10);
 
+        cJSON *onGround =
+            cJSON_GetArrayItem(state, 8);
+
         cJSON *alt =
             cJSON_GetArrayItem(state, 13);
         cJSON *category =
@@ -161,6 +171,24 @@ bool OpenSky_ParseAircraft(
 
         if (cJSON_IsNumber(alt))
             a->altitude = alt->valuedouble;
+
+        // Skip parked/taxiing aircraft and ground vehicles: OpenSky's
+        // on_ground flag when present, or (as a fallback for feeders that
+        // omit it) an aircraft reporting both near-zero altitude and a
+        // walking/taxi-speed ground velocity. A real airborne aircraft at
+        // low altitude still has substantial forward speed, so this
+        // combined check doesn't catch genuine low approaches.
+        bool reportedOnGround =
+            cJSON_IsBool(onGround) && cJSON_IsTrue(onGround);
+
+        bool looksParked =
+            (a->altitude <= GROUND_ALTITUDE_THRESHOLD_M) &&
+            (a->velocity <= GROUND_VELOCITY_THRESHOLD_MS);
+
+        if (reportedOnGround || looksParked)
+        {
+            continue;
+        }
 
         a->valid = true;
 
@@ -287,9 +315,10 @@ static bool RequestToken(void)
             .transport_type = HTTP_TRANSPORT_OVER_SSL,
             //.cert_pem = (const char *)isrgrootx1_pem_start,
             .crt_bundle_attach = esp_crt_bundle_attach,
-            .timeout_ms = 15000,
-            .buffer_size = 8192,
-            .buffer_size_tx = 4096,
+            .timeout_ms = 15000, // HTTP request timeout, NOT the poll interval.
+            // The poll interval lives in main.c (radarRefreshSec, web-configurable).
+            .buffer_size = 4096,
+            .buffer_size_tx = 2048,
         };
 
     esp_http_client_handle_t client =
@@ -310,12 +339,24 @@ static bool RequestToken(void)
         postBody,
         strlen(postBody));
 
-    if (esp_http_client_perform(
-            client) != ESP_OK)
+    esp_err_t request_err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+
+    if (request_err != ESP_OK)
     {
+        ESP_LOGE(TAG, "Token request failed: %s", esp_err_to_name(request_err));
         esp_http_client_cleanup(
             client);
 
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Token response status=%d", status);
+
+    if (status != 200)
+    {
+        ESP_LOGE(TAG, "Token request rejected: %s", responseBuffer);
+        esp_http_client_cleanup(client);
         return false;
     }
 
@@ -381,11 +422,23 @@ static bool EnsureToken(void)
 
 bool OpenSky_Init(void)
 {
+    if (responseBuffer != NULL)
+    {
+        free(responseBuffer);
+        responseBuffer = NULL;
+    }
+
+    accessToken[0] = '\0';
+    tokenExpiry = 0;
+
     responseCapacity = 65536;
 
-    responseBuffer =
-        malloc(
-            responseCapacity);
+    responseBuffer = heap_caps_malloc(
+        responseCapacity,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!responseBuffer)
+        responseBuffer = malloc(responseCapacity);
 
     if (!responseBuffer)
         return false;
@@ -403,11 +456,6 @@ bool OpenSky_HasCredentials(void)
         "clientId='%s'",
         clientId);
 
-    ESP_LOGI(
-        TAG,
-        "clientSecret='%s'",
-        clientSecret);
-
     return strlen(clientId) > 0 &&
            strlen(clientSecret) > 0;
 }
@@ -420,22 +468,12 @@ bool OpenSky_GetAircraftJson(
     char *buffer,
     size_t bufferSize)
 {
-    if (!EnsureToken())
-    {
-        ESP_LOGE(TAG, "Token unavailable");
-        return false;
-    }
+    bool authenticated = EnsureToken();
+    if (!authenticated)
+        ESP_LOGW(TAG, "OAuth unavailable; using anonymous OpenSky request");
 
     responseLength = 0;
     responseBuffer[0] = '\0';
-
-    char bearer[2200];
-
-    snprintf(
-        bearer,
-        sizeof(bearer),
-        "Bearer %s",
-        accessToken);
 
     char url[512];
 
@@ -459,9 +497,10 @@ bool OpenSky_GetAircraftJson(
             .transport_type = HTTP_TRANSPORT_OVER_SSL,
             //.cert_pem = (const char *)isrgrootx1_pem_start,
             .crt_bundle_attach = esp_crt_bundle_attach,
-            .timeout_ms = 15000,
-            .buffer_size = 8192,
-            .buffer_size_tx = 4096,
+            .timeout_ms = 15000, // HTTP request timeout, NOT the poll interval.
+            // The poll interval lives in main.c (radarRefreshSec, web-configurable).
+            .buffer_size = 4096,
+            .buffer_size_tx = 2048,
         };
 
     esp_http_client_handle_t client =
@@ -471,10 +510,12 @@ bool OpenSky_GetAircraftJson(
         client,
         HTTP_METHOD_GET);
 
-    esp_http_client_set_header(
-        client,
-        "Authorization",
-        bearer);
+    if (authenticated)
+    {
+        char bearer[2200];
+        snprintf(bearer, sizeof(bearer), "Bearer %s", accessToken);
+        esp_http_client_set_header(client, "Authorization", bearer);
+    }
 
     esp_err_t err =
         esp_http_client_perform(client);

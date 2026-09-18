@@ -10,6 +10,9 @@ Aircraft *Radar_GetSelectedAircraft(void);
 
 void Radar_ReconcileSelection(void);
 
+void Radar_SetAutoSelectClosest(bool enabled);
+bool Radar_GetAutoSelectClosest(void);
+
 void Radar_Init(void);
 
 void Radar_SetCenter(

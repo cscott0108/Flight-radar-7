@@ -2,6 +2,7 @@
 #include "main.h"
 
 #include <math.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -18,6 +19,17 @@ bool showAircraftLabels = true;
 char selectedIcao24[16] = "";
 
 int selectedAircraft = -1;
+static bool autoSelectClosest = false;
+
+static float AircraftDistanceKm(const Aircraft *aircraft)
+{
+    // Use the dead-reckoned position so auto-select-closest tracks aircraft
+    // between API polls rather than only at poll time.
+    float eastKm = (aircraft->predictedLon - radarCenterLon) *
+                   111.0f * cosf(radarCenterLat * 0.0174532925f);
+    float northKm = (aircraft->predictedLat - radarCenterLat) * 111.0f;
+    return sqrtf(eastKm * eastKm + northKm * northKm);
+}
 
 void Radar_ReconcileSelection(void)
 {
@@ -25,6 +37,25 @@ void Radar_ReconcileSelection(void)
     {
         selectedAircraft = -1;
         selectedIcao24[0] = '\0';
+        return;
+    }
+
+    if (autoSelectClosest)
+    {
+        int closest = 0;
+        float closestDistance = AircraftDistanceKm(&gAircraft[0]);
+        for (int i = 1; i < gAircraftCount; i++)
+        {
+            float distance = AircraftDistanceKm(&gAircraft[i]);
+            if (distance < closestDistance)
+            {
+                closest = i;
+                closestDistance = distance;
+            }
+        }
+
+        selectedAircraft = closest;
+        strcpy(selectedIcao24, gAircraft[closest].icao24);
         return;
     }
 
@@ -58,8 +89,6 @@ void Radar_ReconcileSelection(void)
     strcpy(
         selectedIcao24,
         gAircraft[0].icao24);
-
-    UpdateSelectedAircraftUI();
 }
 
 Aircraft *Radar_GetSelectedAircraft(void)
@@ -71,6 +100,17 @@ Aircraft *Radar_GetSelectedAircraft(void)
     }
 
     return &gAircraft[selectedAircraft];
+}
+
+void Radar_SetAutoSelectClosest(bool enabled)
+{
+    autoSelectClosest = enabled;
+    Radar_ReconcileSelection();
+}
+
+bool Radar_GetAutoSelectClosest(void)
+{
+    return autoSelectClosest;
 }
 
 void Radar_PredictAircraft(void)
@@ -485,7 +525,7 @@ static void radar_draw_cb(
                     LV_PALETTE_GREEN);
 
             label.font =
-                &lv_font_montserrat_12;
+                &lv_font_montserrat_14;
 
             lv_area_t txt_area =
                 {

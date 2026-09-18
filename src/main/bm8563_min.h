@@ -5,7 +5,9 @@
 #include <stdbool.h>
 
 #define BM8563_ADDR 0x51
+#ifndef I2C_MASTER_NUM
 #define I2C_MASTER_NUM I2C_NUM_0
+#endif
 
 esp_err_t bm8563_get_time(struct tm *timeinfo, bool *valid);
 esp_err_t bm8563_set_time(struct tm *timeinfo);
