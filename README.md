@@ -1,57 +1,57 @@
-# ESP32 Flight Radar - 7 Inch
+# ESP32 Flight Radar - 7 Inch Basic
 
-A real-time Flight Radar built using the **Elecrow 7-inch CrowPanel Advance HMI Display**. The project downloads live aircraft data from the **OpenSky Network API** and displays nearby aircraft on an animated radar with a touchscreen interface.
+A real-time Flight Radar built using the **Elecrow 7-inch CrowPanel Basic HMI Display**. The project downloads live aircraft data from the **OpenSky Network API** and displays nearby aircraft on an animated radar with a touchscreen interface. This is a fork of the project from Tech Talkie
 
 Support our open source projects:
 
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-29ABE0?logo=kofi&logoColor=white)](https://ko-fi.com/techtalkies)
+[!\[Ko-fi](https://img.shields.io/badge/Ko--fi-Support-29ABE0?logo=kofi\&logoColor=white)](https://ko-fi.com/techtalkies)
 
 Video tutorial:
 
-[![Youtube Video](https://img.youtube.com/vi/_Vu7CyQgKxw/0.jpg)](https://www.youtube.com/watch?v=_Vu7CyQgKxw)
+[!\[Youtube Video](https://img.youtube.com/vi/\_Vu7CyQgKxw/0.jpg)](https://www.youtube.com/watch?v=_Vu7CyQgKxw)
 
 ## Features
 
-- ✈️ Live aircraft tracking using the OpenSky Network API
-- 📡 Animated radar sweep
-- 🎯 Aircraft position prediction between API updates
-- 📱 7-inch capacitive touchscreen interface
-- 🛩️ Previous/Next aircraft selection
-- ⭐ Selected aircraft highlighting
-- 🏷️ Optional aircraft labels
-- 🌍 Configurable radar center coordinates
-- 📶 WiFi captive portal setup
-- 🔑 Secure API credential storage
-- 💾 Settings saved in NVS
-- ⚡ Built with ESP-IDF and LVGL
+* ✈️ Live aircraft tracking using the OpenSky Network API
+* 📡 Animated radar sweep
+* 🎯 Aircraft position prediction between API updates
+* 📱 7-inch capacitive touchscreen interface - Touch is not working on basic
+* 🛩️ Previous/Next aircraft selection - Touch is not working on basic
+* ⭐ Selected aircraft highlighting
+* 🏷️ Optional aircraft labels
+* 🌍 Configurable radar center coordinates - WebUI configurable
+* 📶 WiFi captive portal setup - WebUI configurable
+* 🔑 Secure API credential storage
+* 💾 Settings saved in NVS
+* ⚡ Built with ESP-IDF and LVGL
 
----
+\---
 
 ## Hardware
 
-- Elecrow CrowPanel Advance 7" ESP32-S3 HMI Display **V1.2**
-- 3D printed case
+* Elecrow CrowPanel Basic 7" ESP32-S3 HMI Display **V1.2**
+* 3D printed case
 
----
+\---
 
 ## Software
 
-- ESP-IDF
-- LVGL 8
-- SquareLine Studio
-- FreeRTOS
-- OpenSky Network REST API
+* ESP-IDF
+* LVGL 8
+* SquareLine Studio
+* FreeRTOS
+* OpenSky Network REST API
 
----
+\---
 
 ## Setup
 
-1. Go to the [Tech Talkies Flasher](https://techtalkies.github.io/flash.html) page.
-2. Select the Flight Radar V2
-3. Flash and enjoy!
+1. Download and install via esp-idf software.
+2. Flash and enjoy!
 
----
-## WiFi Configuration
+\---
+
+## WiFi Configuration (Touch not working use AP IP)
 
 WiFi setup is performed directly on the touchscreen. On the WiFi configuration page,
 
@@ -61,7 +61,7 @@ WiFi setup is performed directly on the touchscreen. On the WiFi configuration p
 
 The device will automatically connect to the configured network on future boots.
 
----
+\---
 
 ## OpenSky API Configuration
 
@@ -76,48 +76,49 @@ After connecting the device to WiFi:
 
 The credentials are securely stored in NVS and only need to be configured once. Reboot to start the radar.
 
----
+\---
 
 ## Radar Settings
 
-The following settings can be configured directly on the touchscreen:
+The following settings can be configured directly on the touchscreen (touch not working so this can be configured in the webui once connected to wifi or to AP.):
 
-- Latitude
-- Longitude
+* Latitude
+* Longitude
 
 These settings are automatically saved and restored after reboot.
 
----
+\---
 
 ## Screens
 
-- Live Radar
-- Aircraft Information
-- WiFi Setup
-- OpenSky API Configuration
-- Radar Settings
+* Live Radar - Working
+* Aircraft Information - Non functional due to touch issue.
+* WiFi Setup - Non functional due to touch issue.
+* OpenSky API Configuration - Non functional due to touch issue.
+* Radar Settings - Non functional due to touch issue.
 
----
+\---
 
 ## Roadmap
 
-- [ ] Touch aircraft selection
-- [ ] Aircraft trails
-- [ ] Aircraft icons by category
-- [ ] Day/Night themes
-- [ ] Adjustable radar range
-- [ ] Airport database
-- [ ] Aircraft search
-- [ ] Distance rings
-- [ ] ADS-B receiver support
-- [ ] Offline mode
+* \[ ] Touch aircraft selection
+* \[ ] Aircraft trails
+* \[ ] Aircraft icons by category
+* \[ ] Day/Night themes
+* \[ ] Adjustable radar range
+* \[ ] Airport database
+* \[ ] Aircraft search
+* \[ ] Distance rings
+* \[ ] ADS-B receiver support
+* \[ ] Offline mode
 
----
+\---
 
 ## License
 
 MIT License
 
----
+\---
 
 If you build one, I'd love to see it! Feel free to open an issue or submit a pull request with improvements.
+
