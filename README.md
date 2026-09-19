@@ -1,124 +1,138 @@
-# ESP32 Flight Radar - 7 Inch Basic
+# \# ESP32 Flight Radar - 7 Inch Basic
 
-A real-time Flight Radar built using the **Elecrow 7-inch CrowPanel Basic HMI Display**. The project downloads live aircraft data from the **OpenSky Network API** and displays nearby aircraft on an animated radar with a touchscreen interface. This is a fork of the project from Tech Talkie
+# 
 
-Support our open source projects:
+# A real-time Flight Radar built using the \*\*Elecrow 7-inch CrowPanel Basic HMI Display\*\*. The project downloads live aircraft data from the \*\*OpenSky Network API\*\* and displays nearby aircraft on an animated radar screen. 
 
-[!\[Ko-fi](https://img.shields.io/badge/Ko--fi-Support-29ABE0?logo=kofi\&logoColor=white)](https://ko-fi.com/techtalkies)
+# 
 
-Video tutorial:
+# This project is a heavily modified fork of the original flight radar by Tech Talkies.
 
-[!\[Youtube Video](https://img.youtube.com/vi/\_Vu7CyQgKxw/0.jpg)](https://www.youtube.com/watch?v=_Vu7CyQgKxw)
+# 
 
-## Features
+# \---
 
-* ✈️ Live aircraft tracking using the OpenSky Network API
-* 📡 Animated radar sweep
-* 🎯 Aircraft position prediction between API updates
-* 📱 7-inch capacitive touchscreen interface - Touch is not working on basic
-* 🛩️ Previous/Next aircraft selection - Touch is not working on basic
-* ⭐ Selected aircraft highlighting
-* 🏷️ Optional aircraft labels
-* 🌍 Configurable radar center coordinates - WebUI configurable
-* 📶 WiFi captive portal setup - WebUI configurable
-* 🔑 Secure API credential storage
-* 💾 Settings saved in NVS
-* ⚡ Built with ESP-IDF and LVGL
+# 
 
-\---
+# \## Key Features \& Major Updates
 
-## Hardware
+# 
 
-* Elecrow CrowPanel Basic 7" ESP32-S3 HMI Display **V1.2**
-* 3D printed case
+# \### 🌐 WebUI \& Display Management
 
-\---
+# \* \*\*Brightness Control:\*\* Full LCD backlight brightness adjustment accessible directly through the WebUI.
 
-## Software
+# \* \*\*Day \& Night Logic:\*\* Automatic day/night scheduling with configurable brightness levels based on local time.
 
-* ESP-IDF
-* LVGL 8
-* SquareLine Studio
-* FreeRTOS
-* OpenSky Network REST API
+# \* \*\*UTC Timezone Offset:\*\* Dynamic local time configuration specified via UTC minutes (e.g., PDT = `-420` mins, PST = `-480` mins).
 
-\---
+# \* \*\*Airfield Map Markers:\*\* Dedicated webpage setup to define custom map markers (red dots) for local airports and airfields on the radar view.
 
-## Setup
+# 
 
-1. Download and install via esp-idf software.
-2. Flash and enjoy!
+# \### 🎨 Aircraft Classification \& Visuals
 
-\---
+# \* \*\*Runway-Style Compass:\*\* Clean outer compass ring displaying compact 2-digit aviation headings (`36`, `09`, `18`, `27`).
 
-## WiFi Configuration (Touch not working use AP IP)
+# \* \*\*Replaced "Category" with "Craft Type":\*\* Replaced OpenSky's unreliable/empty `category` field with custom classification logic to explicitly identify and display Commercial, Emergency, Police, Military, or Private traffic.
 
-WiFi setup is performed directly on the touchscreen. On the WiFi configuration page,
+# \* \*\*Shape \& Color Hierarchy:\*\*
 
-1. Select your WiFi network.
-2. Enter the password using the on-screen keyboard.
-3. Save the settings.
+# &#x20; \* \*\*Private Aircraft:\*\* Small \*\*Hollow/Outline White Triangle\*\*
 
-The device will automatically connect to the configured network on future boots.
+# &#x20; \* \*\*Non-Private / Special Aircraft:\*\* Large \*\*Solid Triangle\*\* with color coding:
 
-\---
+# &#x20;   \* 🟠 \*\*Commercial:\*\* Orange
 
-## OpenSky API Configuration
+# &#x20;   \* 🟢 \*\*Military:\*\* Green
 
-An OpenSky Network account is required for live aircraft data. Create one and download the API credentials: https://opensky-network.org/
+# &#x20;   \* 🔵 \*\*Police:\*\* Blue
 
-After connecting the device to WiFi:
+# &#x20;   \* 🔴 \*\*Emergency Services:\*\* Red
 
-1. Note the IP address displayed in the status bar.
-2. Open that IP address in a web browser on the same network.
-3. Browse the downloaded API credentials file.
-4. Upload the credentials.
+# 
 
-The credentials are securely stored in NVS and only need to be configured once. Reboot to start the radar.
+# \### 🏷️ Custom Callsigns \& Registration Overrides
 
-\---
+# \* \*\*Default ICAO Pre-configurations:\*\* Built-in default lists for common US commercial airline codes, military prefixes, police units, and emergency services.
 
-## Radar Settings
+# \* \*\*Custom Commercial Prefixes:\*\* Manage custom airline prefixes via the WebUI (e.g., `AAL` for American, `JAL` for Japan Airlines) with support for up to \*\*50 custom codes\*\*.
 
-The following settings can be configured directly on the touchscreen (touch not working so this can be configured in the webui once connected to wifi or to AP.):
+# \* \*\*Custom Registration Overrides:\*\* Support for up to \*\*100 custom registration tail numbers\*\* with user-selectable classifications (Commercial, Military, Emergency, Police).
 
-* Latitude
-* Longitude
+# 
 
-These settings are automatically saved and restored after reboot.
+# \### ⚙️ Telemetry, Filtering \& Stability
 
-\---
+# \* \*\*Ground Traffic Filter:\*\* Filter out grounded aircraft (altitude 0m, speed below 25 km/h, or on-ground flags).
 
-## Screens
+# \* \*\*API Rate Limit Guard (429 Logic):\*\* Automatically detects HTTP 429 quota exhaustion, displays an on-screen rate-limit warning banner, and enters a \*\*1-hour backoff pause\*\* before retrying.
 
-* Live Radar - Working
-* Aircraft Information - Non functional due to touch issue.
-* WiFi Setup - Non functional due to touch issue.
-* OpenSky API Configuration - Non functional due to touch issue.
-* Radar Settings - Non functional due to touch issue.
+# \* \*\*Display Refresh \& Serial Debugger:\*\* Fixed screen refresh timing issues and added toggleable `Serial` debug logging for real-time payload inspection.
 
-\---
+# 
 
-## Roadmap
+# \---
 
-* \[ ] Touch aircraft selection
-* \[ ] Aircraft trails
-* \[ ] Aircraft icons by category
-* \[ ] Day/Night themes
-* \[ ] Adjustable radar range
-* \[ ] Airport database
-* \[ ] Aircraft search
-* \[ ] Distance rings
-* \[ ] ADS-B receiver support
-* \[ ] Offline mode
+# 
 
-\---
+# \## Hardware \& Software Stack
 
-## License
+# 
 
-MIT License
+# \* \*\*Hardware:\*\* Elecrow CrowPanel Basic 7" ESP32-S3 HMI Display (V1.2)
 
-\---
+# \* \*\*Framework:\*\* ESP-IDF / FreeRTOS
 
-If you build one, I'd love to see it! Feel free to open an issue or submit a pull request with improvements.
+# \* \*\*Graphics:\*\* LVGL 8 / TFT\_eSPI / SquareLine Studio
+
+# \* \*\*API:\*\* OpenSky Network REST API
+
+# 
+
+# \---
+
+# 
+
+# \## Configuration \& Usage
+
+# 
+
+# 1\. \*\*WiFi \& WebUI Setup:\*\* Connect to the captive portal AP on boot to set up local WiFi. Once connected, access the WebUI via the device's IP address.
+
+# 2\. \*\*OpenSky Credentials:\*\* Upload your OpenSky credentials through the WebUI to authorize API polling.
+
+# 3\. \*\*Radar \& Classification Setup:\*\* Use the WebUI to set your center latitude/longitude coordinates, timezone offsets, day/night schedules, and custom callsign/registration override rules.
+
+# 
+
+# \---
+
+# 
+
+# \## Roadmap
+
+# 
+
+# \* \[ ] Touch support implementation for CrowPanel Basic
+
+# \* \[ ] Manual helicopter override via WebUI (rendering hollow circles for private, solid circles for non-private)
+
+# \* \[ ] Aircraft trails and path history
+
+# \* \[ ] Distance rings and adjustable radar range
+
+# \* \[ ] ADS-B receiver hardware integration
+
+# 
+
+# \---
+
+# 
+
+# \## License
+
+# 
+
+# MIT License
 
