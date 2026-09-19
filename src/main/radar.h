@@ -29,3 +29,7 @@ void Radar_SweepTick(void);
 
 void Radar_PredictAircraft(void);
 extern bool showAircraftLabels;
+
+/* Offsets from radar center in pixels; shared by screen and WebUI preview. */
+bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLon,
+                           float radiusKm, int radiusPixels, int *x, int *y);

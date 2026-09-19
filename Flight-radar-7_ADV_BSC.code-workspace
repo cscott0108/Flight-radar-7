@@ -1,7 +1,7 @@
 {
 	"folders": [
 		{
-			"path": "."
+			"path": "src"
 		},
 		{
 			"path": "../../VSCode/Elecrow/crowpanel/basic/7_inch/firmware"

@@ -17,6 +17,8 @@
 #include "esp_system.h"
 #include "main.h"
 #include "radar.h"
+#include "web_rules.h"
+#include "web_airports.h"
 
 static const char *TAG = "WEBSERVER";
 static httpd_handle_t server_handle = NULL;
@@ -329,6 +331,42 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
         nightIntervalSec = (uint32_t)parsed;
     }
 
+    // Day/night BRIGHTNESS schedule - reuses the day window above, but is
+    // its own independent on/off switch from the polling schedule.
+    bool dayNightBrightnessEnabled = strstr(body, "daynight_brightness_enabled=on") != NULL;
+
+    char dayBrightnessText[24];
+    uint32_t dayBrightnessPercent = GetRadarDayBrightnessPercent();
+
+    if (FormValue(body, "day_brightness", dayBrightnessText, sizeof(dayBrightnessText)) &&
+        dayBrightnessText[0] != '\0')
+    {
+        end = NULL;
+        long parsed = strtol(dayBrightnessText, &end, 10);
+
+        if (end == dayBrightnessText || parsed < 1 || parsed > 100)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Day brightness must be between 1 and 100");
+
+        dayBrightnessPercent = (uint32_t)parsed;
+    }
+
+    char nightBrightnessText[24];
+    uint32_t nightBrightnessPercent = GetRadarNightBrightnessPercent();
+
+    if (FormValue(body, "night_brightness", nightBrightnessText, sizeof(nightBrightnessText)) &&
+        nightBrightnessText[0] != '\0')
+    {
+        end = NULL;
+        long parsed = strtol(nightBrightnessText, &end, 10);
+
+        if (end == nightBrightnessText || parsed < 1 || parsed > 100)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Night brightness must be between 1 and 100");
+
+        nightBrightnessPercent = (uint32_t)parsed;
+    }
+
     SetRadarSettings(latitude, longitude, range);
     SetRadarRefreshSeconds(refreshSeconds);
     SetRadarLowTrafficThreshold(lowThreshold);
@@ -340,9 +378,14 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
         dayEndHour,
         dayIntervalSec,
         nightIntervalSec);
+    SetRadarDayNightBrightnessSchedule(
+        dayNightBrightnessEnabled,
+        dayBrightnessPercent,
+        nightBrightnessPercent);
     Radar_SetAutoSelectClosest(strstr(body, "auto_closest=on") != NULL);
+    SetRadarOpenSkyDebugEnabled(strstr(body, "opensky_debug=on") != NULL);
 
-    char response[320];
+    char response[500];
     int len = 0;
 
     len += snprintf(response + len, sizeof(response) - len,
@@ -365,20 +408,66 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
             (unsigned long)GetRadarRefreshSeconds());
     }
 
+    if (GetRadarDayNightBrightnessEnabled())
+    {
+        len += snprintf(response + len, sizeof(response) - len,
+            "Day/night brightness on: %lu%% by day, %lu%% overnight (same %02lu:00-%02lu:00 window). ",
+            (unsigned long)GetRadarDayBrightnessPercent(),
+            (unsigned long)GetRadarNightBrightnessPercent(),
+            (unsigned long)GetRadarDayStartHour(),
+            (unsigned long)GetRadarDayEndHour());
+    }
+
     if (GetRadarLowTrafficThreshold() > 0)
     {
-        snprintf(response + len, sizeof(response) - len,
-            "Stretched to %lus when fewer than %lu aircraft are in range.",
+        len += snprintf(response + len, sizeof(response) - len,
+            "Stretched to %lus when fewer than %lu aircraft are in range. ",
             (unsigned long)GetRadarLowTrafficIntervalSeconds(),
             (unsigned long)GetRadarLowTrafficThreshold());
     }
     else
     {
+        len += snprintf(response + len, sizeof(response) - len,
+            "Low-traffic slowdown disabled. ");
+    }
+
+    if (GetRadarOpenSkyDebugEnabled())
+    {
         snprintf(response + len, sizeof(response) - len,
-            "Low-traffic slowdown disabled.");
+            "OpenSky field debug logging is ON &mdash; check the serial console.");
     }
 
     SendRedirectPage(req, response, 10);
+    return ESP_OK;
+}
+
+// Applies (and persists) a new backlight brightness. Called via fetch()
+// from the slider on the home page, so this responds with a short plain
+// text body rather than a full redirect page.
+static esp_err_t BrightnessHandler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > 64)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
+
+    char body[65];
+    int received = httpd_req_recv(req, body, req->content_len);
+    if (received <= 0)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed");
+    body[received] = '\0';
+
+    char brightnessText[24];
+    if (!FormValue(body, "brightness", brightnessText, sizeof(brightnessText)))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing brightness");
+
+    char *end = NULL;
+    long parsed = strtol(brightnessText, &end, 10);
+    if (end == brightnessText || parsed < 1 || parsed > 100)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Brightness must be between 1 and 100");
+
+    SetRadarBrightness((uint32_t)parsed);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
 
@@ -649,6 +738,8 @@ static esp_err_t RootHandler(
         "<html>"
         "<body>"
         "<h2>Flight Radar Setup</h2>"
+        "<p><a href='/rules'>Craft Type Rules and Current Aircraft</a></p>"
+        "<p><a href='/airports'>Add or Edit Airport Dots</a></p>"
         "<h3>Wi-Fi</h3>"
         "<form method='POST' action='/wifi'>"
         "<label>Network name <input name='ssid' maxlength='32'></label><br>"
@@ -681,9 +772,45 @@ static esp_err_t RootHandler(
         "Requires the device's clock to be synced over the network, which happens "
         "automatically once online; falls back to the day interval until then.</small><br>"
 
+        "<h4>Day/night brightness (optional)</h4>"
+        "<label><input name='daynight_brightness_enabled' type='checkbox'%s> Enable day/night brightness</label><br>"
+        "<label>Brightness during the day <input name='day_brightness' type='number' min='1' max='100' step='1' value='%lu'>%%</label><br>"
+        "<label>Brightness overnight <input name='night_brightness' type='number' min='1' max='100' step='1' value='%lu'>%%</label><br>"
+        "<small>Uses the same day/night hours configured above, independently of whether the polling "
+        "schedule is on. Overrides the manual slider below based on time of day; falls back to the "
+        "day brightness until the clock has synced.</small><br>"
+
         "<label><input name='auto_closest' type='checkbox'%s> Automatically select closest aircraft</label><br>"
+
+        "<h4>Debugging</h4>"
+        "<label><input name='opensky_debug' type='checkbox'%s> Log raw OpenSky fields for the selected aircraft</label><br>"
+        "<small>Dumps every field OpenSky's API returns (by index) for the Selected Craft aircraft to the "
+        "serial console on each poll. Turn this on to see what's available before wiring a new field into "
+        "the Selected Craft panel, then turn it back off &mdash; no reflash needed either way.</small><br>"
+
         "<button type='submit'>Save settings</button>"
         "</form>"
+
+        "<h2>Display</h2>"
+        "<label>Backlight brightness "
+        "<input id='brightness' name='brightness' type='range' min='1' max='100' step='1' value='%lu' "
+        "oninput=\"document.getElementById('brightnessValue').textContent=this.value;setBrightness(this.value);\">"
+        " <span id='brightnessValue'>%lu</span>%%</label><br>"
+        "<small>Applies immediately. Useful to turn down at night so it isn't blinding.</small>"
+        "<script>"
+        "let brightnessTimer=null;"
+        "function setBrightness(value){"
+        "if(brightnessTimer)clearTimeout(brightnessTimer);"
+        "brightnessTimer=setTimeout(function(){"
+        "fetch('/brightness',{"
+        "method:'POST',"
+        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+        "body:'brightness='+value"
+        "});"
+        "},150);"
+        "}"
+        "</script>"
+
         "<h2>OpenSky Credentials</h2>"
 
         "<p>Select credentials.json</p>"
@@ -743,7 +870,7 @@ static esp_err_t RootHandler(
         "</body>"
         "</html>";
 
-    char *html = malloc(6144);
+    char *html = malloc(8192);
 
     if (!html)
     {
@@ -763,7 +890,7 @@ static esp_err_t RootHandler(
 
     snprintf(
         html,
-        6144,
+        8192,
         htmlFormat,
         latStr,
         lonStr,
@@ -777,7 +904,13 @@ static esp_err_t RootHandler(
         (unsigned long)GetRadarDayEndHour(),
         (unsigned long)GetRadarDayIntervalSeconds(),
         (unsigned long)GetRadarNightIntervalSeconds(),
-        Radar_GetAutoSelectClosest() ? " checked" : "");
+        GetRadarDayNightBrightnessEnabled() ? " checked" : "",
+        (unsigned long)GetRadarDayBrightnessPercent(),
+        (unsigned long)GetRadarNightBrightnessPercent(),
+        Radar_GetAutoSelectClosest() ? " checked" : "",
+        GetRadarOpenSkyDebugEnabled() ? " checked" : "",
+        (unsigned long)GetRadarBrightness(),
+        (unsigned long)GetRadarBrightness());
 
     httpd_resp_set_type(
         req,
@@ -805,6 +938,7 @@ esp_err_t StartWebServer(void)
     // sizeable HTML responses. Bumped for headroom; this task is otherwise
     // idle most of the time so the extra RAM cost is worth the safety margin.
     config.stack_size = 8192;
+    config.max_uri_handlers = 16;
 
     if (httpd_start(
             &server_handle,
@@ -849,6 +983,13 @@ esp_err_t StartWebServer(void)
             .handler = DeleteCredentialsHandler,
             .user_ctx = NULL};
 
+    httpd_uri_t brightness_uri =
+        {
+            .uri = "/brightness",
+            .method = HTTP_POST,
+            .handler = BrightnessHandler,
+            .user_ctx = NULL};
+
     httpd_register_uri_handler(
     server_handle,
         &root_uri);
@@ -868,6 +1009,23 @@ esp_err_t StartWebServer(void)
     httpd_register_uri_handler(
     server_handle,
         &delete_credentials_uri);
+
+    httpd_register_uri_handler(
+    server_handle,
+        &brightness_uri);
+
+    if (WebRules_Register(server_handle) != ESP_OK)
+    {
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
+    if (WebAirports_Register(server_handle) != ESP_OK)
+    {
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(
         TAG,

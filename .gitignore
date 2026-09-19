@@ -1,0 +1,14 @@
+# Build output directory
+src/build/
+
+# VS Code directory settings
+.vscode/
+src/.vscode/
+
+# VS Code workspace configuration
+*.code-workspace
+
+# Dependency lock files and backups
+dependencies.lock
+src/dependencies.lock
+src/dependencies.lock.bak

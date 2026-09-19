@@ -8,7 +8,12 @@ idf_component_register(
         "lvgl_port.c"
         "bm8563_min.c"
         "opensky_client.c"
+        "custom_rules.c"
+        "airports.c"
+        "draw_aircraft.c"
         "webserver.c"
+        "web_rules.c"
+        "web_airports.c"
         "radar.c"
         ${SRC_UI}
     INCLUDE_DIRS 

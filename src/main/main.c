@@ -1,6 +1,7 @@
 #include "waveshare_rgb_lcd_port.h"
 #include "ui.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 #include "driver/i2c.h"
 #include <stdio.h>
@@ -26,6 +27,8 @@
 #include "opensky_client.h"
 #include "webserver.h"
 #include "radar.h"
+#include "custom_rules.h"
+#include "airports.h"
 
 #define MAX_WIFI_NETWORKS 30
 #define DEFAULT_SCAN_LIST_SIZE 30
@@ -79,6 +82,38 @@ static volatile uint32_t radarDayEndHour = RADAR_DAY_END_HOUR_DEFAULT;
 static volatile uint32_t radarDayIntervalSec = RADAR_DAY_INTERVAL_DEFAULT_SEC;
 static volatile uint32_t radarNightIntervalSec = RADAR_NIGHT_INTERVAL_DEFAULT_SEC;
 
+static volatile bool radarOpenSkyDebugEnabled = false;
+
+// Backlight brightness, driven as PWM over LEDC rather than a plain
+// digital on/off, so it can be dimmed instead of just switched. 1 is
+// used as the floor instead of 0 so the "off" end of the slider doesn't
+// leave the screen fully black with no obvious way back in from the
+// device itself.
+#define RADAR_BRIGHTNESS_DEFAULT 100
+#define RADAR_BRIGHTNESS_MIN 1
+#define RADAR_BRIGHTNESS_MAX 100
+
+#define BACKLIGHT_LEDC_TIMER LEDC_TIMER_0
+#define BACKLIGHT_LEDC_MODE LEDC_LOW_SPEED_MODE
+#define BACKLIGHT_LEDC_CHANNEL LEDC_CHANNEL_0
+#define BACKLIGHT_LEDC_DUTY_RES LEDC_TIMER_10_BIT // 0-1023
+#define BACKLIGHT_LEDC_FREQ_HZ 5000               // Above audible range, no visible flicker.
+
+static volatile uint32_t radarBrightnessPercent = RADAR_BRIGHTNESS_DEFAULT;
+
+// Optional day/night BRIGHTNESS schedule. Reuses the same day window
+// (start/end hour + UTC offset) already configured for the day/night
+// POLL interval above, rather than asking for a second copy of the same
+// three settings, but is enabled/applied independently of it - either
+// can be on without the other. When enabled, this overrides whatever the
+// manual brightness slider is set to, based on time of day.
+#define RADAR_DAY_BRIGHTNESS_DEFAULT 100
+#define RADAR_NIGHT_BRIGHTNESS_DEFAULT 25
+
+static volatile bool radarDayNightBrightnessEnabled = false;
+static volatile uint32_t radarDayBrightnessPercent = RADAR_DAY_BRIGHTNESS_DEFAULT;
+static volatile uint32_t radarNightBrightnessPercent = RADAR_NIGHT_BRIGHTNESS_DEFAULT;
+
 // #define I2C_MASTER_NUM              I2C_NUM_0
 #define I2C_MASTER_SDA_IO 19
 #define I2C_MASTER_SCL_IO 20
@@ -94,6 +129,7 @@ static volatile uint32_t radarNightIntervalSec = RADAR_NIGHT_INTERVAL_DEFAULT_SE
 volatile bool wifiConnectedEvent = false;
 bool wifiConnectedState = false;
 static uint32_t lastApiUpdateMs = 0;
+static lv_obj_t *rateLimitUiLabel = NULL;
 
 static void radar_sweep_timer_cb(
     lv_timer_t *t)
@@ -169,40 +205,6 @@ void SaveRadarSettings(
     }
 }
 
-static const char *GetCategoryName(
-    int category)
-{
-    switch (category)
-    {
-    case 2:
-        return "Light";
-
-    case 3:
-        return "Small";
-
-    case 4:
-        return "Large";
-
-    case 5:
-        return "Heavy Vortex";
-
-    case 6:
-        return "Heavy";
-
-    case 8:
-        return "Rotorcraft";
-
-    case 9:
-        return "Glider";
-
-    case 14:
-        return "UAV";
-
-    default:
-        return "Unknown";
-    }
-}
-
 void UpdateSelectedAircraftUI(void)
 {
     Aircraft *a =
@@ -268,8 +270,7 @@ void UpdateSelectedAircraftUI(void)
 
     lv_label_set_text(
         uic_LabelCraftCategory,
-        GetCategoryName(
-            a->category));
+        CustomType_Name(evaluateAircraftType(a->callsign, a->icao24)));
 }
 
 void setUICoords()
@@ -390,6 +391,68 @@ static uint32_t ClampHourOfDay(
     uint32_t hour)
 {
     return (hour > 23) ? 23 : hour;
+}
+
+// Forward declaration: defined further down (it needs IsCurrentlyDaytime,
+// which needs the day-window settings), but the day/night brightness
+// setter above needs to call it as soon as the schedule changes.
+static void UpdateDayNightBrightness(void);
+
+static uint32_t ClampBrightness(
+    uint32_t percent)
+{
+    if (percent < RADAR_BRIGHTNESS_MIN)
+    {
+        return RADAR_BRIGHTNESS_MIN;
+    }
+
+    if (percent > RADAR_BRIGHTNESS_MAX)
+    {
+        return RADAR_BRIGHTNESS_MAX;
+    }
+
+    return percent;
+}
+
+// Configures GPIO2 (LCD_BL_PIN) as an LEDC PWM output. Call once, early
+// at boot, before anything tries to set a duty cycle.
+static void InitBacklightPWM(void)
+{
+    ledc_timer_config_t timer =
+        {
+            .speed_mode = BACKLIGHT_LEDC_MODE,
+            .timer_num = BACKLIGHT_LEDC_TIMER,
+            .duty_resolution = BACKLIGHT_LEDC_DUTY_RES,
+            .freq_hz = BACKLIGHT_LEDC_FREQ_HZ,
+            .clk_cfg = LEDC_AUTO_CLK,
+        };
+
+    ledc_timer_config(&timer);
+
+    ledc_channel_config_t channel =
+        {
+            .gpio_num = LCD_BL_PIN,
+            .speed_mode = BACKLIGHT_LEDC_MODE,
+            .channel = BACKLIGHT_LEDC_CHANNEL,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = BACKLIGHT_LEDC_TIMER,
+            .duty = 0,
+            .hpoint = 0,
+        };
+
+    ledc_channel_config(&channel);
+}
+
+// Applies a brightness percentage (already clamped by the caller) to the
+// backlight's PWM duty cycle.
+static void ApplyBacklightDuty(
+    uint32_t percent)
+{
+    uint32_t maxDuty = (1u << BACKLIGHT_LEDC_DUTY_RES) - 1;
+    uint32_t duty = (percent * maxDuty) / 100;
+
+    ledc_set_duty(BACKLIGHT_LEDC_MODE, BACKLIGHT_LEDC_CHANNEL, duty);
+    ledc_update_duty(BACKLIGHT_LEDC_MODE, BACKLIGHT_LEDC_CHANNEL);
 }
 
 // Shared helper: NVS get/set for a single u32 setting under RADAR_NAMESPACE.
@@ -606,6 +669,80 @@ void SetRadarDayNightSchedule(
     SaveRadarU32Setting("nightint", radarNightIntervalSec);
 }
 
+bool GetRadarOpenSkyDebugEnabled(void)
+{
+    return radarOpenSkyDebugEnabled;
+}
+
+void SetRadarOpenSkyDebugEnabled(
+    bool enabled)
+{
+    radarOpenSkyDebugEnabled = enabled;
+
+    SaveRadarU32Setting("openskydbg", enabled ? 1 : 0);
+}
+
+uint32_t GetRadarBrightness(void)
+{
+    return radarBrightnessPercent;
+}
+
+void SetRadarBrightness(
+    uint32_t percent)
+{
+    radarBrightnessPercent = ClampBrightness(percent);
+
+    ApplyBacklightDuty(radarBrightnessPercent);
+
+    SaveRadarU32Setting("brightness", radarBrightnessPercent);
+}
+
+bool GetRadarDayNightBrightnessEnabled(void)
+{
+    return radarDayNightBrightnessEnabled;
+}
+
+uint32_t GetRadarDayBrightnessPercent(void)
+{
+    return radarDayBrightnessPercent;
+}
+
+uint32_t GetRadarNightBrightnessPercent(void)
+{
+    return radarNightBrightnessPercent;
+}
+
+// Clamps and applies the day/night brightness schedule to the in-memory
+// state only; does not touch NVS or the backlight itself. Mirrors the
+// Apply/Set split used for the day/night poll schedule above, for the
+// same reason: the boot-time loader must not rewrite NVS with the same
+// values it just read back out of it.
+static void ApplyRadarDayNightBrightness(
+    bool enabled,
+    uint32_t dayPercent,
+    uint32_t nightPercent)
+{
+    radarDayNightBrightnessEnabled = enabled;
+    radarDayBrightnessPercent = ClampBrightness(dayPercent);
+    radarNightBrightnessPercent = ClampBrightness(nightPercent);
+}
+
+void SetRadarDayNightBrightnessSchedule(
+    bool enabled,
+    uint32_t dayPercent,
+    uint32_t nightPercent)
+{
+    ApplyRadarDayNightBrightness(enabled, dayPercent, nightPercent);
+
+    SaveRadarU32Setting("brdnenabled", radarDayNightBrightnessEnabled ? 1 : 0);
+    SaveRadarU32Setting("daybri", radarDayBrightnessPercent);
+    SaveRadarU32Setting("nightbri", radarNightBrightnessPercent);
+
+    // Apply right away rather than waiting for the next periodic check,
+    // so toggling this on the web page gives immediate visual feedback.
+    UpdateDayNightBrightness();
+}
+
 // True once SNTP has plausibly synced. Before that, time(NULL) reads back
 // close to the epoch, which would otherwise be misread as the dead of
 // night on Jan 1 1970.
@@ -639,6 +776,45 @@ static bool IsCurrentlyDaytime(
 
     // Day window wraps past midnight (e.g. start=20, end=6).
     return (localHour >= radarDayStartHour) || (localHour < radarDayEndHour);
+}
+
+// Re-applies the backlight duty cycle from the day/night brightness
+// schedule, if enabled. Does NOT touch NVS or the manual brightness
+// setting - this only drives the PWM output directly, so it's safe to
+// call frequently (e.g. every few seconds from a background task)
+// without wearing out flash or fighting the manual slider's own saved
+// value. A no-op if the schedule is disabled.
+static void UpdateDayNightBrightness(void)
+{
+    if (!radarDayNightBrightnessEnabled)
+    {
+        return;
+    }
+
+    time_t now = time(NULL);
+    bool daytime;
+
+    if (IsSystemTimeValid(now))
+    {
+        daytime = IsCurrentlyDaytime(now);
+    }
+    else
+    {
+        // Time not synced yet: default to the day brightness so the
+        // screen isn't unexpectedly dim during the startup window.
+        daytime = true;
+    }
+
+    uint32_t desiredPercent = daytime ?
+        radarDayBrightnessPercent : radarNightBrightnessPercent;
+
+    static uint32_t lastAppliedPercent = UINT32_MAX;
+
+    if (desiredPercent != lastAppliedPercent)
+    {
+        ApplyBacklightDuty(desiredPercent);
+        lastAppliedPercent = desiredPercent;
+    }
 }
 
 // Effective poll interval for the CURRENT cycle. Day/night scheduling (if
@@ -1232,12 +1408,11 @@ static void ui_status_timer_cb(lv_timer_t *t)
 
 static void radar_update_timer_cb(void *pvParameters)
 {
-    static char json[65536];
-
     while (1)
     {
         if (wifiConnectedState &&
-            OpenSky_HasCredentials())
+            OpenSky_HasCredentials() &&
+            OpenSky_GetRateLimitSeconds() == 0)
         {
             float centerLat = radarLat;
             float centerLon = radarLon;
@@ -1264,30 +1439,30 @@ static void radar_update_timer_cb(void *pvParameters)
             float maxLon =
                 centerLon + lonDelta;
 
+            const char *json = NULL;
             if (OpenSky_GetAircraftJson(
                     minLat,
                     maxLat,
                     minLon,
                     maxLon,
-                    json,
-                    sizeof(json)))
+                    &json))
             {
-                OpenSky_ParseAircraft(json);
-
-                lastApiUpdateMs =
-                    xTaskGetTickCount() *
-                    portTICK_PERIOD_MS;
-
-                if (lvgl_port_lock(0))
+                if (OpenSky_ParseAircraft(json))
                 {
-                    // Re-index/re-pick the selection against the freshly
-                    // parsed gAircraft[] first, then paint it. Painting
-                    // before reconciling used a stale index.
-                    Radar_ReconcileSelection();
-                    UpdateSelectedAircraftUI();
+                    ESP_LOGI("OpenSky", "Aircraft in response: %d", gAircraftCount);
+                    lastApiUpdateMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-                    Radar_Refresh();
-                    lvgl_port_unlock();
+                    if (lvgl_port_lock(0))
+                    {
+                        Radar_ReconcileSelection();
+                        UpdateSelectedAircraftUI();
+                        Radar_Refresh();
+                        lvgl_port_unlock();
+                    }
+                }
+                else
+                {
+                    ESP_LOGE("OpenSky", "Aircraft JSON parse failed");
                 }
             }
         }
@@ -1333,8 +1508,26 @@ static void RadarPredictTask(
             selectedUiElapsedMs = 0;
         }
 
+        UpdateDayNightBrightness();
+
         if (lvgl_port_lock(-1))
         {
+            uint32_t cooldownSeconds = OpenSky_GetRateLimitSeconds();
+            if (rateLimitUiLabel) {
+                if (cooldownSeconds) {
+                    lv_obj_clear_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
+                    uint32_t minutes = (cooldownSeconds + 59) / 60;
+                    static uint32_t shownMinutes = UINT32_MAX;
+                    if (minutes != shownMinutes) {
+                        lv_label_set_text_fmt(rateLimitUiLabel,
+                            "OpenSky API call limit exceeded (HTTP 429)\nRetry in %lu min",
+                            (unsigned long)minutes);
+                        shownMinutes = minutes;
+                    }
+                } else {
+                    lv_obj_add_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
             if (refreshSelected)
             {
                 // Cached-data refresh: no API call, just re-run the
@@ -1363,9 +1556,12 @@ void app_main()
     i2c_master_init();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    gpio_reset_pin(LCD_BL_PIN);
-    gpio_set_direction(LCD_BL_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LCD_BL_PIN, 1);
+    // Backlight is driven via LEDC PWM (instead of a plain gpio_set_level
+    // on/off) so brightness can be adjusted from the web UI. Start at full
+    // brightness here so the screen is lit during panel/UI init; the saved
+    // brightness (if any) is applied further down once NVS is available.
+    InitBacklightPWM();
+    ApplyBacklightDuty(RADAR_BRIGHTNESS_DEFAULT);
 
     waveshare_esp32_s3_rgb_lcd_init(); // Initialize the Waveshare ESP32-S3 RGB LCD
 
@@ -1382,6 +1578,11 @@ void app_main()
 
     ESP_ERROR_CHECK(ret);
 
+    if (!CustomRules_Init())
+        ESP_LOGW("CRAFT_RULES", "Could not load one or more saved craft lists; built-in classification remains active");
+    if (!Airports_Init())
+        ESP_LOGW("AIRPORTS", "Could not load saved airport dots");
+
     // Lock the mutex due to the LVGL APIs are not thread-safe
     if (lvgl_port_lock(-1))
     {
@@ -1393,6 +1594,17 @@ void app_main()
 
         Radar_AttachToObject(
             uic_Imageradar);
+
+        rateLimitUiLabel = lv_label_create(uic_PanelRadar);
+        lv_obj_set_width(rateLimitUiLabel, 360);
+        lv_label_set_long_mode(rateLimitUiLabel, LV_LABEL_LONG_WRAP);
+        lv_obj_align(rateLimitUiLabel, LV_ALIGN_TOP_MID, 0, 5);
+        lv_obj_set_style_text_align(rateLimitUiLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_color(rateLimitUiLabel, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(rateLimitUiLabel, lv_color_hex(0xB00020), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(rateLimitUiLabel, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(rateLimitUiLabel, 6, LV_PART_MAIN);
+        lv_obj_add_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
 
         lv_timer_create(
             radar_sweep_timer_cb,
@@ -1475,6 +1687,41 @@ void app_main()
         storedDayEnd,
         storedDayInterval,
         storedNightInterval);
+
+    uint32_t storedDebug = 0;
+
+    if (LoadRadarU32Setting("openskydbg", &storedDebug))
+    {
+        radarOpenSkyDebugEnabled = (storedDebug != 0);
+    }
+
+    uint32_t storedBrightness = RADAR_BRIGHTNESS_DEFAULT;
+
+    if (LoadRadarU32Setting("brightness", &storedBrightness))
+    {
+        radarBrightnessPercent = ClampBrightness(storedBrightness);
+    }
+
+    ApplyBacklightDuty(radarBrightnessPercent);
+
+    uint32_t storedBrDnEnabled = 0;
+    uint32_t storedDayBrightness = RADAR_DAY_BRIGHTNESS_DEFAULT;
+    uint32_t storedNightBrightness = RADAR_NIGHT_BRIGHTNESS_DEFAULT;
+
+    LoadRadarU32Setting("brdnenabled", &storedBrDnEnabled);
+    LoadRadarU32Setting("daybri", &storedDayBrightness);
+    LoadRadarU32Setting("nightbri", &storedNightBrightness);
+
+    ApplyRadarDayNightBrightness(
+        storedBrDnEnabled != 0,
+        storedDayBrightness,
+        storedNightBrightness);
+
+    // If the schedule was on at last boot, apply it immediately rather
+    // than waiting for the RadarPredictTask's first pass. Falls back
+    // gracefully via IsSystemTimeValid if SNTP hasn't synced yet.
+    UpdateDayNightBrightness();
+
     xTaskCreate(
         radar_update_timer_cb,
         "RadarTask",

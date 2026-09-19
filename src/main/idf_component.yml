@@ -7,3 +7,6 @@ dependencies:
     public: true
 
   esp_lcd_touch_gt911: ^1
+
+  # ESP-IDF 6 removed its built-in json component; provide cJSON via the registry.
+  espressif/cjson: "^1.7.19"

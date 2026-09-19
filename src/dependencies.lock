@@ -1,31 +1,42 @@
 dependencies:
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
   espressif/esp_lcd_touch:
     dependencies: []
     source:
-      path: C:\Users\cscot\OneDrive\Documents\GitHub\Flight-radar-7\src\components\espressif__esp_lcd_touch
+      path: components/espressif__esp_lcd_touch
       type: local
     version: 1.1.2
   espressif/esp_lcd_touch_gt911:
     dependencies: []
     source:
-      path: C:\Users\cscot\OneDrive\Documents\GitHub\Flight-radar-7\src\components\espressif__esp_lcd_touch_gt911
+      path: components/espressif__esp_lcd_touch_gt911
       type: local
     version: 1.1.3
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 6.1.0
   lvgl/lvgl:
     dependencies: []
     source:
-      path: C:\Users\cscot\OneDrive\Documents\GitHub\Flight-radar-7\src\components\lvgl__lvgl
+      path: components/lvgl__lvgl
       type: local
     version: 8.4.0
 direct_dependencies:
+- espressif/cjson
 - espressif/esp_lcd_touch
 - espressif/esp_lcd_touch_gt911
 - idf
 - lvgl/lvgl
-manifest_hash: 057a15272db301d022a0e1e84cdefbf5054e530c9026481208cd1048c716253a
+manifest_hash: e04463435eacf99ca75419cea10dbdaa4fe7a4ad9ce6a24206019cc24f3d4fdc
 target: esp32s3
-version: 2.0.0
+version: 3.0.0

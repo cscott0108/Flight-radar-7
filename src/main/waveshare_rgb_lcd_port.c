@@ -92,11 +92,20 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init()
             },
         },
         .data_width = EXAMPLE_RGB_DATA_WIDTH, // Data width for RGB
+#if ESP_IDF_VERSION_MAJOR >= 6
+        .in_color_format = LCD_COLOR_FMT_RGB565,
+        .out_color_format = LCD_COLOR_FMT_RGB565,
+#else
         .bits_per_pixel = EXAMPLE_RGB_BIT_PER_PIXEL, // Bits per pixel
+#endif
         .num_fbs = LVGL_PORT_LCD_RGB_BUFFER_NUMS, // Number of frame buffers
         .bounce_buffer_size_px = EXAMPLE_RGB_BOUNCE_BUFFER_SIZE, // Bounce buffer size in pixels
+#if ESP_IDF_VERSION_MAJOR >= 6
+        .dma_burst_size = 64,
+#else
         .sram_trans_align = 4, // SRAM transaction alignment
         .psram_trans_align = 64, // PSRAM transaction alignment
+#endif
         .hsync_gpio_num = EXAMPLE_LCD_IO_RGB_HSYNC, // GPIO number for horizontal sync
         .vsync_gpio_num = EXAMPLE_LCD_IO_RGB_VSYNC, // GPIO number for vertical sync
         .de_gpio_num = EXAMPLE_LCD_IO_RGB_DE, // GPIO number for data enable
@@ -175,7 +184,11 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init()
     // Register callbacks for RGB panel events
     esp_lcd_rgb_panel_event_callbacks_t cbs = {
 #if EXAMPLE_RGB_BOUNCE_BUFFER_SIZE > 0
+#if ESP_IDF_VERSION_MAJOR >= 6
+        .on_frame_buf_complete = rgb_lcd_on_vsync_event,
+#else
         .on_bounce_frame_finish = rgb_lcd_on_vsync_event, // Callback for bounce frame finish
+#endif
 #else
         .on_vsync = rgb_lcd_on_vsync_event, // Callback for vertical sync
 #endif

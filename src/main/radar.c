@@ -1,5 +1,7 @@
 #include "radar.h"
 #include "main.h"
+#include "draw_aircraft.h"
+#include "airports.h"
 
 #include <math.h>
 #include <string.h>
@@ -186,19 +188,17 @@ void Radar_SweepTick(void)
     }
 }
 
-static bool AircraftToRadar(
-    Aircraft *a,
-    int radiusPixels,
-    int *x,
-    int *y)
+bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLon,
+                           float radiusKm, int radiusPixels, int *x, int *y)
 {
+    if (!x || !y || !isfinite(lat) || !isfinite(lon) || !isfinite(centerLat) ||
+        !isfinite(centerLon) || !isfinite(radiusKm) || radiusKm <= 0 || radiusPixels <= 0)
+        return false;
     float dx =
-        a->predictedLon -
-        radarCenterLon;
+        lon - centerLon;
 
     float dy =
-        a->predictedLat -
-        radarCenterLat;
+        lat - centerLat;
 
     float kmPerDegLat =
         111.0f;
@@ -206,7 +206,7 @@ static bool AircraftToRadar(
     float kmPerDegLon =
         111.0f *
         cosf(
-            radarCenterLat *
+            centerLat *
             3.14159265f /
             180.0f);
 
@@ -221,118 +221,104 @@ static bool AircraftToRadar(
             eastKm * eastKm +
             northKm * northKm);
 
-    if (distance > radarRadiusKm)
+    if (distance > radiusKm)
     {
         return false;
     }
 
     *x =
-        (int)((eastKm / radarRadiusKm) *
+        (int)((eastKm / radiusKm) *
               radiusPixels);
 
     *y =
-        (int)((-northKm / radarRadiusKm) *
+        (int)((-northKm / radiusKm) *
               radiusPixels);
 
     return true;
 }
 
-static void DrawAircraft(
+// Draws a two-digit compass heading label (e.g. "36" for North, meaning
+// 360 degrees / 10) at the given true bearing, just inside the outer
+// ring. Bearing follows compass convention (0=N, 90=E, 180=S, 270=W),
+// which is converted here into the math convention (0=East, CCW) used by
+// the rest of this file's trig, so it lines up with the sweep spokes.
+static void DrawCompassLabel(
     lv_draw_ctx_t *draw_ctx,
-    int x,
-    int y,
-    float heading,
-    bool selected)
+    int cx,
+    int cy,
+    int radius,
+    float bearingDeg,
+    const char *text)
 {
-    float h =
-        heading *
+    float rad =
+        (90.0f - bearingDeg) *
         0.0174532925f;
 
-    int size =
-        selected ? 8 : 6;
+    int labelRadius = radius - 14;
 
-    lv_color_t color =
-        selected
-            ? lv_palette_main(
-                  LV_PALETTE_YELLOW)
-            : lv_color_white();
+    int x =
+        cx +
+        (int)(cosf(rad) * labelRadius);
 
-    lv_point_t pts[3];
+    int y =
+        cy -
+        (int)(sinf(rad) * labelRadius);
 
-    pts[0].x =
-        x +
-        (int)(sinf(h) * size);
+    lv_draw_label_dsc_t label;
 
-    pts[0].y =
-        y -
-        (int)(cosf(h) * size);
+    lv_draw_label_dsc_init(&label);
 
-    pts[1].x =
-        x +
-        (int)(sinf(h + 2.5f) * size);
+    label.color =
+        lv_palette_main(
+            LV_PALETTE_GREEN);
 
-    pts[1].y =
-        y -
-        (int)(cosf(h + 2.5f) * size);
+    label.font = &lv_font_montserrat_12;
+    label.align = LV_TEXT_ALIGN_CENTER;
 
-    pts[2].x =
-        x +
-        (int)(sinf(h - 2.5f) * size);
+    lv_area_t area =
+        {
+            .x1 = x - 12,
+            .y1 = y - 7,
+            .x2 = x + 12,
+            .y2 = y + 7};
 
-    pts[2].y =
-        y -
-        (int)(cosf(h - 2.5f) * size);
-
-    lv_draw_line_dsc_t tri;
-
-    lv_draw_line_dsc_init(
-        &tri);
-
-    tri.color = color;
-    tri.width =
-        selected ? 3 : 2;
-
-    lv_draw_line(
+    lv_draw_label(
         draw_ctx,
-        &tri,
-        &pts[0],
-        &pts[1]);
+        &label,
+        &area,
+        text,
+        NULL);
+}
 
-    lv_draw_line(
+// LVGL's built-in Montserrat fonts only ship a regular weight (there is
+// no bold variant compiled in), so "bold" text is faked by drawing the
+// label twice, offset by one pixel horizontally. This thickens the
+// strokes enough to read as bold at this size without needing a new
+// font asset baked into the firmware.
+static void DrawBoldLabel(
+    lv_draw_ctx_t *draw_ctx,
+    lv_draw_label_dsc_t *dsc,
+    const lv_area_t *coords,
+    const char *text)
+{
+    lv_draw_label(
         draw_ctx,
-        &tri,
-        &pts[1],
-        &pts[2]);
+        dsc,
+        coords,
+        text,
+        NULL);
 
-    lv_draw_line(
+    lv_area_t shifted = *coords;
+
+    shifted.x1 += 1;
+    shifted.x2 += 1;
+
+    lv_draw_label(
         draw_ctx,
-        &tri,
-        &pts[2],
-        &pts[0]);
-
-    if (selected)
-    {
-        lv_draw_arc_dsc_t ring;
-
-        lv_draw_arc_dsc_init(
-            &ring);
-
-        ring.color = color;
-        ring.width = 2;
-
-        lv_point_t center =
-            {
-                .x = x,
-                .y = y};
-
-        lv_draw_arc(
-            draw_ctx,
-            &ring,
-            &center,
-            size + 6,
-            0,
-            360);
-    }
+        dsc,
+        &shifted,
+        text,
+        NULL);
 }
 
 static void radar_draw_cb(
@@ -407,6 +393,14 @@ static void radar_draw_cb(
         0,
         360);
 
+    // Compass headings, so it's clear which way the radar is pointing:
+    // N=36, E=09, S=18, W=27 (true bearing / 10, matching aviation
+    // heading-tape notation).
+    DrawCompassLabel(draw_ctx, cx, cy, radius, 0.0f, "36");
+    DrawCompassLabel(draw_ctx, cx, cy, radius, 90.0f, "09");
+    DrawCompassLabel(draw_ctx, cx, cy, radius, 180.0f, "18");
+    DrawCompassLabel(draw_ctx, cx, cy, radius, 270.0f, "27");
+
     lv_draw_line_dsc_t line;
 
     lv_draw_line_dsc_init(
@@ -473,6 +467,31 @@ static void radar_draw_cb(
             &p2);
     }
 
+    // Airports sit above the sweep and rings, but below aircraft icons.
+    size_t airportCount = Airports_Count();
+    for (size_t i = 0; i < airportCount; i++)
+    {
+        AirportMarker airport;
+        int px, py;
+        if (!Airports_Get(i, &airport) ||
+            !Radar_ProjectPosition(airport.latitude, airport.longitude,
+                                   radarCenterLat, radarCenterLon,
+                                   radarRadiusKm, radius, &px, &py))
+            continue;
+        int half = airport.diameter / 2;
+        lv_area_t dotArea = {
+            .x1 = cx + px - half, .y1 = cy + py - half,
+            .x2 = cx + px - half + airport.diameter - 1,
+            .y2 = cy + py - half + airport.diameter - 1
+        };
+        lv_draw_rect_dsc_t dot;
+        lv_draw_rect_dsc_init(&dot);
+        dot.bg_color = lv_color_hex(0xFF0000);
+        dot.bg_opa = LV_OPA_COVER;
+        dot.radius = LV_RADIUS_CIRCLE;
+        lv_draw_rect(draw_ctx, &dot, &dotArea);
+    }
+
     for (int i = 0;
          i < gAircraftCount;
          i++)
@@ -488,30 +507,19 @@ static void radar_draw_cb(
         int px;
         int py;
 
-        if (!AircraftToRadar(
-                a,
-                radius,
-                &px,
-                &py))
+        if (!Radar_ProjectPosition(a->predictedLat, a->predictedLon,
+                                   radarCenterLat, radarCenterLon,
+                                   radarRadiusKm, radius, &px, &py))
         {
             continue;
         }
-
-        lv_draw_rect_dsc_t dot;
-
-        lv_draw_rect_dsc_init(
-            &dot);
-
-        dot.bg_color =
-            lv_color_white();
-
-        dot.radius = 0;
 
         DrawAircraft(
             draw_ctx,
             cx + px,
             cy + py,
             a->heading,
+            evaluateAircraftType(a->callsign, a->icao24),
             i == selectedAircraft);
 
         if (showAircraftLabels && strlen(a->callsign) > 0)
@@ -534,12 +542,11 @@ static void radar_draw_cb(
                     .x2 = cx + px + 80,
                     .y2 = cy + py + 8};
 
-            lv_draw_label(
+            DrawBoldLabel(
                 draw_ctx,
                 &label,
                 &txt_area,
-                a->callsign,
-                NULL);
+                a->callsign);
         }
     }
 }

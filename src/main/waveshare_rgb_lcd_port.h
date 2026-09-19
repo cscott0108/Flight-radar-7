@@ -10,10 +10,11 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
 #include "esp_lcd_touch_gt911.h"
+#include "esp_idf_version.h"
 #include "lv_demos.h"
 #include "lvgl_port.h"
 
-#define CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911 1 // 1 initiates the touch, 0 closes the touch.
+#define CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911 0 // CrowPanel Basic has no working touch controller.
 
 #define I2C_MASTER_SCL_IO           20       /*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           19       /*!< GPIO number used for I2C master data  */

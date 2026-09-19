@@ -670,7 +670,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_height(ui_Label25, LV_SIZE_CONTENT);    /// 1
     lv_obj_set_x(ui_Label25, 10);
     lv_obj_set_y(ui_Label25, 2);
-    lv_label_set_text(ui_Label25, "Category");
+    lv_label_set_text(ui_Label25, "Craft Type");
     ui_object_set_themeable_style_property(ui_Label25, LV_PART_MAIN | LV_STATE_DEFAULT, LV_STYLE_TEXT_COLOR,
                                            _ui_theme_color_Gray);
     ui_object_set_themeable_style_property(ui_Label25, LV_PART_MAIN | LV_STATE_DEFAULT, LV_STYLE_TEXT_OPA,
