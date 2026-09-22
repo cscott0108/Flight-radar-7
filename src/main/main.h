@@ -73,3 +73,15 @@ void SetRadarDayNightBrightnessSchedule(
     bool enabled,
     uint32_t dayPercent,
     uint32_t nightPercent);
+
+// Idle dimming: overrides brightness to a near-off level after N minutes
+// with zero aircraft in range. Takes priority over the day/night
+// schedule and the manual slider.
+bool GetRadarIdleDimEnabled(void);
+uint32_t GetRadarIdleDimMinutes(void);
+uint32_t GetRadarIdleDimPercent(void);
+
+void SetRadarIdleDimSettings(
+    bool enabled,
+    uint32_t minutes,
+    uint32_t percent);

@@ -13,28 +13,11 @@ IRAM_ATTR static bool rgb_lcd_on_vsync_event(esp_lcd_panel_handle_t panel, const
 }
 
 #if CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911
-/**
- * @brief I2C master initialization
- */
-static esp_err_t i2c_master_init(void)
-{
-    int i2c_master_port = I2C_MASTER_NUM;
-
-    i2c_config_t i2c_conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-
-    // Configure I2C parameters
-    i2c_param_config(i2c_master_port, &i2c_conf);
-
-    // Install I2C driver
-    return i2c_driver_install(i2c_master_port, i2c_conf.mode, 0, 0, 0);
-}
+// (The bus itself is created once, centrally, in main.c's i2c_master_init()
+// using the new driver/i2c_master.h API - see i2c_bus.h. This file's own
+// legacy-driver copy of that setup was dead code: its only call site was
+// already commented out below, and it can't compile against the new
+// driver headers anyway, so it's been removed rather than migrated.)
 
 // GPIO initialization
 void gpio_init(void)
@@ -151,10 +134,25 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init()
 
     esp_lcd_panel_io_handle_t tp_io_handle = NULL; // Declare a handle for touch panel I/O
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG(); // Configure I2C for GT911 touch controller
-    tp_io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP;
+    // GT911's I2C address is set by the state of its own address-select pin
+    // at power-up (varies between individual units, even of the same board
+    // model): usually 0x5D, sometimes 0x14. Try the common address first;
+    // if the controller doesn't answer there, fall back to the other one
+    // rather than hard-coding a single address that only works for some
+    // units. ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG() already defaults dev_addr
+    // to the common 0x5D, so this is mostly documenting the choice.
+    tp_io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS;
+
+    // ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG() doesn't set this field at all,
+    // leaving it at 0. That was silently tolerated by the old I2C driver,
+    // but ESP-IDF v6.1's i2c_master_bus_add_device() validates it and
+    // rejects 0 outright ("invalid scl frequency"). 100kHz matches this
+    // board's own I2C_MASTER_FREQ_HZ and Elecrow's own example code path
+    // (Wire.begin() with no custom clock, i.e. the Arduino default).
+    tp_io_config.scl_speed_hz = I2C_MASTER_FREQ_HZ;
 
     ESP_LOGI(TAG, "Initialize I2C panel IO"); // Log I2C panel I/O initialization
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c((esp_lcd_i2c_bus_handle_t)I2C_MASTER_NUM, &tp_io_config, &tp_io_handle)); // Create new I2C panel I/O
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(gI2CBus, &tp_io_config, &tp_io_handle)); // Create new I2C panel I/O
 
     ESP_LOGI(TAG, "Initialize touch controller GT911"); // Log touch controller initialization
     const esp_lcd_touch_config_t tp_cfg = {
@@ -173,9 +171,35 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init()
         },
     };
     esp_err_t touch_err = esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_cfg, &tp_handle); // Create new I2C GT911 touch controller
+
+    if (touch_err != ESP_OK)
+    {
+        // Didn't answer at the common address - this board's GT911 units
+        // are known to vary here. Tear down and retry once at the backup
+        // address before giving up.
+        ESP_LOGW(TAG, "GT911 not responding at 0x%02X (%s); retrying at backup address 0x%02X",
+            ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS, esp_err_to_name(touch_err),
+            ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP);
+
+        if (tp_io_handle)
+        {
+            esp_lcd_panel_io_del(tp_io_handle);
+            tp_io_handle = NULL;
+        }
+
+        tp_io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP;
+
+        if (esp_lcd_new_panel_io_i2c(gI2CBus, &tp_io_config, &tp_io_handle) == ESP_OK)
+        {
+            touch_err = esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_cfg, &tp_handle);
+        }
+    }
+
     if (touch_err != ESP_OK) {
         ESP_LOGW(TAG, "GT911 touch unavailable (%s); continuing without touch", esp_err_to_name(touch_err));
         tp_handle = NULL;
+    } else {
+        ESP_LOGI(TAG, "GT911 touch initialized OK at I2C address 0x%02X", tp_io_config.dev_addr);
     }
 #endif // CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911
 
@@ -196,32 +220,6 @@ esp_err_t waveshare_esp32_s3_rgb_lcd_init()
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, NULL)); // Register event callbacks
 
     return ESP_OK; // Return success 
-}
-
-/******************************* Turn on the screen backlight **************************************/
-esp_err_t wavesahre_rgb_lcd_bl_on()
-{
-    //Configure CH422G to output mode 
-    uint8_t write_buf = 0x01;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x24, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
-
-    //Pull the backlight pin high to light the screen backlight 
-    write_buf = 0x1E;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x38, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
-    return ESP_OK;
-}
-
-/******************************* Turn off the screen backlight **************************************/
-esp_err_t wavesahre_rgb_lcd_bl_off()
-{
-    //Configure CH422G to output mode 
-    uint8_t write_buf = 0x01;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x24, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
-
-    //Turn off the screen backlight by pulling the backlight pin low 
-    write_buf = 0x1A;
-    i2c_master_write_to_device(I2C_MASTER_NUM, 0x38, &write_buf, 1, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
-    return ESP_OK;
 }
 
 /******************************* Example code **************************************/

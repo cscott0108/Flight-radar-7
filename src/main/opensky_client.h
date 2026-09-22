@@ -13,7 +13,7 @@ typedef struct
     char callsign[16];
     char originCountry[64];
 
-    CustomType craftType;
+    CraftType craftType;
 
     float longitude;
     float latitude;

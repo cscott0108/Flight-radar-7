@@ -4,6 +4,7 @@
 #include "airports.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -290,6 +291,61 @@ static void DrawCompassLabel(
         NULL);
 }
 
+// Distance label for one range ring, placed a few pixels outside the
+// ring itself along a fixed bearing (northeast, between the N and E
+// compass labels) so all three read like a ruler from center to edge,
+// the way real radar displays annotate their range rings - rather than
+// scattering them around the circle where they'd clash with the
+// compass letters or the sweep line.
+static void DrawRangeLabel(
+    lv_draw_ctx_t *draw_ctx,
+    int cx,
+    int cy,
+    int ringRadius,
+    const char *text)
+{
+    const float bearingDeg = 45.0f;
+
+    float rad =
+        (90.0f - bearingDeg) *
+        0.0174532925f;
+
+    int labelRadius = ringRadius + 4;
+
+    int x =
+        cx +
+        (int)(cosf(rad) * labelRadius);
+
+    int y =
+        cy -
+        (int)(sinf(rad) * labelRadius);
+
+    lv_draw_label_dsc_t label;
+
+    lv_draw_label_dsc_init(&label);
+
+    label.color =
+        lv_palette_main(
+            LV_PALETTE_GREEN);
+
+    label.font = &lv_font_montserrat_12;
+    label.align = LV_TEXT_ALIGN_CENTER;
+
+    lv_area_t area =
+        {
+            .x1 = x - 18,
+            .y1 = y - 7,
+            .x2 = x + 18,
+            .y2 = y + 7};
+
+    lv_draw_label(
+        draw_ctx,
+        &label,
+        &area,
+        text,
+        NULL);
+}
+
 // LVGL's built-in Montserrat fonts only ship a regular weight (there is
 // no bold variant compiled in), so "bold" text is faked by drawing the
 // label twice, offset by one pixel horizontally. This thickens the
@@ -401,6 +457,23 @@ static void radar_draw_cb(
     DrawCompassLabel(draw_ctx, cx, cy, radius, 180.0f, "18");
     DrawCompassLabel(draw_ctx, cx, cy, radius, 270.0f, "27");
 
+    // Range-ring distance labels. The three rings are always drawn at
+    // 1/3, 2/3, and 3/3 (the full configured range) of the radar's
+    // radius - see the three lv_draw_arc calls above - so the labels
+    // are computed live from radarRadiusKm rather than hard-coded,
+    // and stay correct for whatever range the user has set.
+    char innerKmText[16];
+    char middleKmText[16];
+    char outerKmText[16];
+
+    snprintf(innerKmText, sizeof(innerKmText), "%.0f km", radarRadiusKm / 3.0f);
+    snprintf(middleKmText, sizeof(middleKmText), "%.0f km", radarRadiusKm * 2.0f / 3.0f);
+    snprintf(outerKmText, sizeof(outerKmText), "%.0f km", radarRadiusKm);
+
+    DrawRangeLabel(draw_ctx, cx, cy, radius / 3, innerKmText);
+    DrawRangeLabel(draw_ctx, cx, cy, radius * 2 / 3, middleKmText);
+    DrawRangeLabel(draw_ctx, cx, cy, radius, outerKmText);
+
     lv_draw_line_dsc_t line;
 
     lv_draw_line_dsc_init(
@@ -486,7 +559,7 @@ static void radar_draw_cb(
         };
         lv_draw_rect_dsc_t dot;
         lv_draw_rect_dsc_init(&dot);
-        dot.bg_color = lv_color_hex(0xFF0000);
+        dot.bg_color = lv_color_hex(airport.color);
         dot.bg_opa = LV_OPA_COVER;
         dot.radius = LV_RADIUS_CIRCLE;
         lv_draw_rect(draw_ctx, &dot, &dotArea);
@@ -514,12 +587,16 @@ static void radar_draw_cb(
             continue;
         }
 
+        /* One decision point: classification -> color, aircraft type -> shape. */
+        const CraftAppearance look =
+            ResolveAircraftAppearance(a->callsign, a->icao24);
+
         DrawAircraft(
             draw_ctx,
             cx + px,
             cy + py,
             a->heading,
-            evaluateAircraftType(a->callsign, a->icao24),
+            &look,
             i == selectedAircraft);
 
         if (showAircraftLabels && strlen(a->callsign) > 0)

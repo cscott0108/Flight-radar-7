@@ -8,6 +8,7 @@ idf_component_register(
         "lvgl_port.c"
         "bm8563_min.c"
         "opensky_client.c"
+        "craft_types.c"
         "custom_rules.c"
         "airports.c"
         "draw_aircraft.c"

@@ -4,7 +4,8 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
+#include "i2c_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_lcd_panel_ops.h"
@@ -14,7 +15,7 @@
 #include "lv_demos.h"
 #include "lvgl_port.h"
 
-#define CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911 0 // CrowPanel Basic has no working touch controller.
+#define CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_GT911 1 // GT911 present on this board's I2C bus (GPIO19/20); see waveshare_rgb_lcd_port.c for address-fallback notes.
 
 #define I2C_MASTER_SCL_IO           20       /*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           19       /*!< GPIO number used for I2C master data  */
@@ -72,9 +73,6 @@ bool example_lvgl_lock(int timeout_ms);
 void example_lvgl_unlock(void);
 
 esp_err_t waveshare_esp32_s3_rgb_lcd_init();
-
-esp_err_t wavesahre_rgb_lcd_bl_on();
-esp_err_t wavesahre_rgb_lcd_bl_off();
 
 void example_lvgl_demo_ui();
 

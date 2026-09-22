@@ -3,7 +3,8 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
+#include "i2c_bus.h"
 #include <stdio.h>
 
 #include "bm8563_min.h"
@@ -113,6 +114,22 @@ static volatile uint32_t radarBrightnessPercent = RADAR_BRIGHTNESS_DEFAULT;
 static volatile bool radarDayNightBrightnessEnabled = false;
 static volatile uint32_t radarDayBrightnessPercent = RADAR_DAY_BRIGHTNESS_DEFAULT;
 static volatile uint32_t radarNightBrightnessPercent = RADAR_NIGHT_BRIGHTNESS_DEFAULT;
+
+// Optional idle dimming: if no aircraft have been in range for at least
+// this many minutes, override whatever brightness would otherwise be
+// active (manual or day/night) and drop to a near-off level, since
+// there's nothing to look at. Takes priority over the day/night
+// schedule - an idle, aircraft-free screen dims regardless of time of
+// day - and restores immediately once an aircraft reappears.
+#define RADAR_IDLE_DIM_MINUTES_DEFAULT 15
+#define RADAR_IDLE_DIM_PERCENT_DEFAULT 1
+#define RADAR_IDLE_DIM_MINUTES_MIN 1
+#define RADAR_IDLE_DIM_MINUTES_MAX 1440 // 24 hours
+#define RADAR_IDLE_DIM_PERCENT_MAX 10   // deliberately capped low - this is a "nearly off" level, not a normal brightness setting
+
+static volatile bool radarIdleDimEnabled = false;
+static volatile uint32_t radarIdleDimMinutes = RADAR_IDLE_DIM_MINUTES_DEFAULT;
+static volatile uint32_t radarIdleDimPercent = RADAR_IDLE_DIM_PERCENT_DEFAULT;
 
 // #define I2C_MASTER_NUM              I2C_NUM_0
 #define I2C_MASTER_SDA_IO 19
@@ -270,7 +287,7 @@ void UpdateSelectedAircraftUI(void)
 
     lv_label_set_text(
         uic_LabelCraftCategory,
-        CustomType_Name(evaluateAircraftType(a->callsign, a->icao24)));
+        CraftType_Name(evaluateAircraftType(a->callsign, a->icao24)));
 }
 
 void setUICoords()
@@ -412,6 +429,33 @@ static uint32_t ClampBrightness(
     }
 
     return percent;
+}
+
+// Unlike the manual slider (which floors at RADAR_BRIGHTNESS_MIN so the
+// screen is never accidentally left un-recoverably dark), idle dimming
+// is explicitly allowed down to 0% - the whole point is "nothing to see,
+// turn it off" - but capped at a low ceiling since this isn't meant to
+// be used as a general brightness level.
+static uint32_t ClampIdleDimPercent(
+    uint32_t percent)
+{
+    return (percent > RADAR_IDLE_DIM_PERCENT_MAX) ? RADAR_IDLE_DIM_PERCENT_MAX : percent;
+}
+
+static uint32_t ClampIdleDimMinutes(
+    uint32_t minutes)
+{
+    if (minutes < RADAR_IDLE_DIM_MINUTES_MIN)
+    {
+        return RADAR_IDLE_DIM_MINUTES_MIN;
+    }
+
+    if (minutes > RADAR_IDLE_DIM_MINUTES_MAX)
+    {
+        return RADAR_IDLE_DIM_MINUTES_MAX;
+    }
+
+    return minutes;
 }
 
 // Configures GPIO2 (LCD_BL_PIN) as an LEDC PWM output. Call once, early
@@ -743,6 +787,45 @@ void SetRadarDayNightBrightnessSchedule(
     UpdateDayNightBrightness();
 }
 
+bool GetRadarIdleDimEnabled(void)
+{
+    return radarIdleDimEnabled;
+}
+
+uint32_t GetRadarIdleDimMinutes(void)
+{
+    return radarIdleDimMinutes;
+}
+
+uint32_t GetRadarIdleDimPercent(void)
+{
+    return radarIdleDimPercent;
+}
+
+static void ApplyRadarIdleDimSettings(
+    bool enabled,
+    uint32_t minutes,
+    uint32_t percent)
+{
+    radarIdleDimEnabled = enabled;
+    radarIdleDimMinutes = ClampIdleDimMinutes(minutes);
+    radarIdleDimPercent = ClampIdleDimPercent(percent);
+}
+
+void SetRadarIdleDimSettings(
+    bool enabled,
+    uint32_t minutes,
+    uint32_t percent)
+{
+    ApplyRadarIdleDimSettings(enabled, minutes, percent);
+
+    SaveRadarU32Setting("idledimen", radarIdleDimEnabled ? 1 : 0);
+    SaveRadarU32Setting("idledimmin", radarIdleDimMinutes);
+    SaveRadarU32Setting("idledimpct", radarIdleDimPercent);
+
+    UpdateDayNightBrightness();
+}
+
 // True once SNTP has plausibly synced. Before that, time(NULL) reads back
 // close to the epoch, which would otherwise be misread as the dead of
 // night on Jan 1 1970.
@@ -779,34 +862,92 @@ static bool IsCurrentlyDaytime(
 }
 
 // Re-applies the backlight duty cycle from the day/night brightness
-// schedule, if enabled. Does NOT touch NVS or the manual brightness
-// setting - this only drives the PWM output directly, so it's safe to
-// call frequently (e.g. every few seconds from a background task)
-// without wearing out flash or fighting the manual slider's own saved
-// value. A no-op if the schedule is disabled.
-static void UpdateDayNightBrightness(void)
+// schedule, if enabled; otherwise re-applies the manual slider's value
+// (so turning the schedule off snaps the backlight back to it instead of
+// leaving it stuck at whatever the schedule last set). Does NOT touch
+// NVS - this only drives the PWM output directly, so it's safe to call
+// frequently (e.g. every few seconds from a background task). A cached
+// "last applied" value keeps this from hammering the LEDC registers on
+// every call when nothing has actually changed.
+// Tracks how long gAircraftCount has been continuously zero, for the
+// idle-dim feature below. An explicit flag (rather than overloading 0 as
+// a sentinel on the timestamp) since 0 is a legitimately reachable tick
+// count - overloading it could make a streak that happens to start at
+// tick 0 perpetually re-anchor to "now" and never actually accumulate.
+static bool zeroAircraftStreakActive = false;
+static uint32_t zeroAircraftSinceMs = 0;
+
+static bool IsIdleDimActive(void)
 {
-    if (!radarDayNightBrightnessEnabled)
+    if (!radarIdleDimEnabled)
     {
-        return;
+        zeroAircraftStreakActive = false;
+        return false;
     }
 
-    time_t now = time(NULL);
-    bool daytime;
+    uint32_t nowMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    if (IsSystemTimeValid(now))
+    if (gAircraftCount == 0)
     {
-        daytime = IsCurrentlyDaytime(now);
+        if (!zeroAircraftStreakActive)
+        {
+            zeroAircraftStreakActive = true;
+            zeroAircraftSinceMs = nowMs;
+        }
     }
     else
     {
-        // Time not synced yet: default to the day brightness so the
-        // screen isn't unexpectedly dim during the startup window.
-        daytime = true;
+        zeroAircraftStreakActive = false;
+        return false;
     }
 
-    uint32_t desiredPercent = daytime ?
-        radarDayBrightnessPercent : radarNightBrightnessPercent;
+    // Unsigned subtraction wraps correctly even across a tick-count
+    // rollover (~49 days), since the actual elapsed idle time here is
+    // always far shorter than that.
+    uint32_t idleMs = nowMs - zeroAircraftSinceMs;
+
+    return idleMs >= (radarIdleDimMinutes * 60000UL);
+}
+
+// Applies whichever brightness source currently has priority:
+//   1. Idle dimming (0 aircraft for the configured number of minutes) -
+//      overrides everything else, since there's nothing to look at.
+//   2. Day/night schedule, if enabled.
+//   3. The manual slider, as the fallback / normal case.
+static void UpdateDayNightBrightness(void)
+{
+    uint32_t desiredPercent;
+
+    if (IsIdleDimActive())
+    {
+        desiredPercent = radarIdleDimPercent;
+    }
+    else if (radarDayNightBrightnessEnabled)
+    {
+        time_t now = time(NULL);
+        bool daytime;
+
+        if (IsSystemTimeValid(now))
+        {
+            daytime = IsCurrentlyDaytime(now);
+        }
+        else
+        {
+            // Time not synced yet: default to the day brightness so the
+            // screen isn't unexpectedly dim during the startup window.
+            daytime = true;
+        }
+
+        desiredPercent = daytime ?
+            radarDayBrightnessPercent : radarNightBrightnessPercent;
+    }
+    else
+    {
+        // Schedule is off: track the manual slider instead, so switching
+        // the schedule off snaps back to it rather than leaving the
+        // backlight stuck at whatever the schedule last applied.
+        desiredPercent = radarBrightnessPercent;
+    }
 
     static uint32_t lastAppliedPercent = UINT32_MAX;
 
@@ -1285,45 +1426,26 @@ void wifi_connect_btn_cb(
 }
 
 // I2C init
+i2c_master_bus_handle_t gI2CBus = NULL;
+
+// Creates the single shared I2C bus for this board (GPIO19/20) using the
+// new driver/i2c_master.h API. Every I2C device (BM8563 RTC, GT911 touch)
+// attaches to this same bus handle as a device - see i2c_bus.h for why
+// this can't be split across the old and new drivers on ESP-IDF v6+.
 void i2c_master_init()
 {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_MASTER_NUM,
         .sda_io_num = I2C_MASTER_SDA_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_io_num = I2C_MASTER_SCL_IO,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode,
-                                       I2C_MASTER_RX_BUF_DISABLE,
-                                       I2C_MASTER_TX_BUF_DISABLE, 0));
-}
 
-// Scan a specific I2C address to see if there is a response.
-bool i2c_scan_address(uint8_t address)
-{
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return ret == ESP_OK;
-}
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &gI2CBus));
 
-// Write a byte to a certain address
-esp_err_t i2c_write_byte(uint8_t device_addr, uint8_t data)
-{
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (device_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, data, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    ESP_ERROR_CHECK(bm8563_i2c_attach(gI2CBus));
 }
 
 static void ui_status_timer_cb(lv_timer_t *t)
@@ -1716,6 +1838,19 @@ void app_main()
         storedBrDnEnabled != 0,
         storedDayBrightness,
         storedNightBrightness);
+
+    uint32_t storedIdleDimEnabled = 0;
+    uint32_t storedIdleDimMinutes = RADAR_IDLE_DIM_MINUTES_DEFAULT;
+    uint32_t storedIdleDimPercent = RADAR_IDLE_DIM_PERCENT_DEFAULT;
+
+    LoadRadarU32Setting("idledimen", &storedIdleDimEnabled);
+    LoadRadarU32Setting("idledimmin", &storedIdleDimMinutes);
+    LoadRadarU32Setting("idledimpct", &storedIdleDimPercent);
+
+    ApplyRadarIdleDimSettings(
+        storedIdleDimEnabled != 0,
+        storedIdleDimMinutes,
+        storedIdleDimPercent);
 
     // If the schedule was on at last boot, apply it immediately rather
     // than waiting for the RadarPredictTask's first pass. Falls back

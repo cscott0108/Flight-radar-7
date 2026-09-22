@@ -367,6 +367,42 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
         nightBrightnessPercent = (uint32_t)parsed;
     }
 
+    // Idle dimming - dims below the day/night/manual brightness after N
+    // minutes with zero aircraft in range.
+    bool idleDimEnabled = strstr(body, "idle_dim_enabled=on") != NULL;
+
+    char idleDimMinutesText[24];
+    uint32_t idleDimMinutes = GetRadarIdleDimMinutes();
+
+    if (FormValue(body, "idle_dim_minutes", idleDimMinutesText, sizeof(idleDimMinutesText)) &&
+        idleDimMinutesText[0] != '\0')
+    {
+        end = NULL;
+        long parsed = strtol(idleDimMinutesText, &end, 10);
+
+        if (end == idleDimMinutesText || parsed < 1 || parsed > 1440)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Idle dim minutes must be between 1 and 1440");
+
+        idleDimMinutes = (uint32_t)parsed;
+    }
+
+    char idleDimPercentText[24];
+    uint32_t idleDimPercent = GetRadarIdleDimPercent();
+
+    if (FormValue(body, "idle_dim_percent", idleDimPercentText, sizeof(idleDimPercentText)) &&
+        idleDimPercentText[0] != '\0')
+    {
+        end = NULL;
+        long parsed = strtol(idleDimPercentText, &end, 10);
+
+        if (end == idleDimPercentText || parsed < 0 || parsed > 10)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Idle dim percent must be between 0 and 10");
+
+        idleDimPercent = (uint32_t)parsed;
+    }
+
     SetRadarSettings(latitude, longitude, range);
     SetRadarRefreshSeconds(refreshSeconds);
     SetRadarLowTrafficThreshold(lowThreshold);
@@ -382,10 +418,14 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
         dayNightBrightnessEnabled,
         dayBrightnessPercent,
         nightBrightnessPercent);
+    SetRadarIdleDimSettings(
+        idleDimEnabled,
+        idleDimMinutes,
+        idleDimPercent);
     Radar_SetAutoSelectClosest(strstr(body, "auto_closest=on") != NULL);
     SetRadarOpenSkyDebugEnabled(strstr(body, "opensky_debug=on") != NULL);
 
-    char response[500];
+    char response[600];
     int len = 0;
 
     len += snprintf(response + len, sizeof(response) - len,
@@ -416,6 +456,14 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
             (unsigned long)GetRadarNightBrightnessPercent(),
             (unsigned long)GetRadarDayStartHour(),
             (unsigned long)GetRadarDayEndHour());
+    }
+
+    if (GetRadarIdleDimEnabled())
+    {
+        len += snprintf(response + len, sizeof(response) - len,
+            "Idle dimming on: drops to %lu%% after %lu minutes with no aircraft in range. ",
+            (unsigned long)GetRadarIdleDimPercent(),
+            (unsigned long)GetRadarIdleDimMinutes());
     }
 
     if (GetRadarLowTrafficThreshold() > 0)
@@ -736,66 +784,82 @@ static esp_err_t RootHandler(
     const char htmlFormat[] =
         "<!DOCTYPE html>"
         "<html>"
+        "<head>"
+        "<style>"
+        "body{font-family:sans-serif;max-width:640px;margin:0 auto;padding:1em;line-height:1.5;color:#222;}"
+        "h2{border-bottom:2px solid #4CAF50;padding-bottom:4px;margin-top:1.2em;}"
+        "h3{margin-top:0;}"
+        "fieldset{border:1px solid #bbb;border-radius:6px;margin:1em 0;padding:0.6em 1em 1em;}"
+        "legend{font-weight:bold;padding:0 6px;}"
+        "details{border:1px solid #ddd;border-radius:6px;margin:0.8em 0;padding:0.2em 1em;}"
+        "details summary{cursor:pointer;font-weight:bold;padding:6px 0;}"
+        "label{display:block;margin:0.6em 0;}"
+        "input[type=number],input[type=text],input[type=password]{width:130px;}"
+        "small{color:#666;display:block;margin:2px 0 10px 0;}"
+        "button{margin:0.8em 0;padding:6px 16px;}"
+        "a{color:#2a7a2a;}"
+        "</style>"
+        "</head>"
         "<body>"
         "<h2>Flight Radar Setup</h2>"
-        "<p><a href='/rules'>Craft Type Rules and Current Aircraft</a></p>"
-        "<p><a href='/airports'>Add or Edit Airport Dots</a></p>"
+        "<p><a href='/rules'>Craft Types: Registry, Operators and Current Aircraft</a> &middot; "
+        "<a href='/airports'>Add or Edit Airport Dots</a></p>"
         "<h3>Wi-Fi</h3>"
         "<form method='POST' action='/wifi'>"
-        "<label>Network name <input name='ssid' maxlength='32'></label><br>"
-        "<label>Password <input name='password' type='password' maxlength='64'></label><br>"
+        "<label>Network name <input name='ssid' maxlength='32'></label>"
+        "<label>Password <input name='password' type='password' maxlength='64'></label>"
         "<button type='submit'>Save Wi-Fi</button>"
         "</form>"
-        "<h3>Radar location</h3>"
+        "<h3>Radar Settings</h3>"
         "<form method='POST' action='/radar'>"
-        "<label>Latitude <input name='latitude' type='number' step='any' min='-90' max='90' value='%s'></label><br>"
-        "<label>Longitude <input name='longitude' type='number' step='any' min='-180' max='180' value='%s'></label><br>"
-        "<label>Range <input name='range' type='number' step='any' min='1' max='5000' value='%s'> km</label><br>"
-        "<label>OpenSky refresh interval <input name='refresh' type='number' min='10' max='600' step='1' value='%lu'> seconds</label><br>"
-        "<small>10-600 s. Values below 25 s risk exceeding the 4000 requests/day API limit.</small><br>"
-
-        "<h4>Reduce polling when quiet</h4>"
+        "<fieldset><legend>Location &amp; range</legend>"
+        "<label>Latitude <input name='latitude' type='number' step='any' min='-90' max='90' value='%s'></label>"
+        "<label>Longitude <input name='longitude' type='number' step='any' min='-180' max='180' value='%s'></label>"
+        "<label>Range <input name='range' type='number' step='any' min='1' max='5000' value='%s'> km</label>"
+        "<label>OpenSky refresh interval <input name='refresh' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
+        "<small>10-600 s. Values below 25 s risk exceeding the 4000 requests/day API limit.</small>"
+        "</fieldset>"
+        "<details><summary>Reduce polling when quiet</summary>"
         "<label>Slow down to a longer interval when fewer than "
         "<input name='low_threshold' type='number' min='0' max='500' step='1' value='%lu'> "
-        "aircraft are in range</label><br>"
-        "<label>Slow interval <input name='low_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label><br>"
-        "<small>Set the threshold to 0 to disable this.</small><br>"
-
-        "<h4>Day/night schedule (optional)</h4>"
-        "<label><input name='daynight_enabled' type='checkbox'%s> Enable day/night schedule</label><br>"
-        "<label>UTC offset <input name='utc_offset' type='number' min='-720' max='840' step='1' value='%ld'> minutes (For PDT -7 is -420 min, PST -8 is -480 min)</label><br>"
-        "<label>Day starts at <input name='day_start' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label><br>"
-        "<label>Day ends at <input name='day_end' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label><br>"
-        "<label>Interval during the day <input name='day_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label><br>"
-        "<label>Interval overnight <input name='night_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label><br>"
-        "<small>When enabled, this replaces the refresh interval above during those hours. "
-        "Requires the device's clock to be synced over the network, which happens "
-        "automatically once online; falls back to the day interval until then.</small><br>"
-
-        "<h4>Day/night brightness (optional)</h4>"
-        "<label><input name='daynight_brightness_enabled' type='checkbox'%s> Enable day/night brightness</label><br>"
-        "<label>Brightness during the day <input name='day_brightness' type='number' min='1' max='100' step='1' value='%lu'>%%</label><br>"
-        "<label>Brightness overnight <input name='night_brightness' type='number' min='1' max='100' step='1' value='%lu'>%%</label><br>"
-        "<small>Uses the same day/night hours configured above, independently of whether the polling "
-        "schedule is on. Overrides the manual slider below based on time of day; falls back to the "
-        "day brightness until the clock has synced.</small><br>"
-
-        "<label><input name='auto_closest' type='checkbox'%s> Automatically select closest aircraft</label><br>"
-
-        "<h4>Debugging</h4>"
-        "<label><input name='opensky_debug' type='checkbox'%s> Log raw OpenSky fields for the selected aircraft</label><br>"
-        "<small>Dumps every field OpenSky's API returns (by index) for the Selected Craft aircraft to the "
-        "serial console on each poll. Turn this on to see what's available before wiring a new field into "
-        "the Selected Craft panel, then turn it back off &mdash; no reflash needed either way.</small><br>"
-
+        "aircraft are in range</label>"
+        "<label>Slow interval <input name='low_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
+        "<small>Set the threshold to 0 to disable this.</small>"
+        "</details>"
+        "<details><summary>Day/night polling schedule</summary>"
+        "<label><input name='daynight_enabled' type='checkbox'%s> Enable day/night schedule</label>"
+        "<label>UTC offset <input name='utc_offset' type='number' min='-720' max='840' step='1' value='%ld'> minutes (For PDT -7 is -420 min, PST -8 is -480 min)</label>"
+        "<label>Day starts at <input name='day_start' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label>"
+        "<label>Day ends at <input name='day_end' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label>"
+        "<label>Interval during the day <input name='day_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
+        "<label>Interval overnight <input name='night_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
+        "<small>When enabled, this replaces the refresh interval above during those hours. Requires the device's clock to be synced over the network, which happens automatically once online; falls back to the day interval until then.</small>"
+        "</details>"
+        "<details><summary>Day/night brightness</summary>"
+        "<label><input name='daynight_brightness_enabled' type='checkbox'%s> Enable day/night brightness</label>"
+        "<label>Brightness during the day <input name='day_brightness' type='number' min='1' max='100' step='1' value='%lu'>%%</label>"
+        "<label>Brightness overnight <input name='night_brightness' type='number' min='1' max='100' step='1' value='%lu'>%%</label>"
+        "<small>Uses the same day/night hours configured above, independently of whether the polling schedule is on. Overrides the manual slider below based on time of day; falls back to the day brightness until the clock has synced.</small>"
+        "</details>"
+        "<details><summary>Idle dimming</summary>"
+        "<label><input name='idle_dim_enabled' type='checkbox'%s> Dim when no aircraft are in range</label>"
+        "<label>After <input name='idle_dim_minutes' type='number' min='1' max='1440' step='1' value='%lu'> "
+        "minutes with zero aircraft in range</label>"
+        "<label>Dim to <input name='idle_dim_percent' type='number' min='0' max='10' step='1' value='%lu'>%%</label>"
+        "<small>Overrides the day/night brightness and the manual slider while idle; restores immediately once an aircraft reappears. 0%% turns the backlight fully off.</small>"
+        "</details>"
+        "<label><input name='auto_closest' type='checkbox'%s> Automatically select closest aircraft</label>"
+        "<details><summary>Debugging</summary>"
+        "<label><input name='opensky_debug' type='checkbox'%s> Log raw OpenSky fields for the selected aircraft</label>"
+        "<small>Dumps every field OpenSky's API returns (by index) for the Selected Craft aircraft to the serial console on each poll. Turn this on to see what's available before wiring a new field into the Selected Craft panel, then turn it back off &mdash; no reflash needed either way.</small>"
+        "</details>"
         "<button type='submit'>Save settings</button>"
         "</form>"
-
         "<h2>Display</h2>"
         "<label>Backlight brightness "
         "<input id='brightness' name='brightness' type='range' min='1' max='100' step='1' value='%lu' "
         "oninput=\"document.getElementById('brightnessValue').textContent=this.value;setBrightness(this.value);\">"
-        " <span id='brightnessValue'>%lu</span>%%</label><br>"
+        " <span id='brightnessValue'>%lu</span>%%</label>"
         "<small>Applies immediately. Useful to turn down at night so it isn't blinding.</small>"
         "<script>"
         "let brightnessTimer=null;"
@@ -810,36 +874,25 @@ static esp_err_t RootHandler(
         "},150);"
         "}"
         "</script>"
-
         "<h2>OpenSky Credentials</h2>"
-
         "<p>Select credentials.json</p>"
-
         "<form method='POST' "
         "action='/upload' "
         "enctype='application/octet-stream'>"
-
         "<input type='file' "
         "id='fileInput'>"
-
         "<button type='button' "
         "onclick='uploadFile()'>Upload</button>"
-
         "</form>"
-
         "<script>"
         "async function uploadFile(){"
-
         "const file="
         "document.getElementById('fileInput').files[0];"
-
         "if(!file){"
         "alert('Select a file');"
         "return;"
         "}"
-
         "const data=await file.text();"
-
         "const response=await fetch('/upload',{"
         "method:'POST',"
         "headers:{"
@@ -847,26 +900,21 @@ static esp_err_t RootHandler(
         "},"
         "body:data"
         "});"
-
         "const msg=await response.text();"
-
         "let status=document.getElementById('uploadStatus');"
         "if(!status){"
         "status=document.createElement('p');"
         "status.id='uploadStatus';"
         "document.body.appendChild(status);"
         "}"
-
         "status.textContent=msg+' Returning to the home page in 30 seconds\\u2026';"
         "setTimeout(function(){location.href='/';},30000);"
         "}"
         "</script>"
-
         "<form method='POST' action='/delete-credentials' "
         "onsubmit=\"return confirm('Delete stored OpenSky credentials?')\">"
         "<button type='submit'>Delete OpenSky credentials</button>"
         "</form>"
-
         "</body>"
         "</html>";
 
@@ -907,6 +955,9 @@ static esp_err_t RootHandler(
         GetRadarDayNightBrightnessEnabled() ? " checked" : "",
         (unsigned long)GetRadarDayBrightnessPercent(),
         (unsigned long)GetRadarNightBrightnessPercent(),
+        GetRadarIdleDimEnabled() ? " checked" : "",
+        (unsigned long)GetRadarIdleDimMinutes(),
+        (unsigned long)GetRadarIdleDimPercent(),
         Radar_GetAutoSelectClosest() ? " checked" : "",
         GetRadarOpenSkyDebugEnabled() ? " checked" : "",
         (unsigned long)GetRadarBrightness(),
@@ -937,8 +988,21 @@ esp_err_t StartWebServer(void)
     // Default is 4096 bytes, which is tight once request handlers build
     // sizeable HTML responses. Bumped for headroom; this task is otherwise
     // idle most of the time so the extra RAM cost is worth the safety margin.
-    config.stack_size = 8192;
-    config.max_uri_handlers = 16;
+    // Bumped again after the page grew substantially (day/night brightness,
+    // idle dimming, the reorganized/CSS'd layout, more form fields overall)
+    // - 8192 was enough for the earlier, smaller version of this page but
+    // wasn't anymore, and caused the exact same class of httpd stack
+    // overflow this value was originally introduced to fix. Generous
+    // headroom this time since this task is idle almost all the time and
+    // the board has ~200KB+ of free internal RAM at boot.
+    config.stack_size = 16384;
+    // Total registered handlers across webserver.c (6), web_rules.c (10) and
+    // web_airports.c (3) is 19 after the registry/operator page rework (was 18,
+    // and 16 before that, silently dropping the last handler to register -
+    // hence "no slots left" in the log). Set with headroom for future
+    // additions rather than the exact current count; each unused slot only
+    // costs one small httpd_uri_t-sized entry of heap.
+    config.max_uri_handlers = 28;
 
     if (httpd_start(
             &server_handle,
@@ -990,38 +1054,37 @@ esp_err_t StartWebServer(void)
             .handler = BrightnessHandler,
             .user_ctx = NULL};
 
-    httpd_register_uri_handler(
-    server_handle,
-        &root_uri);
+    // These 6 core routes previously weren't checked for registration
+    // failure at all - a silent way for exactly this class of bug (the
+    // handler-table capacity issue above) to hide. Aggregated the same
+    // way WebRules_Register/WebAirports_Register already do, so a
+    // failure here is loud and stops startup cleanly instead of leaving
+    // some routes silently missing.
+    esp_err_t err = httpd_register_uri_handler(server_handle, &root_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &upload_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &wifi_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &radar_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &delete_credentials_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &brightness_uri);
 
-    httpd_register_uri_handler(
-    server_handle,
-        &upload_uri);
-
-    httpd_register_uri_handler(
-    server_handle,
-        &wifi_uri);
-
-    httpd_register_uri_handler(
-    server_handle,
-        &radar_uri);
-
-    httpd_register_uri_handler(
-    server_handle,
-        &delete_credentials_uri);
-
-    httpd_register_uri_handler(
-    server_handle,
-        &brightness_uri);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register core web routes (%s)", esp_err_to_name(err));
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
 
     if (WebRules_Register(server_handle) != ESP_OK)
     {
+        ESP_LOGE(TAG, "Failed to register rules routes");
         httpd_stop(server_handle);
         server_handle = NULL;
         return ESP_FAIL;
     }
     if (WebAirports_Register(server_handle) != ESP_OK)
     {
+        ESP_LOGE(TAG, "Failed to register airport routes");
         httpd_stop(server_handle);
         server_handle = NULL;
         return ESP_FAIL;

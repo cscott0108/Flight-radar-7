@@ -3,6 +3,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_http_client.h"
 #include "esp_log.h"
 
@@ -186,6 +189,16 @@ bool OpenSky_ParseAircraft(
         cJSON_GetObjectItem(
             root,
             "states");
+
+    // OpenSky returns "states": null (not an empty array) when zero
+    // aircraft match the queried bounding box — a normal, successful
+    // response (nothing currently flying over a quiet area), not a
+    // parse failure.
+    if (!states || cJSON_IsNull(states))
+    {
+        cJSON_Delete(root);
+        return true;
+    }
 
     if (!cJSON_IsArray(states))
     {

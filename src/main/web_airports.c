@@ -63,17 +63,6 @@ static void FormatCoordinate(float value, char out[24])
              scaled / 1000000, scaled % 1000000);
 }
 
-static const char *AircraftColor(CustomType type)
-{
-    switch (type) {
-    case TYPE_COMMERCIAL: return "#FF9800";
-    case TYPE_POLICE: return "#238BFF";
-    case TYPE_MILITARY: return "#00D060";
-    case TYPE_EMERGENCY: return "#FF3030";
-    default: return "#FFFFFF";
-    }
-}
-
 static esp_err_t AirportsPage(httpd_req_t *req)
 {
     const float centerLat = GetRadarLat();
@@ -117,8 +106,9 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             !Radar_ProjectPosition(marker.latitude, marker.longitude,
                                    centerLat, centerLon, radiusKm, 190, &x, &y))
             continue;
-        if (SendFormat(req, "<circle cx='%d' cy='%d' r='%u' fill='#FF0000'/>",
-                       200 + x, 200 + y, (unsigned)(marker.diameter / 2)) != ESP_OK)
+        if (SendFormat(req, "<circle cx='%d' cy='%d' r='%u' fill='#%06X'/>",
+                       200 + x, 200 + y, (unsigned)(marker.diameter / 2),
+                       (unsigned)(marker.color & 0xFFFFFFu)) != ESP_OK)
             return ESP_FAIL;
     }
     int count = gAircraftCount;
@@ -131,17 +121,32 @@ static esp_err_t AirportsPage(httpd_req_t *req)
                     centerLat, centerLon, radiusKm, 190, &x, &y))
             continue;
         x += 200; y += 200;
-        if (SendFormat(req,
+        CraftResolution resolved = ResolveAircraft(a.callsign, a.icao24);
+        char fill[8];
+        CraftType_ColorHtml(resolved.type, fill);
+        esp_err_t err;
+        if (resolved.aircraftType == AIRCRAFT_HELICOPTER) {
+            /* Same solid-circle-with-gray-ring the radar draws, scaled to this
+             * preview's SVG units (viewBox is half the panel's screen pixels). */
+            err = SendFormat(req,
+                "<circle cx='%d' cy='%d' r='%d' fill='%s' "
+                "stroke='#%06X' stroke-width='%d'/>",
+                x, y, HELI_MARKER_DIAMETER_PX / 4, fill,
+                (unsigned)HELI_RING_RGB, HELI_RING_WIDTH_PX / 2);
+        } else {
+            err = SendFormat(req,
                 "<polygon points='%d,%d %d,%d %d,%d' fill='%s' opacity='.9'/>",
-                x, y - 6, x - 5, y + 4, x + 5, y + 4,
-                AircraftColor(evaluateAircraftType(a.callsign, a.icao24))) != ESP_OK)
+                x, y - 6, x - 5, y + 4, x + 5, y + 4, fill);
+        }
+        if (err != ESP_OK)
             return ESP_FAIL;
     }
 
     if (Send(req,
         "<circle id='candidate' cx='200' cy='200' r='6' fill='#FF0000' "
         "stroke='white' stroke-width='2' visibility='hidden'/></svg>"
-        "<p><small>Red circles are saved airports; triangles are aircraft at page load. "
+        "<p><small>Circles are saved airports (in their chosen color); triangles are fixed-wing "
+        "aircraft and ringed dots are helicopters, both at page load. "
         "The white-rimmed red dot is your unsaved placement.</small></p>"
         "<h2 id='editor'>Add or edit airport</h2>"
         "<form id='airportForm' method='post' action='/airports/save'>"
@@ -150,10 +155,11 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "<label>Latitude <input id='latitude' name='latitude' type='number' step='any' min='-90' max='90' required></label>"
         "<label>Longitude <input id='longitude' name='longitude' type='number' step='any' min='-180' max='180' required></label>"
         "<label>Dot diameter <input id='diameter' name='diameter' type='number' min='6' max='24' value='12' required> pixels</label>"
+        "<label>Dot color <input id='color' name='color' type='color' value='#FF0000' required></label>"
         "<button type='submit'>Save airport</button><button type='button' onclick='newAirport()'>New dot</button>"
-        "</form><h2>Saved airports</h2><table><tr><th>Name</th><th>Position</th><th>Size</th><th></th></tr>") != ESP_OK)
+        "</form><h2>Saved airports</h2><table><tr><th>Name</th><th>Position</th><th>Size</th><th>Color</th><th></th></tr>") != ESP_OK)
         return ESP_FAIL;
-    if (!airportCount && Send(req, "<tr><td colspan='4'>No airports saved</td></tr>") != ESP_OK)
+    if (!airportCount && Send(req, "<tr><td colspan='5'>No airports saved</td></tr>") != ESP_OK)
         return ESP_FAIL;
     for (size_t i = 0; i < airportCount; i++) {
         AirportMarker marker;
@@ -161,13 +167,17 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         if (!Airports_Get(i, &marker)) continue;
         FormatCoordinate(marker.latitude, airportLat);
         FormatCoordinate(marker.longitude, airportLon);
+        char colorHex[8];
+        snprintf(colorHex, sizeof(colorHex), "#%06X", (unsigned)(marker.color & 0xFFFFFFu));
         if (Send(req, "<tr><td>") != ESP_OK ||
             SendEscaped(req, marker.name) != ESP_OK ||
             SendFormat(req,
-                "</td><td>%s, %s</td><td>%u px</td><td>"
-                "<button type='button' data-index='%u' data-lat='%s' data-lon='%s' data-size='%u' data-name='",
-                airportLat, airportLon, (unsigned)marker.diameter, (unsigned)i,
-                airportLat, airportLon, (unsigned)marker.diameter) != ESP_OK ||
+                "</td><td>%s, %s</td><td>%u px</td>"
+                "<td><span style='display:inline-block;width:1em;height:1em;vertical-align:middle;"
+                "border:1px solid #888;background:%s'></span> %s</td><td>"
+                "<button type='button' data-index='%u' data-lat='%s' data-lon='%s' data-size='%u' data-color='%s' data-name='",
+                airportLat, airportLon, (unsigned)marker.diameter, colorHex, colorHex,
+                (unsigned)i, airportLat, airportLon, (unsigned)marker.diameter, colorHex) != ESP_OK ||
             SendEscaped(req, marker.name) != ESP_OK ||
             Send(req, "' onclick='editAirport(this)'>Edit</button>"
                       "<form class='inline' method='post' action='/airports/delete'>") != ESP_OK ||
@@ -187,6 +197,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         ";const f=document.getElementById('airportForm');"
         "const latInput=document.getElementById('latitude'),lonInput=document.getElementById('longitude');"
         "const nameInput=document.getElementById('name'),sizeInput=document.getElementById('diameter');"
+        "const colorInput=document.getElementById('color');"
         "const indexInput=document.getElementById('index');"
         "function preview(){let lat=Number(latInput.value),lon=Number(lonInput.value);"
         "if(!latInput.value||!lonInput.value){dot.setAttribute('visibility','hidden');return;}"
@@ -194,7 +205,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "let x=200+east/rangeKm*190,y=200-north/rangeKm*190;"
         "if(!Number.isFinite(x)||!Number.isFinite(y)||Math.hypot(x-200,y-200)>190){"
         "dot.setAttribute('visibility','hidden');return;}"
-        "dot.setAttribute('cx',x);dot.setAttribute('cy',y);"
+        "dot.setAttribute('cx',x);dot.setAttribute('cy',y);dot.setAttribute('fill',colorInput.value);"
         "dot.setAttribute('r',Number(sizeInput.value)/2||6);dot.setAttribute('visibility','visible');}"
         "map.addEventListener('click',function(e){let p=map.createSVGPoint();p.x=e.clientX;p.y=e.clientY;"
         "p=p.matrixTransform(map.getScreenCTM().inverse());"
@@ -202,12 +213,12 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "latInput.value=(centerLat-dy/190*rangeKm/111).toFixed(6);"
         "lonInput.value=(centerLon+dx/190*rangeKm/(111*Math.cos(centerLat*Math.PI/180))).toFixed(6);"
         "preview();});"
-        "function newAirport(){f.reset();indexInput.value='-1';sizeInput.value='12';"
+        "function newAirport(){f.reset();indexInput.value='-1';sizeInput.value='12';colorInput.value='#FF0000';"
         "dot.setAttribute('visibility','hidden');location.hash='editor';}"
         "function editAirport(b){indexInput.value=b.dataset.index;nameInput.value=b.dataset.name;"
         "latInput.value=b.dataset.lat;lonInput.value=b.dataset.lon;"
-        "sizeInput.value=b.dataset.size;preview();location.hash='editor';}"
-        "['latitude','longitude','diameter'].forEach(id=>document.getElementById(id).addEventListener('input',preview));"
+        "sizeInput.value=b.dataset.size;colorInput.value=b.dataset.color;preview();location.hash='editor';}"
+        "['latitude','longitude','diameter','color'].forEach(id=>document.getElementById(id).addEventListener('input',preview));"
         "</script><p><a href='/'>Back to setup</a></p></body></html>") != ESP_OK)
         return ESP_FAIL;
     return httpd_resp_send_chunk(req, NULL, 0);
@@ -277,9 +288,25 @@ static esp_err_t Redirect(httpd_req_t *req)
     return httpd_resp_sendstr(req, "Saved. Return to /airports.");
 }
 
+/* "#RRGGBB" (the native <input type=color> format) -> 0xRRGGBB. */
+static bool ParseHtmlColor(const char *text, uint32_t *out)
+{
+    if (text[0] != '#' || strlen(text) != 7)
+        return false;
+    long value = 0;
+    for (int i = 1; i < 7; i++) {
+        int digit = HexDigit(text[i]);
+        if (digit < 0)
+            return false;
+        value = value * 16 + digit;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
 static esp_err_t SaveAirport(httpd_req_t *req)
 {
-    char body[256], indexText[12], name[64], latText[32], lonText[32], sizeText[12];
+    char body[256], indexText[12], name[64], latText[32], lonText[32], sizeText[12], colorText[16];
     long index, diameter;
     AirportMarker marker = {0};
     if (!ReadForm(req, body) ||
@@ -288,9 +315,11 @@ static esp_err_t SaveAirport(httpd_req_t *req)
         !GetField(body, "latitude", latText, sizeof(latText)) ||
         !GetField(body, "longitude", lonText, sizeof(lonText)) ||
         !GetField(body, "diameter", sizeText, sizeof(sizeText)) ||
+        !GetField(body, "color", colorText, sizeof(colorText)) ||
         !ParseLong(indexText, &index) || !ParseLong(sizeText, &diameter) ||
         !ParseFloat(latText, &marker.latitude) ||
         !ParseFloat(lonText, &marker.longitude) ||
+        !ParseHtmlColor(colorText, &marker.color) ||
         index < -1 || index >= MAX_AIRPORTS ||
         diameter < 6 || diameter > 24 || strlen(name) > AIRPORT_NAME_LENGTH)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid airport details");
