@@ -30,25 +30,28 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
 ### 🎨 Aircraft Classification & Visuals
 
 - **Runway-style compass** — clean outer ring with compact 2-digit aviation headings (`36`, `09`, `18`, `27`).
-- **"Craft Type" classification** — replaces OpenSky's unreliable/empty `category` field with a fully custom, user-editable classification system covering **nine** categories:
+- **"Craft Type" classification** — replaces OpenSky's unreliable/empty `category` field with a fully custom, user-editable classification system covering **ten** categories:
 
   | Type | Color | Type | Color |
   |---|---|---|---|
   | Personal *(default/unknown)* | ⚪ White | Military | 🫒 Olive |
   | Private | ⬜ Grey | Police | 🔵 Blue |
   | Business | 🩵 Powder Blue | Emergency Services | 🔴 Red |
-  | Commercial | 🟠 Orange | Important *(watchlist)* | 🩷 Pink |
-  | Cargo | 🟣 Purple | | |
+  | Commercial | 🟠 Orange | Interesting *(personal watchlist)* | 🩷 Pink |
+  | Cargo | 🟣 Purple | Important *(VIP / high-priority)* | 🟡 Yellow fill, 🔴 red border |
 
-- **Manual Aircraft Type (Fixed-Wing / Helicopter)** — independent of classification color. Any registered aircraft can be manually marked as a helicopter, rendering it as a **solid circle with a gray ring** in its classification's color, instead of the usual triangle. This is deliberately manual: OpenSky has no reliable way to tell fixed-wing and rotary-wing aircraft apart, so it's never guessed automatically.
+- **Manual Aircraft Type (Fixed-Wing / Helicopter)** — independent of classification color. Any registered aircraft can be manually marked as a helicopter, rendering it as a **solid circle with a ring** in its classification's color, instead of the usual triangle. This is deliberately manual: OpenSky has no reliable way to tell fixed-wing and rotary-wing aircraft apart, so it's never guessed automatically.
 - **Marker hierarchy:**
   - **Personal** aircraft (the default/fallback): small **hollow outline triangle**.
+  - **Important:** solid filled triangle with a **red outline** — yellow fill, red border, for maximum visibility.
   - **Every other classification:** solid filled triangle, colored per the table above.
-  - **Any classification, when manually marked as a Helicopter:** solid circle (≈18px) with a gray ring, in that classification's color — e.g. a Police helicopter is a blue ringed circle, an Emergency helicopter is a red one.
+  - **Any classification, when manually marked as a Helicopter:** solid circle (≈18px) with a ring in that classification's color — e.g. a Police helicopter is a blue-ringed circle, an Emergency helicopter is a red one. An Important helicopter's ring is red (matching its border), while every other classification's ring is a fixed gray.
 
 ### 🏷️ Custom Callsigns, Registrations & Operators
 
 - **Built-in defaults** — a maintained table of common airline ICAO codes, military/police/emergency callsign prefixes, shipped out of the box.
+- **VIP / special-mission prefix rules** — seeded defaults (`SAM`, `SPAR`, `EXEC`, `PAT` → Important) for watching VIP and government-transport call signs, fully editable/removable like any other rule. These are ordinary prefix rules, not a hard-coded list — a specific registration you configure separately (e.g. `SAM123`) always takes precedence over the broader pattern.
+- **Notes** — an optional, free-text field on any registration entry (e.g. `HL8299 → Interesting → "South Korea, LG Electronics"`), persisted alongside its classification, editable from the WebUI and shown as a tooltip on the Current Aircraft table.
 - **Fully editable via WebUI** — add, edit, delete, or restore-to-default any operator code or aircraft registration rule directly from the browser, no hard caps on how many you keep (backed by plain CSV files on the device's flash, not a fixed-size table).
 - **Bulk backup/restore** — export and re-import your custom classification rules as CSV.
 - **One-click Lookup + Add/Edit** — the Current Aircraft table lets you look up any aircraft currently in range and configure its classification/type in a couple of clicks, prefilled with what's already known about it.

@@ -21,6 +21,7 @@ typedef enum {
     CRAFT_MILITARY,
     CRAFT_POLICE,
     CRAFT_EMERGENCY,
+    CRAFT_INTERESTING,
     CRAFT_IMPORTANT,
     CRAFT_TYPE_COUNT
 } CraftType;
@@ -52,7 +53,10 @@ typedef struct {
     CraftMarker marker;
     uint32_t colorRgb;     /* fill: always the craft type's own color */
     int sizePx;            /* triangles: vertex distance from center; circle: diameter */
-    int ringWidthPx;       /* 0 = no ring */
+    int ringWidthPx;       /* 0 = no ring/border. Used for the helicopter ring
+                             * (always) and, for craft types that define a
+                             * border (currently only Important), also as the
+                             * fixed-wing triangle's outline width. */
     uint32_t ringRgb;
     int selectRadiusPx;    /* radius of the yellow "selected" ring */
 } CraftAppearance;

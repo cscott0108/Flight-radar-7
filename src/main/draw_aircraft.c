@@ -53,6 +53,21 @@ void DrawAircraft(lv_draw_ctx_t *draw_ctx, int x, int y,
             fill.bg_color = color;
             fill.bg_opa = LV_OPA_COVER;
             lv_draw_triangle(draw_ctx, &fill, points);
+
+            /* LVGL 8's triangle draw has no border of its own, so a craft
+             * type that defines one (currently only Important: yellow fill,
+             * red border) gets the closest visually-consistent alternative -
+             * the same three-edge outline technique used for Personal's
+             * small-outline marker, drawn on top of the fill. */
+            if (look->ringWidthPx > 0) {
+                lv_draw_line_dsc_t outline;
+                lv_draw_line_dsc_init(&outline);
+                outline.color = lv_color_hex(look->ringRgb);
+                outline.width = look->ringWidthPx;
+                lv_draw_line(draw_ctx, &outline, &points[0], &points[1]);
+                lv_draw_line(draw_ctx, &outline, &points[1], &points[2]);
+                lv_draw_line(draw_ctx, &outline, &points[2], &points[0]);
+            }
         }
     }
 

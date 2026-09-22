@@ -7,11 +7,16 @@
 
 /* Two user-editable lists, both plain CSV on the SPIFFS partition:
  *
- *   Registry (custom_rules.csv):   PREFIX,TYPE[,AIRCRAFT] - explicit per-aircraft
- *                                  (registration / call sign) classification,
- *                                  plus the manual aircraft type (FIXED or
- *                                  HELI; the column is optional and a missing
- *                                  one means Fixed-Wing).
+ *   Registry (custom_rules.csv):   PREFIX,TYPE[,AIRCRAFT[,NOTES]] - explicit
+ *                                  per-aircraft (registration / call sign)
+ *                                  classification, plus the manual aircraft
+ *                                  type (FIXED or HELI; optional, a missing
+ *                                  one means Fixed-Wing) and optional
+ *                                  free-text Notes (MAX_RULE_NOTES chars,
+ *                                  no commas/quotes). VIP/special-mission
+ *                                  prefixes (SAM, SPAR, EXEC, PAT -> Important)
+ *                                  are seeded here as ordinary rows, not a
+ *                                  separate mechanism.
  *   Operators (operators.csv):     ICAO,NAME,TYPE         - per-operator
  *                                  classification. Only *changes* to the
  *                                  built-in defaults and user-added operators
@@ -27,14 +32,17 @@
 
 #define MAX_CUSTOM_RULES 5000
 #define MAX_RULE_PREFIX 15
+#define MAX_RULE_NOTES 96 /* optional free-text context, e.g. "South Korea, LG Electronics" */
 #define MAX_OPERATORS 1000
 #define MAX_OPERATOR_CODE 4
 #define MAX_OPERATOR_NAME 39
 
-/* Registry CSV files carry "#FORMAT=2" on their first line. A file without it
- * is a pre-Personal/Business/Cargo/Important file, in which PRIVATE meant the
- * small-aircraft category, so it is read as Personal and rewritten. */
-#define CUSTOM_RULES_FORMAT_VERSION 2
+/* Registry CSV files carry "#FORMAT=2" (or higher) on their first line. A
+ * file without any #FORMAT marker is a pre-Personal/Business/Cargo/Important
+ * file, in which PRIVATE meant the small-aircraft category, so it is read as
+ * Personal and rewritten. Version 3 adds the optional trailing Notes column;
+ * a version-2 file loads with every rule's notes empty. */
+#define CUSTOM_RULES_FORMAT_VERSION 3
 
 #define CUSTOM_RULES_CSV_PATH "/spiffs/custom_rules.csv"
 #define OPERATORS_CSV_PATH "/spiffs/operators.csv"
@@ -46,6 +54,7 @@ typedef struct {
     char prefix[MAX_RULE_PREFIX + 1];
     CraftType type;
     AircraftType aircraftType;
+    char notes[MAX_RULE_NOTES + 1]; /* optional, may be empty */
 } CustomRule;
 
 typedef struct {
@@ -83,9 +92,14 @@ size_t CustomRules_Count(void);
 bool CustomRules_Get(size_t index, CustomRule *out);
 /* Exact (case-insensitive) lookup of one rule; used for duplicate detection. */
 bool CustomRules_Find(const char *prefix, CustomRule *out);
-bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType); /* add or update */
+/* notes may be NULL or empty (optional). add or update. */
+bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes);
 bool CustomRules_Delete(const char *prefix);
 bool CustomRules_NormalizePrefix(const char *input, char out[MAX_RULE_PREFIX + 1]);
+/* Trims, then accepts 0..MAX_RULE_NOTES printable ASCII characters. Commas
+ * and double quotes are rejected (same convention as Operators_NormalizeName)
+ * so the CSV never needs quoting. NULL/empty input is valid - Notes is optional. */
+bool CustomRules_NormalizeNotes(const char *input, char out[MAX_RULE_NOTES + 1]);
 
 /* ---- operators: built-ins first (alphabetical), then custom (alphabetical) ---- */
 size_t Operators_Count(void);

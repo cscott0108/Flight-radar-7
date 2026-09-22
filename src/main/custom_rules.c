@@ -99,12 +99,22 @@ static const char *const seedCommercialExtras[] = {
     "APZ", "MNL", "DLX"
 };
 
-/* Registry entries seeded on a device with no custom_rules.csv at all. */
-static const struct { const char *prefix; CraftType type; } seedRegistry[] = {
-    {"NGF", CRAFT_EMERGENCY}, {"REH", CRAFT_EMERGENCY}, {"N248PH", CRAFT_EMERGENCY},
-    {"N145TN", CRAFT_EMERGENCY}, {"STNFORD1", CRAFT_EMERGENCY}, {"N743AM", CRAFT_EMERGENCY},
-    {"N408SD", CRAFT_POLICE}, {"YEL7", CRAFT_COMMERCIAL}, {"ASY", CRAFT_PERSONAL},
-    {"C6559", CRAFT_MILITARY}, {"PFT144", CRAFT_IMPORTANT},
+/* Registry entries seeded on a device with no custom_rules.csv at all, and
+ * re-checked (added if still missing) on every migration to a newer format -
+ * see SeedMissingRegistryDefaults(). The VIP/special-mission prefixes are
+ * ordinary registry rows like any other: the existing longest-prefix-match
+ * precedence already means a more specific entry (e.g. "SAM123") overrides
+ * a shorter generic one ("SAM") with no separate rule tier needed. These are
+ * defaults only - fully editable/removable through the webserver. */
+static const struct { const char *prefix; CraftType type; const char *notes; } seedRegistry[] = {
+    {"NGF", CRAFT_EMERGENCY, ""}, {"REH", CRAFT_EMERGENCY, ""}, {"N248PH", CRAFT_EMERGENCY, ""},
+    {"N145TN", CRAFT_EMERGENCY, ""}, {"STNFORD1", CRAFT_EMERGENCY, ""}, {"N743AM", CRAFT_EMERGENCY, ""},
+    {"N408SD", CRAFT_POLICE, ""}, {"YEL7", CRAFT_COMMERCIAL, ""}, {"ASY", CRAFT_PERSONAL, ""},
+    {"C6559", CRAFT_MILITARY, ""}, {"PFT144", CRAFT_IMPORTANT, ""},
+    {"SAM", CRAFT_IMPORTANT, "Special Air Mission / VIP transport"},
+    {"SPAR", CRAFT_IMPORTANT, "Special Air Mission / VIP transport"},
+    {"EXEC", CRAFT_IMPORTANT, "Executive/government transport"},
+    {"PAT", CRAFT_IMPORTANT, "Patriot / VIP transport"},
 };
 
 /* ---- in-memory state ---- */
@@ -191,6 +201,32 @@ bool Operators_NormalizeName(const char *input, char out[MAX_OPERATOR_NAME + 1])
     return true;
 }
 
+/* Trims, then accepts 0..MAX_RULE_NOTES printable ASCII characters. Commas
+ * and double quotes are rejected, same convention as Operators_NormalizeName,
+ * so the CSV never needs quoting. Empty is valid - Notes is optional. */
+bool CustomRules_NormalizeNotes(const char *input, char out[MAX_RULE_NOTES + 1])
+{
+    if (!out)
+        return false;
+    if (!input)
+        input = "";
+    while (*input == ' ' || *input == '\t')
+        input++;
+    size_t length = strlen(input);
+    while (length > 0 && (input[length - 1] == ' ' || input[length - 1] == '\t'))
+        length--;
+    if (length > MAX_RULE_NOTES)
+        return false;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)input[i];
+        if (c < 0x20 || c > 0x7E || c == ',' || c == '"')
+            return false;
+        out[i] = (char)c;
+    }
+    out[length] = '\0';
+    return true;
+}
+
 static char *TrimInPlace(char *s)
 {
     while (*s == ' ' || *s == '\t')
@@ -264,8 +300,8 @@ static int FindRule(const char *prefix)
     return -1;
 }
 
-/* In-memory upsert without saving. */
-static bool UpsertRule(const char *prefix, CraftType type, AircraftType aircraftType)
+/* In-memory upsert without saving. notes may be NULL (treated as empty). */
+static bool UpsertRule(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes)
 {
     int i = FindRule(prefix);
     if (i < 0) {
@@ -276,7 +312,22 @@ static bool UpsertRule(const char *prefix, CraftType type, AircraftType aircraft
     }
     rules[i].type = type;
     rules[i].aircraftType = aircraftType;
+    strncpy(rules[i].notes, notes ? notes : "", MAX_RULE_NOTES);
+    rules[i].notes[MAX_RULE_NOTES] = '\0';
     return true;
+}
+
+/* Adds any of seedRegistry[] not already present, without touching existing
+ * rows (including ones the user has since edited or deleted). Used both to
+ * populate a brand-new device and to backfill the VIP defaults into an
+ * existing installation migrating to format 3. */
+static void SeedMissingRegistryDefaults(void)
+{
+    for (size_t i = 0; i < sizeof(seedRegistry) / sizeof(seedRegistry[0]); i++) {
+        if (FindRule(seedRegistry[i].prefix) < 0)
+            UpsertRule(seedRegistry[i].prefix, seedRegistry[i].type, AIRCRAFT_FIXED_WING,
+                       seedRegistry[i].notes);
+    }
 }
 
 static bool SaveRulesToCsv(void)
@@ -289,24 +340,34 @@ static bool SaveRulesToCsv(void)
 
     fprintf(f, "#FORMAT=%d\n", CUSTOM_RULES_FORMAT_VERSION);
     fprintf(f, "# Flight Radar registry rules (aircraft-specific craft types).\n");
-    fprintf(f, "# One rule per line: PREFIX,TYPE,AIRCRAFT\n");
+    fprintf(f, "# One rule per line: PREFIX,TYPE,AIRCRAFT,NOTES\n");
     fprintf(f, "# TYPE is one of PERSONAL, PRIVATE, BUSINESS, COMMERCIAL, CARGO, MILITARY (MIL),\n");
-    fprintf(f, "# POLICE (LEO), EMERGENCY (ES), IMPORTANT.\n");
+    fprintf(f, "# POLICE (LEO), EMERGENCY (ES), INTERESTING (INT), IMPORTANT.\n");
     fprintf(f, "# AIRCRAFT is FIXED or HELI (manual designation; optional, a missing value means FIXED).\n");
+    fprintf(f, "# NOTES is free text, optional, up to %d characters, no commas or quotes.\n", MAX_RULE_NOTES);
     fprintf(f, "# Prefix matches ignore case and include any following flight number.\n");
     fprintf(f, "# Use ? for one unknown letter or digit (e.g. S?NFRD). The longest matching rule wins.\n");
-    fprintf(f, "# Keep the #FORMAT=2 line: a file without it is read as an old file where PRIVATE meant PERSONAL.\n");
+    fprintf(f, "# Keep the #FORMAT=%d line: a file without any #FORMAT marker is read as an old file\n", CUSTOM_RULES_FORMAT_VERSION);
+    fprintf(f, "# where PRIVATE meant PERSONAL; a #FORMAT=2 file loads with every rule's notes empty.\n");
 
     for (size_t i = 0; i < rulesCount; i++)
-        fprintf(f, "%s,%s,%s\n", rules[i].prefix, CraftType_CsvName(rules[i].type),
-                AircraftType_CsvName(rules[i].aircraftType));
+        fprintf(f, "%s,%s,%s,%s\n", rules[i].prefix, CraftType_CsvName(rules[i].type),
+                AircraftType_CsvName(rules[i].aircraftType), rules[i].notes);
 
     fclose(f);
     return true;
 }
 
+/* PRIVATE meant the small-aircraft category (now Personal) only in files
+ * predating format 2. This is a fixed historical cutoff, deliberately NOT
+ * tied to CUSTOM_RULES_FORMAT_VERSION - bumping the format version further
+ * (e.g. for Notes, format 3) must never re-trigger this remap for files that
+ * already use post-format-2 semantics. */
+#define CUSTOM_RULES_LEGACY_PRIVATE_BEFORE_VERSION 2
+
 /* Loads rules[] fresh. Malformed lines are skipped (not fatal). Returns true
- * if the file was a pre-version-2 file (no #FORMAT marker). */
+ * if the file needs rewriting to the current format (older than it, in any
+ * respect - not just the legacy-PRIVATE cutoff above). */
 static bool LoadRulesFromCsv(void)
 {
     rulesCount = 0;
@@ -334,13 +395,25 @@ static bool LoadRulesFromCsv(void)
 
         /* Optional third column: the manual aircraft type. A missing column is
          * Fixed-Wing (older files); an unrecognized value also falls back to
-         * Fixed-Wing so a typo cannot delete the classification. */
+         * Fixed-Wing so a typo cannot delete the classification.
+         * Optional fourth column (format 3+): free-text notes. A missing or
+         * invalid value falls back to empty rather than dropping the rule. */
         char *typeField = comma + 1;
         AircraftType aircraftType = AIRCRAFT_FIXED_WING;
+        char notesField[MAX_RULE_NOTES + 1] = "";
         char *second = strchr(typeField, ',');
         if (second) {
             *second = '\0';
-            if (!AircraftType_Parse(TrimInPlace(second + 1), &aircraftType)) {
+            char *aircraftField = second + 1;
+            char *third = strchr(aircraftField, ',');
+            if (third) {
+                *third = '\0';
+                if (!CustomRules_NormalizeNotes(TrimInPlace(third + 1), notesField)) {
+                    notesField[0] = '\0';
+                    ESP_LOGW(TAG, "Invalid notes on rule '%s'; leaving blank", trimmed);
+                }
+            }
+            if (!AircraftType_Parse(TrimInPlace(aircraftField), &aircraftType)) {
                 aircraftType = AIRCRAFT_FIXED_WING;
                 ESP_LOGW(TAG, "Unknown aircraft type on rule '%s'; using Fixed-Wing", trimmed);
             }
@@ -349,10 +422,10 @@ static bool LoadRulesFromCsv(void)
         char normalizedPrefix[MAX_RULE_PREFIX + 1];
         CraftType type;
         if (!CustomRules_NormalizePrefix(TrimInPlace(trimmed), normalizedPrefix) ||
-            !CraftType_Parse(TrimInPlace(typeField), version < CUSTOM_RULES_FORMAT_VERSION, &type))
+            !CraftType_Parse(TrimInPlace(typeField), version < CUSTOM_RULES_LEGACY_PRIVATE_BEFORE_VERSION, &type))
             continue;
 
-        if (!UpsertRule(normalizedPrefix, type, aircraftType))
+        if (!UpsertRule(normalizedPrefix, type, aircraftType, notesField))
             break;
     }
     fclose(f);
@@ -436,7 +509,7 @@ static bool SaveOperatorsToCsv(void)
     fprintf(f, "# here. A row whose ICAO matches a built-in operator overrides its name/type;\n");
     fprintf(f, "# delete the row (or use Restore Default) to go back to the built-in value.\n");
     fprintf(f, "# TYPE is one of PERSONAL, PRIVATE, BUSINESS, COMMERCIAL, CARGO, MILITARY,\n");
-    fprintf(f, "# POLICE, EMERGENCY, IMPORTANT. NAME may not contain commas or quotes.\n");
+    fprintf(f, "# POLICE, EMERGENCY, INTERESTING, IMPORTANT. NAME may not contain commas or quotes.\n");
 
     for (size_t i = 0; i < opCount; i++)
         fprintf(f, "%s,%s,%s\n", opRows[i].code, opRows[i].name, CraftType_CsvName(opRows[i].type));
@@ -514,15 +587,17 @@ static void LoadAllLocked(bool isInit)
     /* Registry */
     if (!FileExists(CUSTOM_RULES_CSV_PATH)) {
         rulesCount = 0;
-        for (size_t i = 0; i < sizeof(seedRegistry) / sizeof(seedRegistry[0]); i++)
-            UpsertRule(seedRegistry[i].prefix, seedRegistry[i].type, AIRCRAFT_FIXED_WING);
+        SeedMissingRegistryDefaults();
         SaveRulesToCsv();
         ESP_LOGI(TAG, "No registry file; seeded %u default registry entries", (unsigned)rulesCount);
     } else if (LoadRulesFromCsv()) {
-        /* Legacy file: PRIVATE was already read as Personal by the parser.
-         * On the device's first boot with this firmware also mark PFT144. */
+        /* Legacy/older-format file. On the device's first boot with this
+         * firmware, backfill any seed defaults still missing (this is the
+         * same mechanism that has always (re-)added PFT144; it now also
+         * covers the new VIP/special-mission prefixes) without touching
+         * anything the user already has. */
         if (isInit)
-            UpsertRule("PFT144", CRAFT_IMPORTANT, AIRCRAFT_FIXED_WING);
+            SeedMissingRegistryDefaults();
         SaveRulesToCsv();
         ESP_LOGI(TAG, "Migrated registry file to format %d", CUSTOM_RULES_FORMAT_VERSION);
     }
@@ -609,11 +684,12 @@ bool CustomRules_Find(const char *prefix, CustomRule *out)
     return i >= 0;
 }
 
-bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType)
+bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes)
 {
     char normalized[MAX_RULE_PREFIX + 1];
+    char normalizedNotes[MAX_RULE_NOTES + 1];
     if (!rulesLock || !CustomRules_NormalizePrefix(prefix, normalized) || !CraftType_IsValid((int)type) ||
-        !AircraftType_IsValid((int)aircraftType))
+        !AircraftType_IsValid((int)aircraftType) || !CustomRules_NormalizeNotes(notes, normalizedNotes))
         return false;
 
     xSemaphoreTake(rulesLock, portMAX_DELAY);
@@ -624,7 +700,7 @@ bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftTy
     if (!isNew)
         previous = rules[i];
 
-    if (!UpsertRule(normalized, type, aircraftType)) {
+    if (!UpsertRule(normalized, type, aircraftType, normalizedNotes)) {
         xSemaphoreGive(rulesLock);
         return false;
     }

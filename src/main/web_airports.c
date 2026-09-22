@@ -122,17 +122,27 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             continue;
         x += 200; y += 200;
         CraftResolution resolved = ResolveAircraft(a.callsign, a.icao24);
+        /* Same resolve -> appearance path radar.c uses, so this preview always
+         * matches the panel exactly (helicopter ring color, Important's
+         * yellow-fill/red-border, and anything added later). */
+        CraftAppearance appearance = CraftType_Appearance(resolved.type, resolved.aircraftType);
         char fill[8];
-        CraftType_ColorHtml(resolved.type, fill);
+        snprintf(fill, sizeof(fill), "#%06X", (unsigned)(appearance.colorRgb & 0xFFFFFFu));
         esp_err_t err;
         if (resolved.aircraftType == AIRCRAFT_HELICOPTER) {
-            /* Same solid-circle-with-gray-ring the radar draws, scaled to this
+            /* Same solid-circle-with-ring the radar draws, scaled to this
              * preview's SVG units (viewBox is half the panel's screen pixels). */
             err = SendFormat(req,
                 "<circle cx='%d' cy='%d' r='%d' fill='%s' "
                 "stroke='#%06X' stroke-width='%d'/>",
                 x, y, HELI_MARKER_DIAMETER_PX / 4, fill,
-                (unsigned)HELI_RING_RGB, HELI_RING_WIDTH_PX / 2);
+                (unsigned)appearance.ringRgb, appearance.ringWidthPx / 2);
+        } else if (appearance.ringWidthPx > 0) {
+            /* Important: yellow fill with a red outline - the closest SVG
+             * equivalent to the panel's filled-triangle-plus-stroke marker. */
+            err = SendFormat(req,
+                "<polygon points='%d,%d %d,%d %d,%d' fill='%s' stroke='#%06X' stroke-width='1' opacity='.95'/>",
+                x, y - 6, x - 5, y + 4, x + 5, y + 4, fill, (unsigned)appearance.ringRgb);
         } else {
             err = SendFormat(req,
                 "<polygon points='%d,%d %d,%d %d,%d' fill='%s' opacity='.9'/>",

@@ -92,7 +92,9 @@ static esp_err_t SendAircraftTypeOptions(httpd_req_t *req)
 static esp_err_t SendRow(httpd_req_t *req, const char *format, ...) __attribute__((format(printf, 2, 3)));
 static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
 {
-    char row[1536];
+    char row[4096]; /* grown from 1536: a Notes value can appear twice per row
+                     * (tooltip + data attribute) at up to MAX_RULE_NOTES*6
+                     * bytes escaped each, plus the existing cell/button text */
     va_list args;
     va_start(args, format);
     int n = vsnprintf(row, sizeof(row), format, args);
@@ -117,6 +119,7 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "<label id='lo' hidden>Airline / Operator <input type='text' id='fname' maxlength='39' autocomplete='off'></label>" \
     "<label>Craft Type <select id='ftype'></select></label>" \
     "<label>Aircraft Type <select id='fatype'></select></label>" \
+    "<label>Notes <input type='text' id='fnotes' maxlength='96' placeholder='optional' autocomplete='off'></label>" \
     "<p id='dmsg' role='alert'></p>" \
     "<p><button type='button' onclick='dSave()'>Save</button> <button type='button' id='dedit' hidden onclick='dUseExisting()'>Edit existing entry</button> " \
     "<button type='button' onclick='dClose()'>Cancel</button></p></div></dialog>"
@@ -125,7 +128,7 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "<script>" \
     "function editReg(b){var f=document.getElementById('regForm').elements;" \
     "f['prefix'].value=b.dataset.prefix;f['type'].value=b.dataset.type;" \
-    "f['atype'].value=b.dataset.atype;f['prefix'].focus();}" \
+    "f['atype'].value=b.dataset.atype;f['notes'].value=b.dataset.notes||'';f['prefix'].focus();}" \
     "function editOp(b){var f=document.getElementById('opForm').elements;" \
     "f['code'].value=b.dataset.code;f['code'].readOnly=(b.dataset.builtin==='1');" \
     "f['opname'].value=b.dataset.name;f['type'].value=b.dataset.type;" \
@@ -175,6 +178,8 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "$('ftype').value=reg?cur.regtype:cur.optype;" \
     "$('fatype').value=reg?(cur.regatype||'FIXED'):'FIXED';" \
     "$('fatype').closest('label').hidden=!reg;" \
+    "$('fnotes').value=reg?(cur.regnotes||''):'';" \
+    "$('fnotes').closest('label').hidden=!reg;" \
     "var has=reg?cur.hasreg==='1':cur.hasop==='1';" \
     "orig=has?$('fkey').value.toUpperCase():'';" \
     "$('fkey').readOnly=(!reg&&has);" \
@@ -186,19 +191,20 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "var p=new URLSearchParams();p.set('mode',mode);p.set('key',key);" \
     "if(mode==='op'){p.set('name',name);}" \
     "p.set('type',$('ftype').value);" \
-    "if(mode==='reg'){p.set('atype',$('fatype').value);}" \
+    "if(mode==='reg'){p.set('atype',$('fatype').value);p.set('notes',$('fnotes').value);}" \
     "p.set('overwrite',(orig&&key.toUpperCase()===orig)?'1':'0');" \
     "$('dmsg').textContent='Saving...';" \
     "try{var r=await fetch('/rules/save',{method:'POST',body:p});" \
     "var t=(await r.text()).split('\\n');" \
     "if(r.ok){D.close();try{sessionStorage.setItem('msg',t[1]||'Saved.');}catch(e){}location.reload();return;}" \
     "$('dmsg').textContent=t[1]||'Save failed.';" \
-    "if(r.status===409){ex={key:t[2],name:t[3],type:t[4],atype:t[5]};$('dedit').hidden=false;}" \
+    "if(r.status===409){ex={key:t[2],name:t[3],type:t[4],atype:t[5],notes:t[6]};$('dedit').hidden=false;}" \
     "}catch(e){$('dmsg').textContent='Could not reach the device.';}}" \
     "function dUseExisting(){if(!ex){return;}" \
     "$('fkey').value=ex.key;$('fkey').readOnly=(mode==='op');" \
     "if(mode==='op'){$('fname').value=ex.name;}" \
-    "$('ftype').value=ex.type;if(ex.atype){$('fatype').value=ex.atype;}orig=ex.key.toUpperCase();" \
+    "$('ftype').value=ex.type;if(ex.atype){$('fatype').value=ex.atype;}" \
+    "if(ex.notes!==undefined){$('fnotes').value=ex.notes;}orig=ex.key.toUpperCase();" \
     "$('dedit').hidden=true;$('dmsg').textContent='Editing the existing entry. Change it and press Save.';}" \
     "try{var m=sessionStorage.getItem('msg');if(m){sessionStorage.removeItem('msg');var bn=$('banner');bn.textContent=m;bn.hidden=false;}}catch(e){}"
 
@@ -277,9 +283,20 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
     else
         snprintf(decided, sizeof(decided), "%s", CraftSource_Name(resolved.source));
 
-    char eCs[128], eShown[128], eQuery[128], eReg[64], eName[256], eDecided[64];
+    /* Registry note, if any - not shown as its own column here (this table
+     * is meant to stay compact); carried instead as a data attribute for the
+     * Add/Edit dialog to prefill, and as a tooltip on the call sign cell. */
+    char regNotes[MAX_RULE_NOTES + 1] = "";
+    if (hasReg) {
+        CustomRule regRule;
+        if (CustomRules_Find(resolved.registryPrefix, &regRule))
+            snprintf(regNotes, sizeof(regNotes), "%s", regRule.notes);
+    }
+
+    char eCs[128], eShown[128], eQuery[128], eReg[64], eName[256], eDecided[64], eRegNotes[MAX_RULE_NOTES * 6 + 1];
     EscapeInto(eCs, sizeof(eCs), cs);
     EscapeInto(eShown, sizeof(eShown), cs[0] ? cs : "(empty)");
+    EscapeInto(eRegNotes, sizeof(eRegNotes), regNotes);
     EscapeInto(eQuery, sizeof(eQuery), cs[0] ? cs : hx);
     EscapeInto(eReg, sizeof(eReg), regKey);
     EscapeInto(eName, sizeof(eName), hasOp ? op.name : "");
@@ -292,16 +309,16 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
     const char *regAircraftType = AircraftType_CsvName(hasReg ? resolved.aircraftType : AIRCRAFT_FIXED_WING);
 
     return SendRow(req,
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>"
+        "<tr><td title='%s'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>"
         "<button type='button' data-q='%s' onclick='lookup(this)'%s>&#128270; Lookup</button>"
-        "<button type='button' data-cs='%s' data-reg='%s' data-regtype='%s' data-regatype='%s' data-hasreg='%s' "
-        "data-icao='%s' data-opname='%s' data-optype='%s' data-hasop='%s' onclick='dOpen(this)'>%s</button>"
+        "<button type='button' data-cs='%s' data-reg='%s' data-regtype='%s' data-regatype='%s' data-regnotes='%s' "
+        "data-hasreg='%s' data-icao='%s' data-opname='%s' data-optype='%s' data-hasop='%s' onclick='dOpen(this)'>%s</button>"
         "</td></tr>",
-        eShown, icao[0] ? icao : "---", CraftType_Name(resolved.type),
+        eRegNotes, eShown, icao[0] ? icao : "---", CraftType_Name(resolved.type),
         AircraftType_Name(resolved.aircraftType), eDecided,
         eQuery, eQuery[0] ? "" : " disabled",
-        eCs, eReg, regType, regAircraftType, hasReg ? "1" : "0",
-        icao, eName, opType, hasOp ? "1" : "0",
+        eCs, eReg, regType, regAircraftType, eRegNotes,
+        hasReg ? "1" : "0", icao, eName, opType, hasOp ? "1" : "0",
         (hasReg || hasOp) ? "&#9998; Edit" : "&#10133; Add");
 }
 
@@ -336,29 +353,31 @@ static esp_err_t RulesPage(httpd_req_t *req)
         "</select></label> <label>Aircraft type <select name='atype'>") != ESP_OK ||
         SendAircraftTypeOptions(req) != ESP_OK ||
         SendChunk(req,
-        "</select></label> <button>Add or update</button></form>"
+        "</select></label> <label>Notes <input name='notes' maxlength='96' placeholder='optional'></label> "
+        "<button>Add or update</button></form>"
         "<p><a href='/rules/export'>Download custom_rules.csv</a> &middot; "
         "<label style='display:inline'>Upload a replacement: <input type='file' id='importRulesFile' accept='.csv,text/csv'></label> "
         "<button type='button' onclick=\"importCsv('importRulesFile','/rules/import')\">Upload &amp; replace</button></p>"
-        "<table><tr><th>Registry / prefix</th><th>Craft Type</th><th>Aircraft Type</th><th>Action</th></tr>") != ESP_OK)
+        "<table><tr><th>Registry / prefix</th><th>Craft Type</th><th>Aircraft Type</th><th>Notes</th><th>Action</th></tr>") != ESP_OK)
         return ESP_FAIL;
 
     size_t count = CustomRules_Count();
-    if (!count && SendChunk(req, "<tr><td colspan='4'>No registry rules</td></tr>") != ESP_OK)
+    if (!count && SendChunk(req, "<tr><td colspan='5'>No registry rules</td></tr>") != ESP_OK)
         return ESP_FAIL;
     for (size_t i = 0; i < count; i++) {
         CustomRule rule;
-        char prefix[64];
+        char prefix[64], notes[MAX_RULE_NOTES * 6 + 1];
         if (!CustomRules_Get(i, &rule))
             continue;
         EscapeInto(prefix, sizeof(prefix), rule.prefix);
+        EscapeInto(notes, sizeof(notes), rule.notes);
         if (SendRow(req,
-                "<tr><td>%s</td><td>%s</td><td>%s</td><td>"
-                "<button type='button' data-prefix='%s' data-type='%s' data-atype='%s' onclick='editReg(this)'>Edit</button>"
+                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>"
+                "<button type='button' data-prefix='%s' data-type='%s' data-atype='%s' data-notes='%s' onclick='editReg(this)'>Edit</button>"
                 "<form class='inline' method='post' action='/delete'>"
                 "<input type='hidden' name='prefix' value='%s'><button>Delete</button></form></td></tr>",
-                prefix, CraftType_Name(rule.type), AircraftType_Name(rule.aircraftType),
-                prefix, CraftType_CsvName(rule.type), AircraftType_CsvName(rule.aircraftType), prefix) != ESP_OK)
+                prefix, CraftType_Name(rule.type), AircraftType_Name(rule.aircraftType), notes,
+                prefix, CraftType_CsvName(rule.type), AircraftType_CsvName(rule.aircraftType), notes, prefix) != ESP_OK)
             return ESP_FAIL;
     }
 
@@ -444,7 +463,11 @@ static esp_err_t RulesPage(httpd_req_t *req)
 
 /* ---- form parsing ---- */
 
-#define FORM_BODY_MAX 256
+/* Grown from 256 to fit a worst-case URL-encoded Notes value (up to
+ * MAX_RULE_NOTES chars, each up to 3 bytes encoded) alongside the other
+ * fields. This only grows a couple of small on-stack buffers per request;
+ * see the HTTPD memory note in PROJECT_STATE_COMPACT.md. */
+#define FORM_BODY_MAX 512
 
 static bool ReadForm(httpd_req_t *req, char body[FORM_BODY_MAX])
 {
@@ -596,7 +619,7 @@ static esp_err_t ImportOperators(httpd_req_t *req)
 
 static esp_err_t AddRule(httpd_req_t *req)
 {
-    char body[FORM_BODY_MAX], prefix[64], typeText[40], aircraftTypeText[24];
+    char body[FORM_BODY_MAX], prefix[64], typeText[40], aircraftTypeText[24], notesText[MAX_RULE_NOTES * 3 + 1];
     if (!ReadForm(req, body) || !FormValue(body, "prefix", prefix, sizeof(prefix)) ||
         !FormValue(body, "type", typeText, sizeof(typeText)))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
@@ -608,10 +631,16 @@ static esp_err_t AddRule(httpd_req_t *req)
     AircraftType aircraftType = AIRCRAFT_FIXED_WING;
     if (FormValue(body, "atype", aircraftTypeText, sizeof(aircraftTypeText)))
         AircraftType_Parse(aircraftTypeText, &aircraftType);
+    if (!FormValue(body, "notes", notesText, sizeof(notesText)))
+        notesText[0] = '\0';
     char normalized[MAX_RULE_PREFIX + 1];
     if (!CustomRules_NormalizePrefix(prefix, normalized))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Pattern must be 1-15 letters, digits, or ? characters");
-    if (!CustomRules_Add(normalized, type, aircraftType))
+    char normalizedNotes[MAX_RULE_NOTES + 1];
+    if (!CustomRules_NormalizeNotes(notesText, normalizedNotes))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Notes must be under 96 characters, without commas or quotes");
+    if (!CustomRules_Add(normalized, type, aircraftType, normalizedNotes))
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "Could not save rule (storage error)");
     LogHttpdMemory("registry save");
@@ -713,22 +742,32 @@ static esp_err_t SaveFromAircraft(httpd_req_t *req)
     if (FormValue(body, "atype", aircraftTypeText, sizeof(aircraftTypeText)))
         AircraftType_Parse(aircraftTypeText, &aircraftType);
 
-    char reply[384];
+    /* Notes only applies to registry entries; missing/invalid just means empty. */
+    char notesText[MAX_RULE_NOTES * 3 + 1];
+    if (!FormValue(body, "notes", notesText, sizeof(notesText)))
+        notesText[0] = '\0';
+
+    char reply[512];
     if (!strcmp(mode, "reg")) {
         char prefix[MAX_RULE_PREFIX + 1];
         if (!CustomRules_NormalizePrefix(key, prefix))
             return Reply(req, "400 Bad Request",
                          "ERR\nRegistry number must be 1-15 letters, digits, or ? characters.");
+        char normalizedNotes[MAX_RULE_NOTES + 1];
+        if (!CustomRules_NormalizeNotes(notesText, normalizedNotes))
+            return Reply(req, "400 Bad Request",
+                         "ERR\nNotes must be under 96 characters, without commas or quotes.");
         CustomRule existing;
         if (!overwrite && CustomRules_Find(prefix, &existing)) {
             snprintf(reply, sizeof(reply),
                      "EXISTS\n%s is already configured. Current: %s" ARROW "%s. "
-                     "Would you like to edit the existing entry?\n%s\n\n%s\n%s",
+                     "Would you like to edit the existing entry?\n%s\n\n%s\n%s\n%s",
                      prefix, prefix, CraftType_Name(existing.type), prefix,
-                     CraftType_CsvName(existing.type), AircraftType_CsvName(existing.aircraftType));
+                     CraftType_CsvName(existing.type), AircraftType_CsvName(existing.aircraftType),
+                     existing.notes);
             return Reply(req, "409 Conflict", reply);
         }
-        if (!CustomRules_Add(prefix, type, aircraftType))
+        if (!CustomRules_Add(prefix, type, aircraftType, normalizedNotes))
             return Reply(req, "500 Internal Server Error", "ERR\nCould not save (storage error).");
         snprintf(reply, sizeof(reply), "OK\nSaved registry rule %s" ARROW "%s, %s.", prefix,
                  CraftType_Name(type), AircraftType_Name(aircraftType));

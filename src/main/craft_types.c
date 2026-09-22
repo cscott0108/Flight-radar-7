@@ -8,19 +8,28 @@ typedef struct {
     const char *csvName;
     uint32_t colorRgb;
     CraftMarker marker;
+    bool hasBorder;      /* true only for Important: adds a border/outline on
+                          * top of the fill (yellow fill, red border) */
+    uint32_t borderRgb;
 } CraftTypeDef;
+
+/* Fixed-wing marker outline width when a craft type defines a border
+ * (currently only Important). Reuses the same ring mechanism the helicopter
+ * marker already uses (see CraftAppearance.ringWidthPx/ringRgb). */
+#define CRAFT_BORDER_WIDTH_PX 2
 
 /* Indexed by CraftType. */
 static const CraftTypeDef defs[CRAFT_TYPE_COUNT] = {
-    [CRAFT_PERSONAL]   = {"Personal",           "PERSONAL",  0xFFFFFF, CRAFT_MARKER_SMALL_OUTLINE}, /* White */
-    [CRAFT_PRIVATE]    = {"Private",            "PRIVATE",   0x9E9E9E, CRAFT_MARKER_TRIANGLE},      /* Grey */
-    [CRAFT_BUSINESS]   = {"Business",           "BUSINESS",  0xB0E0E6, CRAFT_MARKER_TRIANGLE},      /* Powder Blue */
-    [CRAFT_COMMERCIAL] = {"Commercial",         "COMMERCIAL",0xFF9800, CRAFT_MARKER_TRIANGLE},      /* Orange */
-    [CRAFT_CARGO]      = {"Cargo",              "CARGO",     0xA855F7, CRAFT_MARKER_TRIANGLE},      /* Purple */
-    [CRAFT_MILITARY]   = {"Military",           "MILITARY",  0x8A9A20, CRAFT_MARKER_TRIANGLE},      /* Olive */
-    [CRAFT_POLICE]     = {"Police",             "POLICE",    0x238BFF, CRAFT_MARKER_TRIANGLE},      /* Blue */
-    [CRAFT_EMERGENCY]  = {"Emergency Services", "EMERGENCY", 0xFF3030, CRAFT_MARKER_TRIANGLE},      /* Red */
-    [CRAFT_IMPORTANT]  = {"Important",          "IMPORTANT", 0xFF6EB4, CRAFT_MARKER_TRIANGLE},      /* Pink */
+    [CRAFT_PERSONAL]    = {"Personal",           "PERSONAL",    0xFFFFFF, CRAFT_MARKER_SMALL_OUTLINE, false, 0},       /* White */
+    [CRAFT_PRIVATE]     = {"Private",            "PRIVATE",     0x9E9E9E, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Grey */
+    [CRAFT_BUSINESS]    = {"Business",           "BUSINESS",    0xB0E0E6, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Powder Blue */
+    [CRAFT_COMMERCIAL]  = {"Commercial",         "COMMERCIAL",  0xFF9800, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Orange */
+    [CRAFT_CARGO]       = {"Cargo",              "CARGO",       0xA855F7, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Purple */
+    [CRAFT_MILITARY]    = {"Military",           "MILITARY",    0x8A9A20, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Olive */
+    [CRAFT_POLICE]      = {"Police",             "POLICE",      0x238BFF, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Blue */
+    [CRAFT_EMERGENCY]   = {"Emergency Services", "EMERGENCY",   0xFF3030, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Red */
+    [CRAFT_INTERESTING] = {"Interesting",        "INTERESTING", 0xFF6EB4, CRAFT_MARKER_TRIANGLE,      false, 0},       /* Pink (Important's old color) */
+    [CRAFT_IMPORTANT]   = {"Important",          "IMPORTANT",   0xFFFF00, CRAFT_MARKER_TRIANGLE,      true,  0xFF3030},/* Yellow fill, red border */
 };
 
 /* Short aliases for hand-editing CSV files. Canonical names are matched from
@@ -33,6 +42,7 @@ static const struct { const char *alias; CraftType type; } aliases[] = {
     {"MIL", CRAFT_MILITARY},
     {"POL", CRAFT_POLICE}, {"LEO", CRAFT_POLICE},
     {"EMERGENCY SERVICES", CRAFT_EMERGENCY}, {"EMG", CRAFT_EMERGENCY}, {"ES", CRAFT_EMERGENCY},
+    {"INT", CRAFT_INTERESTING},
     {"IMP", CRAFT_IMPORTANT},
 };
 
@@ -107,18 +117,28 @@ CraftAppearance CraftType_Appearance(CraftType type, AircraftType aircraftType)
 {
     CraftAppearance a;
     a.colorRgb = CraftType_ColorRgb(type); /* color always comes from the classification */
+    const CraftTypeDef *def = Def(type);
     if (aircraftType == AIRCRAFT_HELICOPTER) {
         a.marker = CRAFT_MARKER_SOLID_CIRCLE;
         a.sizePx = HELI_MARKER_DIAMETER_PX;
         a.ringWidthPx = HELI_RING_WIDTH_PX;
-        a.ringRgb = HELI_RING_RGB;
+        /* The ring is always present (never confused with an airport dot),
+         * but a craft type with its own border (currently only Important)
+         * uses that border color here instead of the fixed gray. */
+        a.ringRgb = def->hasBorder ? def->borderRgb : HELI_RING_RGB;
         a.selectRadiusPx = HELI_MARKER_DIAMETER_PX / 2 + 6;
     } else {
-        /* Fixed-Wing keeps the existing marker exactly as before. */
+        /* Fixed-Wing keeps the existing marker exactly as before, plus an
+         * outline for craft types that define a border (Important only). */
         a.marker = CraftType_Marker(type);
         a.sizePx = a.marker == CRAFT_MARKER_SMALL_OUTLINE ? 5 : 10;
-        a.ringWidthPx = 0;
-        a.ringRgb = 0;
+        if (def->hasBorder) {
+            a.ringWidthPx = CRAFT_BORDER_WIDTH_PX;
+            a.ringRgb = def->borderRgb;
+        } else {
+            a.ringWidthPx = 0;
+            a.ringRgb = 0;
+        }
         a.selectRadiusPx = a.sizePx + 6;
     }
     return a;
