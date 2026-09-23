@@ -121,7 +121,8 @@ static esp_err_t AirportsPage(httpd_req_t *req)
                     centerLat, centerLon, radiusKm, 190, &x, &y))
             continue;
         x += 200; y += 200;
-        CraftResolution resolved = ResolveAircraft(a.callsign, a.icao24);
+        CraftResolution resolved = ResolveAircraftWithHint(
+            a.callsign, a.icao24, a.providerTypeHint, a.hasProviderTypeHint);
         /* Same resolve -> appearance path radar.c uses, so this preview always
          * matches the panel exactly (helicopter ring color, Important's
          * yellow-fill/red-border, and anything added later). */

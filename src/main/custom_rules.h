@@ -122,3 +122,29 @@ CraftType evaluateAircraftType(const char *callsign, const char *hex);
  * used by every renderer (radar and web preview). */
 CraftAppearance ResolveAircraftAppearance(const char *callsign, const char *hex);
 const char *CraftSource_Name(CraftSource source);
+
+/* Multi-provider Aircraft Type resolution (see PROJECT_STATE.md "Automatic
+ * Aircraft Type Detection"). Precedence:
+ *
+ *   explicit registry Aircraft Type  (CRAFT_SRC_REGISTRY)
+ *       > providerHint (when hasHint)
+ *       > AIRCRAFT_FIXED_WING default
+ *
+ * An explicit registry entry is authoritative regardless of its value
+ * (including a registry rule that explicitly says Fixed-Wing) - a provider
+ * must never silently override a manual registry Aircraft Type assignment.
+ * When no registry rule matched, the provider's hint (if any) is used
+ * instead of the plain Fixed-Wing default. Classification (CraftType/color)
+ * resolution is unaffected; only the aircraftType (shape) differs from
+ * plain ResolveAircraft(). */
+CraftResolution ResolveAircraftWithHint(
+    const char *callsign,
+    const char *hex,
+    AircraftType providerHint,
+    bool hasHint);
+
+CraftAppearance ResolveAircraftAppearanceWithHint(
+    const char *callsign,
+    const char *hex,
+    AircraftType providerHint,
+    bool hasHint);

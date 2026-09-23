@@ -1066,3 +1066,32 @@ CraftAppearance ResolveAircraftAppearance(const char *callsign, const char *hex)
     CraftResolution resolved = ResolveAircraft(callsign, hex);
     return CraftType_Appearance(resolved.type, resolved.aircraftType);
 }
+
+CraftResolution ResolveAircraftWithHint(
+    const char *callsign,
+    const char *hex,
+    AircraftType providerHint,
+    bool hasHint)
+{
+    CraftResolution result = ResolveAircraft(callsign, hex);
+
+    /* A registry rule (whatever aircraftType it carries, including the
+     * default Fixed-Wing) is an explicit, user-configured decision about
+     * this specific aircraft and always wins. Otherwise, if the provider
+     * offered a usable type hint, use it in place of the plain
+     * Fixed-Wing default. */
+    if (result.source != CRAFT_SRC_REGISTRY && hasHint && AircraftType_IsValid((int)providerHint))
+        result.aircraftType = providerHint;
+
+    return result;
+}
+
+CraftAppearance ResolveAircraftAppearanceWithHint(
+    const char *callsign,
+    const char *hex,
+    AircraftType providerHint,
+    bool hasHint)
+{
+    CraftResolution resolved = ResolveAircraftWithHint(callsign, hex, providerHint, hasHint);
+    return CraftType_Appearance(resolved.type, resolved.aircraftType);
+}

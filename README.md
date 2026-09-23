@@ -4,7 +4,7 @@
 
 **A real-time ADS-B flight radar built for the Elecrow 7" CrowPanel Basic HMI display.**
 
-Live aircraft data from the **OpenSky Network API**, rendered on an animated, sweep-style radar screen — fully configured through an on-device WebUI, no reflashing required.
+Live aircraft data from **OpenSky Network** or **adsb.lol**, rendered on an animated, sweep-style radar screen — fully configured through an on-device WebUI, no reflashing required.
 
 *A heavily modified fork of the original Flight Radar project by Tech Talkies.*
 
@@ -19,18 +19,27 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
 
 ## ✨ Key Features
 
+### 🌐 Aircraft Data & Providers
+
+- **Two supported data providers, switchable from the WebUI:**
+  - **OpenSky Network** (default) — the original data source, ~4000 requests/day, requires free OpenSky client credentials.
+  - **adsb.lol** — a community-run ADSBExchange-compatible API. No account or credentials needed.
+- **Automatic Aircraft Type detection (adsb.lol only)** — adsb.lol's ADS-B category field gives a best-effort hint (helicopter, glider/UAV/lighter-than-air, ground vehicle), but it's only ever a *hint*: any aircraft you've manually classified in the registry keeps your manual choice, always. OpenSky's own category data is too unreliable to use for this and is never consulted.
+- **Provider diagnostics mode** — Off / Normal / Verbose / Raw, toggled from the WebUI, no reflashing. Verbose shows exactly why each aircraft got the Aircraft Type it did (provider hint vs. your registry override); Raw adds a size-capped, credential-redacted preview of the provider's response for troubleshooting.
+- Switching providers is instant and doesn't require reconfiguring your radar location, range, or classification rules — they're shared across both.
+
 ### 🌐 WebUI & Display Management
 
 - **Brightness control** — full LCD backlight adjustment from the WebUI, including a manual slider.
 - **Day/night scheduling** — separate poll-interval and brightness behavior for day vs. night, on a configurable local time window (UTC offset in minutes, e.g. PDT = `-420`, PST = `-480`).
 - **Idle dimming** — automatically dims the backlight after a period with zero aircraft in range, restoring instantly when traffic reappears.
-- **Low-traffic poll slowdown** — stretches the OpenSky polling interval when few or no aircraft are nearby, to conserve API quota.
+- **Low-traffic poll slowdown** — stretches the polling interval when few or no aircraft are nearby, to conserve API quota.
 - **Airfield map markers** — define custom airport/airfield reference dots on the radar, each with **its own configurable color** (not just a fixed red).
 
 ### 🎨 Aircraft Classification & Visuals
 
 - **Runway-style compass** — clean outer ring with compact 2-digit aviation headings (`36`, `09`, `18`, `27`).
-- **"Craft Type" classification** — replaces OpenSky's unreliable/empty `category` field with a fully custom, user-editable classification system covering **ten** categories:
+- **"Craft Type" classification** — a fully custom, user-editable classification system covering **ten** categories, independent of whichever data provider is active:
 
   | Type | Color | Type | Color |
   |---|---|---|---|
@@ -40,14 +49,14 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
   | Commercial | 🟠 Orange | Interesting *(personal watchlist)* | 🩷 Pink |
   | Cargo | 🟣 Purple | Important *(VIP / high-priority)* | 🟡 Yellow fill, 🔴 red border |
 
-- **Manual Aircraft Type (Fixed-Wing / Helicopter / Other)** — independent of classification color. Any registered aircraft can be manually marked as a **Helicopter** (solid circle) or **Other** (diamond, for uncommon aircraft — airships, autogyros, and the like), instead of the usual triangle. This is deliberately manual: OpenSky has no reliable way to tell fixed-wing, rotary-wing, and other unusual aircraft apart, so it's never guessed automatically.
+- **Aircraft Type (Fixed-Wing / Helicopter / Other)** — independent of classification color. Any aircraft can be marked as a **Helicopter** (solid circle) or **Other** (diamond, for uncommon aircraft — airships, autogyros, and the like) instead of the usual triangle, either automatically (adsb.lol hint) or manually via a registry rule. A manual registry rule always wins over the automatic hint, even if that rule just confirms Fixed-Wing.
 - **Directional indicators** — Helicopter and Other markers both show heading: a short line through the helicopter's ring, and a small gray/black forward tip on the Other diamond. Both use the radar's usual north-up convention and simply don't draw if heading is unavailable.
 - **Marker hierarchy:**
   - **Personal** aircraft (the default/fallback): small **hollow outline triangle**.
   - **Important:** solid filled triangle with a **red outline** — yellow fill, red border, for maximum visibility.
   - **Every other classification:** solid filled triangle, colored per the table above.
-  - **Any classification, when manually marked as a Helicopter:** solid circle (≈18px) with a ring in that classification's color, plus a heading line in the same color — e.g. a Police helicopter is a blue-ringed circle, an Emergency helicopter is a red one. An Important helicopter's ring (and heading line) is red (matching its border), while every other classification's ring is a fixed gray.
-  - **Any classification, when manually marked as Other:** a classification-colored **diamond** with a fixed gray/black forward tip showing heading — e.g. a pink diamond for Interesting, an olive diamond for Military. Important's diamond gets its usual red outline in addition to the yellow fill; the tip stays gray/black regardless of classification.
+  - **Any classification, when marked as a Helicopter:** solid circle (≈18px) with a ring in that classification's color, plus a heading line in the same color — e.g. a Police helicopter is a blue-ringed circle, an Emergency helicopter is a red one. An Important helicopter's ring (and heading line) is red (matching its border), while every other classification's ring is a fixed gray.
+  - **Any classification, when marked as Other:** a classification-colored **diamond** with a fixed gray/black forward tip showing heading — e.g. a pink diamond for Interesting, an olive diamond for Military. Important's diamond gets its usual red outline in addition to the yellow fill; the tip stays gray/black regardless of classification.
 
 ### 🏷️ Custom Callsigns, Registrations & Operators
 
@@ -60,9 +69,9 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
 
 ### ⚙️ Telemetry, Filtering & Stability
 
-- **Ground traffic filter** — hides grounded aircraft (on-ground flag, or near-zero altitude *and* speed as a fallback for feeders that omit the flag).
-- **API rate-limit guard** — detects HTTP 429 quota exhaustion, shows an on-screen warning banner, and backs off for an hour before retrying automatically.
-- **Toggleable serial debug logging** — inspect raw OpenSky payloads over Serial without reflashing.
+- **Ground traffic filter** — hides grounded aircraft (on-ground flag, or near-zero altitude *and* speed as a fallback for feeders that omit the flag), applied identically regardless of which provider is active.
+- **API rate-limit guard** — detects rate-limit responses from the active provider, shows an on-screen warning banner naming that provider, and backs off automatically before retrying (an hour for OpenSky's documented quota, a shorter conservative pause for adsb.lol, which publishes no fixed quota).
+- **Toggleable serial debug logging** — inspect raw OpenSky fields, or the new multi-level provider diagnostics (Normal/Verbose/Raw, covering both providers), over Serial without reflashing.
 
 ---
 
@@ -73,7 +82,7 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
 | **Hardware** | Elecrow CrowPanel Basic 7" — ESP32-S3, 800×480 RGB TFT |
 | **Framework** | ESP-IDF v6.1 / FreeRTOS |
 | **Graphics** | LVGL 8.4, UI laid out in SquareLine Studio, driven via the ESP32-S3's native RGB LCD peripheral (`esp_lcd`) |
-| **Data source** | OpenSky Network REST API |
+| **Data sources** | OpenSky Network REST API (default), adsb.lol REST API |
 
 > **Note on touch:** this board has a GT911 capacitive touch controller, but it does not respond over I2C on this particular unit — a known, community-documented hardware-level issue with this SKU rather than a bug in this firmware. All configuration is done through the WebUI instead.
 
@@ -82,17 +91,26 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
 ## 🚀 Configuration & Usage
 
 1. **Wi-Fi & WebUI setup** — on first boot, connect to the device's fallback access point and configure your home Wi-Fi. Once connected, access the WebUI at the device's IP address.
-2. **OpenSky credentials** — upload your OpenSky API client credentials through the WebUI to authorize polling.
-3. **Radar & classification setup** — set your center latitude/longitude and range, timezone/UTC offset, day/night and idle-dim schedules, and your custom aircraft/operator classification rules.
+2. **Choose a data provider** — from the Radar Settings page, pick **OpenSky Network** (upload your free OpenSky client credentials through the WebUI) or **adsb.lol** (no credentials needed — just select it and go).
+3. **Radar & classification setup** — set your center latitude/longitude and range, timezone/UTC offset, day/night and idle-dim schedules, and your custom aircraft/operator classification rules. These apply the same way no matter which provider you've picked.
 
 ---
 
 ## 🗺️ Roadmap
 
 - [ ] Adjustable/independent distance-ring spacing
-- [ ] ADS-B receiver hardware integration (local reception, not just OpenSky)
+- [ ] ADS-B receiver hardware integration (local reception, not just remote APIs)
 - [ ] Automatic DST switching for the day/night UTC offset (currently a manual twice-a-year setting)
+- [ ] Aircraft-type inference from adsb.lol's ICAO type code (`t` field), as a secondary signal alongside the current ADS-B category-based hint
 - [ ] Revisit touchscreen support if a working fix for this board's GT911 issue ever surfaces
+
+---
+
+## ⚠️ Current Status & Limitations
+
+- The multi-provider architecture (OpenSky + adsb.lol, automatic Aircraft Type hints, provider diagnostics) has been **host-tested** (the registry/classification resolution logic and the adsb.lol category-mapping logic run against a suite of automated checks on a development machine) but has **not yet been built with the ESP-IDF toolchain or run on real hardware**. Review the code before flashing a device you depend on, and expect to do a normal build/flash/verify pass.
+- adsb.lol's ground-vehicle categories (ADS-B category `C0`–`C7`) are shown with the same diamond marker as other "Other" aircraft, since there's no dedicated ground-vehicle shape; a registry rule can override this per-aircraft if it's noisy at your location.
+- adsb.lol publishes no fixed rate limit, so this project applies its own conservative polling floor and backoff rather than a documented provider limit.
 
 ---
 

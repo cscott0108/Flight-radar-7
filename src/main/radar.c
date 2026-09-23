@@ -587,9 +587,11 @@ static void radar_draw_cb(
             continue;
         }
 
-        /* One decision point: classification -> color, aircraft type -> shape. */
+        /* One decision point: classification -> color, aircraft type -> shape
+         * (registry override > provider hint > Fixed-Wing default). */
         const CraftAppearance look =
-            ResolveAircraftAppearance(a->callsign, a->icao24);
+            ResolveAircraftAppearanceWithHint(a->callsign, a->icao24,
+                                               a->providerTypeHint, a->hasProviderTypeHint);
 
         DrawAircraft(
             draw_ctx,

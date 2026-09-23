@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -95,13 +96,9 @@ static void LogHttpMemory(const char *stage)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
-#define MAX_AIRCRAFT 200
-
-// An aircraft this low AND this slow is treated as parked/taxiing ground
-// clutter (or a ground vehicle broadcasting ADS-B) rather than a real
-// selectable target, even if OpenSky's own on_ground flag is missing.
-#define GROUND_ALTITUDE_THRESHOLD_M 15.0f  // ~49 ft
-#define GROUND_VELOCITY_THRESHOLD_MS 8.5f  // ~30.6 km/h
+// GROUND_ALTITUDE_THRESHOLD_M / GROUND_VELOCITY_THRESHOLD_MS now live in
+// aircraft_provider.h, shared with every provider so ground filtering is
+// identical regardless of which one is active.
 
 // Logs every raw field OpenSky's /states/all endpoint provides for one
 // state vector, by array index, to the serial console. Only called (see
@@ -171,13 +168,12 @@ static void LogOpenSkyStateFields(cJSON *state)
     ESP_LOGI(TAG_DBG, "-----------------------------------");
 }
 
-Aircraft gAircraft[MAX_AIRCRAFT];
-int gAircraftCount = 0;
-
 bool OpenSky_ParseAircraft(
     const char *json)
 {
     gAircraftCount = 0;
+    int rawCount = 0;
+    int rejectedCount = 0;
 
     cJSON *root =
         cJSON_Parse(json);
@@ -197,12 +193,15 @@ bool OpenSky_ParseAircraft(
     if (!states || cJSON_IsNull(states))
     {
         cJSON_Delete(root);
+        ProviderDiag_ParseResult("OpenSky", true, 0, 0, 0);
         return true;
     }
 
     if (!cJSON_IsArray(states))
     {
         cJSON_Delete(root);
+        ProviderDiag_Warning("OpenSky", "\"states\" field was present but not an array/null");
+        ProviderDiag_ParseResult("OpenSky", false, 0, 0, 0);
         return false;
     }
 
@@ -222,6 +221,8 @@ bool OpenSky_ParseAircraft(
         if (!cJSON_IsArray(state))
             continue;
 
+        rawCount++;
+
         Aircraft *a =
             &gAircraft[gAircraftCount];
 
@@ -229,6 +230,12 @@ bool OpenSky_ParseAircraft(
             a,
             0,
             sizeof(Aircraft));
+
+        /* OpenSky's own category field is unreliable/mostly empty (see
+         * README), so it is never surfaced as an Aircraft Type hint - shape
+         * always falls through to the registry or the Fixed-Wing default. */
+        a->hasProviderTypeHint = false;
+        a->providerTypeHint = AIRCRAFT_FIXED_WING;
 
         cJSON *icao =
             cJSON_GetArrayItem(state, 0);
@@ -261,6 +268,7 @@ bool OpenSky_ParseAircraft(
             !cJSON_IsNumber(lat) ||
             !cJSON_IsNumber(lon))
         {
+            rejectedCount++;
             continue;
         }
 
@@ -319,6 +327,7 @@ bool OpenSky_ParseAircraft(
 
         if (reportedOnGround || looksParked)
         {
+            rejectedCount++;
             continue;
         }
 
@@ -353,9 +362,22 @@ bool OpenSky_ParseAircraft(
                           portTICK_PERIOD_MS;
 
         gAircraftCount++;
+
+        if (AircraftProvider_GetDebugLevel() >= PROVIDER_DEBUG_VERBOSE)
+        {
+            CraftResolution resolved = ResolveAircraftWithHint(
+                a->callsign, a->icao24, a->providerTypeHint, a->hasProviderTypeHint);
+            const char *regName = (resolved.source == CRAFT_SRC_REGISTRY) ?
+                AircraftType_Name(resolved.aircraftType) : "none";
+            ProviderDiag_TypeResolution(
+                a->icao24, "" /* OpenSky exposes no usable category */,
+                false, AIRCRAFT_FIXED_WING, regName, resolved.aircraftType);
+        }
     }
 
     cJSON_Delete(root);
+
+    ProviderDiag_ParseResult("OpenSky", true, rawCount, gAircraftCount, rejectedCount);
 
     return true;
 }
@@ -622,10 +644,9 @@ bool OpenSky_HasCredentials(void)
 }
 
 bool OpenSky_GetAircraftJson(
-    float minLat,
-    float maxLat,
-    float minLon,
-    float maxLon,
+    float centerLat,
+    float centerLon,
+    float radiusKm,
     const char **json)
 {
     if (!json || !responseBuffer)
@@ -645,6 +666,17 @@ bool OpenSky_GetAircraftJson(
     responseLength = 0;
     responseBuffer[0] = '\0';
 
+    // OpenSky's states/all endpoint wants a lat/lon bounding box rather than
+    // a point+radius; this is an OpenSky-specific query shape and stays
+    // entirely inside this file (see aircraft_provider.h).
+    float latDelta = radiusKm / 111.0f;
+    float lonDelta = radiusKm / (111.0f * cosf(centerLat * (float)M_PI / 180.0f));
+
+    float minLat = centerLat - latDelta;
+    float maxLat = centerLat + latDelta;
+    float minLon = centerLon - lonDelta;
+    float maxLon = centerLon + lonDelta;
+
     char url[512];
 
     snprintf(
@@ -659,6 +691,10 @@ bool OpenSky_GetAircraftJson(
         maxLon);
 
     ESP_LOGI(TAG, "Request URL: %s", url);
+    // The bounding box is not sensitive, so it's fine to show in full at
+    // Normal diagnostics (unlike the OAuth request, which never logs its
+    // body/headers - see RequestToken()).
+    ProviderDiag_RequestStart("OpenSky", "aircraft request", url);
     LogHttpMemory("Before aircraft TLS");
 
     esp_http_client_config_t config =
@@ -721,6 +757,7 @@ ESP_LOGI(TAG, "RequestToken start");
             "HTTP GET failed: %s",
             esp_err_to_name(err));
 
+        ProviderDiag_RequestDone("OpenSky", "aircraft request", 0, 0, false);
         esp_http_client_cleanup(client);
         return false;
     }
@@ -735,6 +772,9 @@ ESP_LOGI(TAG, "RequestToken start");
         (unsigned)responseLength);
 
     esp_http_client_cleanup(client);
+
+    ProviderDiag_RequestDone("OpenSky", "aircraft request", status, responseLength, status == 200);
+    ProviderDiag_RawPreview("OpenSky", responseBuffer, responseLength);
 
     if (status == 429)
     {

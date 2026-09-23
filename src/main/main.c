@@ -26,6 +26,8 @@
 
 #include "esp_http_client.h"
 #include "opensky_client.h"
+#include "adsblol_client.h"
+#include "aircraft_provider.h"
 #include "webserver.h"
 #include "radar.h"
 #include "custom_rules.h"
@@ -966,6 +968,21 @@ static uint32_t GetEffectivePollIntervalSeconds(void)
 {
     uint32_t baseInterval = radarRefreshSec;
 
+    uint32_t providerMin = AircraftProvider_MinPollIntervalSeconds();
+    if (baseInterval < providerMin)
+    {
+        static uint32_t lastWarnedInterval = 0;
+        if (baseInterval != lastWarnedInterval)
+        {
+            ESP_LOGW("AircraftProvider",
+                     "Configured refresh interval (%us) is below the active provider's safe "
+                     "minimum (%us); using %us instead",
+                     (unsigned)baseInterval, (unsigned)providerMin, (unsigned)providerMin);
+            lastWarnedInterval = baseInterval;
+        }
+        baseInterval = providerMin;
+    }
+
     if (radarDayNightEnabled)
     {
         time_t now = time(NULL);
@@ -1191,7 +1208,7 @@ static void wifi_event_handler(
             "IP: %s",
             ipStr);
 
-        if (OpenSky_HasCredentials())
+        if (AircraftProvider_HasCredentials())
             lv_obj_add_flag(uic_DialogConfigReq, LV_OBJ_FLAG_HIDDEN);
 
         InitTime();
@@ -1500,12 +1517,11 @@ static void ui_status_timer_cb(lv_timer_t *t)
                 lv_obj_set_style_text_color(uic_LabelConnection, lv_color_hex(0x00FF00), 0);
             }
 
-            OpenSky_Init();
-
             ESP_LOGI(
-                "OpenSky",
-                "Has creds: %d",
-                OpenSky_HasCredentials());
+                "AircraftProvider",
+                "Active provider: %s, has creds: %d",
+                AircraftProviderType_Name(AircraftProvider_GetActive()),
+                AircraftProvider_HasCredentials());
 
             StartWebServer();
         }
@@ -1533,45 +1549,19 @@ static void radar_update_timer_cb(void *pvParameters)
     while (1)
     {
         if (wifiConnectedState &&
-            OpenSky_HasCredentials() &&
-            OpenSky_GetRateLimitSeconds() == 0)
+            AircraftProvider_HasCredentials() &&
+            AircraftProvider_GetRateLimitSeconds() == 0)
         {
-            float centerLat = radarLat;
-            float centerLon = radarLon;
-            float radiusKm = radarRangeKm;
-
-            float latDelta =
-                radiusKm / 111.0f;
-
-            float lonDelta =
-                radiusKm /
-                (111.0f *
-                 cosf(centerLat *
-                      M_PI / 180.0f));
-
-            float minLat =
-                centerLat - latDelta;
-
-            float maxLat =
-                centerLat + latDelta;
-
-            float minLon =
-                centerLon - lonDelta;
-
-            float maxLon =
-                centerLon + lonDelta;
-
             const char *json = NULL;
-            if (OpenSky_GetAircraftJson(
-                    minLat,
-                    maxLat,
-                    minLon,
-                    maxLon,
+            if (AircraftProvider_GetAircraftJson(
+                    radarLat,
+                    radarLon,
+                    radarRangeKm,
                     &json))
             {
-                if (OpenSky_ParseAircraft(json))
+                if (AircraftProvider_ParseAircraft(json))
                 {
-                    ESP_LOGI("OpenSky", "Aircraft in response: %d", gAircraftCount);
+                    ESP_LOGI("AircraftProvider", "Aircraft in response: %d", gAircraftCount);
                     lastApiUpdateMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
                     if (lvgl_port_lock(0))
@@ -1584,7 +1574,7 @@ static void radar_update_timer_cb(void *pvParameters)
                 }
                 else
                 {
-                    ESP_LOGE("OpenSky", "Aircraft JSON parse failed");
+                    ESP_LOGE("AircraftProvider", "Aircraft JSON parse failed");
                 }
             }
         }
@@ -1634,7 +1624,7 @@ static void RadarPredictTask(
 
         if (lvgl_port_lock(-1))
         {
-            uint32_t cooldownSeconds = OpenSky_GetRateLimitSeconds();
+            uint32_t cooldownSeconds = AircraftProvider_GetRateLimitSeconds();
             if (rateLimitUiLabel) {
                 if (cooldownSeconds) {
                     lv_obj_clear_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
@@ -1642,7 +1632,8 @@ static void RadarPredictTask(
                     static uint32_t shownMinutes = UINT32_MAX;
                     if (minutes != shownMinutes) {
                         lv_label_set_text_fmt(rateLimitUiLabel,
-                            "OpenSky API call limit exceeded (HTTP 429)\nRetry in %lu min",
+                            "%s API call limit exceeded\nRetry in %lu min",
+                            AircraftProviderType_Name(AircraftProvider_GetActive()),
                             (unsigned long)minutes);
                         shownMinutes = minutes;
                     }
@@ -1704,6 +1695,13 @@ void app_main()
         ESP_LOGW("CRAFT_RULES", "Could not load one or more saved craft lists; built-in classification remains active");
     if (!Airports_Init())
         ESP_LOGW("AIRPORTS", "Could not load saved airport dots");
+
+    // Loads the persisted provider selection/debug level and initializes
+    // every provider (OpenSky credentials, response buffers) unconditionally
+    // at boot - not gated on Wi-Fi - so the settings page reflects the
+    // correct saved provider even before/without a network connection (e.g.
+    // the Flight-Radar-Setup fallback AP).
+    AircraftProvider_Init();
 
     // Lock the mutex due to the LVGL APIs are not thread-safe
     if (lvgl_port_lock(-1))

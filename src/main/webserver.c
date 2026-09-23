@@ -17,6 +17,7 @@
 #include "esp_system.h"
 #include "main.h"
 #include "radar.h"
+#include "aircraft_provider.h"
 #include "web_rules.h"
 #include "web_airports.h"
 
@@ -401,6 +402,22 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
                                        "Idle dim percent must be between 0 and 10");
 
         idleDimPercent = (uint32_t)parsed;
+    }
+
+    char providerText[24];
+    AircraftProviderType providerType;
+    if (FormValue(body, "provider", providerText, sizeof(providerText)) &&
+        AircraftProviderType_Parse(providerText, &providerType))
+    {
+        AircraftProvider_SetActive(providerType);
+    }
+
+    char providerDebugText[24];
+    ProviderDebugLevel debugLevel;
+    if (FormValue(body, "provider_debug", providerDebugText, sizeof(providerDebugText)) &&
+        ProviderDebugLevel_Parse(providerDebugText, &debugLevel))
+    {
+        AircraftProvider_SetDebugLevel(debugLevel);
     }
 
     SetRadarSettings(latitude, longitude, range);
@@ -816,8 +833,15 @@ static esp_err_t RootHandler(
         "<label>Latitude <input name='latitude' type='number' step='any' min='-90' max='90' value='%s'></label>"
         "<label>Longitude <input name='longitude' type='number' step='any' min='-180' max='180' value='%s'></label>"
         "<label>Range <input name='range' type='number' step='any' min='1' max='5000' value='%s'> km</label>"
-        "<label>OpenSky refresh interval <input name='refresh' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
-        "<small>10-600 s. Values below 25 s risk exceeding the 4000 requests/day API limit.</small>"
+        "<label>Aircraft data refresh interval <input name='refresh' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
+        "<small>10-600 s. Values below 25 s risk exceeding OpenSky's 4000 requests/day API limit; the active provider's own safe minimum is enforced automatically either way.</small>"
+        "</fieldset>"
+        "<fieldset><legend>Aircraft data provider</legend>"
+        "<label>Provider <select name='provider'>"
+        "<option value='OPENSKY'%s>OpenSky Network</option>"
+        "<option value='ADSBLOL'%s>adsb.lol</option>"
+        "</select></label>"
+        "<small>OpenSky needs the client credentials configured above/below; adsb.lol is a free community API and needs no credentials. Switching providers takes effect on the next poll.</small>"
         "</fieldset>"
         "<details><summary>Reduce polling when quiet</summary>"
         "<label>Slow down to a longer interval when fewer than "
@@ -852,6 +876,13 @@ static esp_err_t RootHandler(
         "<details><summary>Debugging</summary>"
         "<label><input name='opensky_debug' type='checkbox'%s> Log raw OpenSky fields for the selected aircraft</label>"
         "<small>Dumps every field OpenSky's API returns (by index) for the Selected Craft aircraft to the serial console on each poll. Turn this on to see what's available before wiring a new field into the Selected Craft panel, then turn it back off &mdash; no reflash needed either way.</small>"
+        "<label>Provider diagnostics <select name='provider_debug'>"
+        "<option value='OFF'%s>Off</option>"
+        "<option value='NORMAL'%s>Normal</option>"
+        "<option value='VERBOSE'%s>Verbose</option>"
+        "<option value='RAW'%s>Raw</option>"
+        "</select></label>"
+        "<small>Off: nothing logged. Normal: request/response status and aircraft counts for the active provider. Verbose: adds per-aircraft Aircraft Type resolution (provider category, hint, registry override, final result). Raw: adds a bounded, credential-redacted preview of the raw response body. Applies to whichever provider is selected above.</small>"
         "</details>"
         "<button type='submit'>Save settings</button>"
         "</form>"
@@ -944,6 +975,8 @@ static esp_err_t RootHandler(
         lonStr,
         rangeStr,
         (unsigned long)GetRadarRefreshSeconds(),
+        (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_OPENSKY) ? " selected" : "",
+        (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_ADSBLOL) ? " selected" : "",
         (unsigned long)GetRadarLowTrafficThreshold(),
         (unsigned long)GetRadarLowTrafficIntervalSeconds(),
         GetRadarDayNightEnabled() ? " checked" : "",
@@ -960,6 +993,10 @@ static esp_err_t RootHandler(
         (unsigned long)GetRadarIdleDimPercent(),
         Radar_GetAutoSelectClosest() ? " checked" : "",
         GetRadarOpenSkyDebugEnabled() ? " checked" : "",
+        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_OFF) ? " selected" : "",
+        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_NORMAL) ? " selected" : "",
+        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_VERBOSE) ? " selected" : "",
+        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_RAW) ? " selected" : "",
         (unsigned long)GetRadarBrightness(),
         (unsigned long)GetRadarBrightness());
 
