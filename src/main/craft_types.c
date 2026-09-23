@@ -124,9 +124,31 @@ CraftAppearance CraftType_Appearance(CraftType type, AircraftType aircraftType)
         a.ringWidthPx = HELI_RING_WIDTH_PX;
         /* The ring is always present (never confused with an airport dot),
          * but a craft type with its own border (currently only Important)
-         * uses that border color here instead of the fixed gray. */
+         * uses that border color here instead of the fixed gray. The
+         * heading-direction line drawn inside the ring (draw_aircraft.c)
+         * always matches this same ringRgb, so Important's line is red like
+         * its ring and every other classification's line is the usual gray -
+         * this is not a new classification-specific rule, just the existing
+         * one applied to one more visual element on the same marker. */
         a.ringRgb = def->hasBorder ? def->borderRgb : HELI_RING_RGB;
         a.selectRadiusPx = HELI_MARKER_DIAMETER_PX / 2 + 6;
+    } else if (aircraftType == AIRCRAFT_OTHER) {
+        a.marker = CRAFT_MARKER_DIAMOND;
+        a.sizePx = OTHER_MARKER_SIZE_PX; /* vertex distance from center, like the triangle marker */
+        /* Diamond outline follows the same craft-type border rule the
+         * fixed-wing triangle already uses (currently only Important); the
+         * forward tip is unconditional and always gray/black, drawn by
+         * draw_aircraft.c using OTHER_TIP_RGB rather than this field, so it
+         * never becomes classification-specific even when a border is set
+         * here. */
+        if (def->hasBorder) {
+            a.ringWidthPx = CRAFT_BORDER_WIDTH_PX;
+            a.ringRgb = def->borderRgb;
+        } else {
+            a.ringWidthPx = 0;
+            a.ringRgb = 0;
+        }
+        a.selectRadiusPx = a.sizePx + 6;
     } else {
         /* Fixed-Wing keeps the existing marker exactly as before, plus an
          * outline for craft types that define a border (Important only). */
@@ -153,12 +175,16 @@ bool AircraftType_IsValid(int aircraftType)
 
 const char *AircraftType_Name(AircraftType t)
 {
-    return t == AIRCRAFT_HELICOPTER ? "Helicopter" : "Fixed-Wing";
+    if (t == AIRCRAFT_HELICOPTER) return "Helicopter";
+    if (t == AIRCRAFT_OTHER) return "Other";
+    return "Fixed-Wing";
 }
 
 const char *AircraftType_CsvName(AircraftType t)
 {
-    return t == AIRCRAFT_HELICOPTER ? "HELI" : "FIXED";
+    if (t == AIRCRAFT_HELICOPTER) return "HELI";
+    if (t == AIRCRAFT_OTHER) return "OTHER";
+    return "FIXED";
 }
 
 bool AircraftType_Parse(const char *token, AircraftType *out)
@@ -169,6 +195,7 @@ bool AircraftType_Parse(const char *token, AircraftType *out)
         {"FIXED WING", AIRCRAFT_FIXED_WING}, {"FW", AIRCRAFT_FIXED_WING},
         {"HELI", AIRCRAFT_HELICOPTER}, {"HELICOPTER", AIRCRAFT_HELICOPTER},
         {"HELO", AIRCRAFT_HELICOPTER},
+        {"OTHER", AIRCRAFT_OTHER}, {"OTH", AIRCRAFT_OTHER}, {"MISC", AIRCRAFT_OTHER},
     };
     char upper[16];
     if (!token || !out)

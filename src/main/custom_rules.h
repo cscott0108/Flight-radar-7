@@ -10,8 +10,8 @@
  *   Registry (custom_rules.csv):   PREFIX,TYPE[,AIRCRAFT[,NOTES]] - explicit
  *                                  per-aircraft (registration / call sign)
  *                                  classification, plus the manual aircraft
- *                                  type (FIXED or HELI; optional, a missing
- *                                  one means Fixed-Wing) and optional
+ *                                  type (FIXED, HELI or OTHER; optional, a
+ *                                  missing one means Fixed-Wing) and optional
  *                                  free-text Notes (MAX_RULE_NOTES chars,
  *                                  no commas/quotes). VIP/special-mission
  *                                  prefixes (SAM, SPAR, EXEC, PAT -> Important)

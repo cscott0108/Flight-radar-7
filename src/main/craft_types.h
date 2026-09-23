@@ -29,7 +29,8 @@ typedef enum {
 typedef enum {
     CRAFT_MARKER_SMALL_OUTLINE = 0, /* small outlined triangle (Personal) */
     CRAFT_MARKER_TRIANGLE,          /* standard filled triangle (all others) */
-    CRAFT_MARKER_SOLID_CIRCLE       /* helicopter: filled circle with a gray ring */
+    CRAFT_MARKER_SOLID_CIRCLE,      /* helicopter: filled circle with a gray ring */
+    CRAFT_MARKER_DIAMOND            /* other: classification-colored diamond with a directional tip */
 } CraftMarker;
 
 /* Aircraft type is a MANUAL designation, independent of the craft type
@@ -39,6 +40,7 @@ typedef enum {
 typedef enum {
     AIRCRAFT_FIXED_WING = 0, /* default: the existing marker for the craft type */
     AIRCRAFT_HELICOPTER,     /* solid circle in the craft type's color */
+    AIRCRAFT_OTHER,          /* uncommon aircraft (airship, autogyro, etc): diamond */
     AIRCRAFT_TYPE_COUNT
 } AircraftType;
 
@@ -47,6 +49,15 @@ typedef enum {
 #define HELI_MARKER_DIAMETER_PX 18
 #define HELI_RING_WIDTH_PX 3         /* band drawn inside the 18 px circle */
 #define HELI_RING_RGB 0x707070       /* gray band; sets helicopters apart from airport dots */
+
+/* Other marker geometry. sizePx mirrors the standard filled-triangle marker's
+ * vertex-distance scale (see CraftType_Appearance) so it reads as a similar
+ * footprint on the radar, just a different silhouette. The forward tip is a
+ * fixed gray/black indicator - it reuses the existing helicopter-ring gray
+ * rather than inventing a new configurable color, and is never
+ * classification-specific (unlike the diamond's fill/outline, which are). */
+#define OTHER_MARKER_SIZE_PX 10
+#define OTHER_TIP_RGB HELI_RING_RGB
 
 /* The one authoritative answer to "how do I draw this aircraft". */
 typedef struct {
@@ -76,9 +87,9 @@ CraftAppearance CraftType_Appearance(CraftType type, AircraftType aircraftType);
 
 size_t AircraftType_Count(void);
 bool AircraftType_IsValid(int aircraftType);
-const char *AircraftType_Name(AircraftType t);    /* "Fixed-Wing", "Helicopter" */
-const char *AircraftType_CsvName(AircraftType t); /* "FIXED", "HELI" - canonical file/form token */
-/* Case-insensitive; accepts FIXED, FIXED-WING, FW, HELI, HELICOPTER, HELO. */
+const char *AircraftType_Name(AircraftType t);    /* "Fixed-Wing", "Helicopter", "Other" */
+const char *AircraftType_CsvName(AircraftType t); /* "FIXED", "HELI", "OTHER" - canonical file/form token */
+/* Case-insensitive; accepts FIXED, FIXED-WING, FW, HELI, HELICOPTER, HELO, OTHER, OTH. */
 bool AircraftType_Parse(const char *token, AircraftType *out);
 
 /* Case-insensitive; accepts canonical names, CSV tokens and short aliases.

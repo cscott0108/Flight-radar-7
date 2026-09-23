@@ -40,12 +40,14 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
   | Commercial | 🟠 Orange | Interesting *(personal watchlist)* | 🩷 Pink |
   | Cargo | 🟣 Purple | Important *(VIP / high-priority)* | 🟡 Yellow fill, 🔴 red border |
 
-- **Manual Aircraft Type (Fixed-Wing / Helicopter)** — independent of classification color. Any registered aircraft can be manually marked as a helicopter, rendering it as a **solid circle with a ring** in its classification's color, instead of the usual triangle. This is deliberately manual: OpenSky has no reliable way to tell fixed-wing and rotary-wing aircraft apart, so it's never guessed automatically.
+- **Manual Aircraft Type (Fixed-Wing / Helicopter / Other)** — independent of classification color. Any registered aircraft can be manually marked as a **Helicopter** (solid circle) or **Other** (diamond, for uncommon aircraft — airships, autogyros, and the like), instead of the usual triangle. This is deliberately manual: OpenSky has no reliable way to tell fixed-wing, rotary-wing, and other unusual aircraft apart, so it's never guessed automatically.
+- **Directional indicators** — Helicopter and Other markers both show heading: a short line through the helicopter's ring, and a small gray/black forward tip on the Other diamond. Both use the radar's usual north-up convention and simply don't draw if heading is unavailable.
 - **Marker hierarchy:**
   - **Personal** aircraft (the default/fallback): small **hollow outline triangle**.
   - **Important:** solid filled triangle with a **red outline** — yellow fill, red border, for maximum visibility.
   - **Every other classification:** solid filled triangle, colored per the table above.
-  - **Any classification, when manually marked as a Helicopter:** solid circle (≈18px) with a ring in that classification's color — e.g. a Police helicopter is a blue-ringed circle, an Emergency helicopter is a red one. An Important helicopter's ring is red (matching its border), while every other classification's ring is a fixed gray.
+  - **Any classification, when manually marked as a Helicopter:** solid circle (≈18px) with a ring in that classification's color, plus a heading line in the same color — e.g. a Police helicopter is a blue-ringed circle, an Emergency helicopter is a red one. An Important helicopter's ring (and heading line) is red (matching its border), while every other classification's ring is a fixed gray.
+  - **Any classification, when manually marked as Other:** a classification-colored **diamond** with a fixed gray/black forward tip showing heading — e.g. a pink diamond for Interesting, an olive diamond for Military. Important's diamond gets its usual red outline in addition to the yellow fill; the tip stays gray/black regardless of classification.
 
 ### 🏷️ Custom Callsigns, Registrations & Operators
 
@@ -87,7 +89,6 @@ Live aircraft data from the **OpenSky Network API**, rendered on an animated, sw
 
 ## 🗺️ Roadmap
 
-- [ ] Aircraft trails and path history
 - [ ] Adjustable/independent distance-ring spacing
 - [ ] ADS-B receiver hardware integration (local reception, not just OpenSky)
 - [ ] Automatic DST switching for the day/night UTC offset (currently a manual twice-a-year setting)

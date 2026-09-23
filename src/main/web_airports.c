@@ -128,15 +128,56 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         CraftAppearance appearance = CraftType_Appearance(resolved.type, resolved.aircraftType);
         char fill[8];
         snprintf(fill, sizeof(fill), "#%06X", (unsigned)(appearance.colorRgb & 0xFFFFFFu));
+        const bool haveHeading = isfinite(a.heading);
+        const float h = haveHeading ? a.heading * 0.0174532925f : 0.0f;
         esp_err_t err;
         if (resolved.aircraftType == AIRCRAFT_HELICOPTER) {
             /* Same solid-circle-with-ring the radar draws, scaled to this
              * preview's SVG units (viewBox is half the panel's screen pixels). */
+            const int r = HELI_MARKER_DIAMETER_PX / 4;
             err = SendFormat(req,
                 "<circle cx='%d' cy='%d' r='%d' fill='%s' "
                 "stroke='#%06X' stroke-width='%d'/>",
-                x, y, HELI_MARKER_DIAMETER_PX / 4, fill,
+                x, y, r, fill,
                 (unsigned)appearance.ringRgb, appearance.ringWidthPx / 2);
+            /* Directional heading indicator, mirroring the panel: a short
+             * line in the same color as the ring, only drawn for a finite
+             * heading so it never implies a direction that isn't known. */
+            if (err == ESP_OK && haveHeading) {
+                const int lineRadius = r - appearance.ringWidthPx / 2;
+                if (lineRadius > 0)
+                    err = SendFormat(req,
+                        "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#%06X' stroke-width='1'/>",
+                        x, y, x + (int)(sinf(h) * lineRadius), y - (int)(cosf(h) * lineRadius),
+                        (unsigned)appearance.ringRgb);
+            }
+        } else if (resolved.aircraftType == AIRCRAFT_OTHER) {
+            /* Diamond, mirroring the panel's marker: classification-colored
+             * body, an outline only if this classification has one
+             * (Important), and a fixed gray/black forward tip when heading
+             * is known. Without a heading the diamond still renders, just
+             * pointed "up" and without the tip. */
+            const int size = 6, side = 4;
+            const int nx = x + (int)(sinf(h) * size), ny = y - (int)(cosf(h) * size);
+            const int rx = x + (int)(sinf(h + 1.5707963f) * side), ry = y - (int)(cosf(h + 1.5707963f) * side);
+            const int tx = x + (int)(sinf(h + 3.1415927f) * side), ty = y - (int)(cosf(h + 3.1415927f) * side);
+            const int lx = x + (int)(sinf(h - 1.5707963f) * side), ly = y - (int)(cosf(h - 1.5707963f) * side);
+            if (appearance.ringWidthPx > 0)
+                err = SendFormat(req,
+                    "<polygon points='%d,%d %d,%d %d,%d %d,%d' fill='%s' stroke='#%06X' stroke-width='1'/>",
+                    nx, ny, rx, ry, tx, ty, lx, ly, fill, (unsigned)appearance.ringRgb);
+            else
+                err = SendFormat(req,
+                    "<polygon points='%d,%d %d,%d %d,%d %d,%d' fill='%s' opacity='.9'/>",
+                    nx, ny, rx, ry, tx, ty, lx, ly, fill);
+            if (err == ESP_OK && haveHeading) {
+                const float tipDist = size * 0.5f;
+                const int tlx = x + (int)(sinf(h + 1.0f) * tipDist), tly = y - (int)(cosf(h + 1.0f) * tipDist);
+                const int trx = x + (int)(sinf(h - 1.0f) * tipDist), tryY = y - (int)(cosf(h - 1.0f) * tipDist);
+                err = SendFormat(req,
+                    "<polygon points='%d,%d %d,%d %d,%d' fill='#%06X'/>",
+                    nx, ny, tlx, tly, trx, tryY, (unsigned)OTHER_TIP_RGB);
+            }
         } else if (appearance.ringWidthPx > 0) {
             /* Important: yellow fill with a red outline - the closest SVG
              * equivalent to the panel's filled-triangle-plus-stroke marker. */
@@ -156,7 +197,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "<circle id='candidate' cx='200' cy='200' r='6' fill='#FF0000' "
         "stroke='white' stroke-width='2' visibility='hidden'/></svg>"
         "<p><small>Circles are saved airports (in their chosen color); triangles are fixed-wing "
-        "aircraft and ringed dots are helicopters, both at page load. "
+        "aircraft, ringed dots are helicopters, and diamonds are other aircraft types, all at page load. "
         "The white-rimmed red dot is your unsaved placement.</small></p>"
         "<h2 id='editor'>Add or edit airport</h2>"
         "<form id='airportForm' method='post' action='/airports/save'>"

@@ -343,7 +343,7 @@ static bool SaveRulesToCsv(void)
     fprintf(f, "# One rule per line: PREFIX,TYPE,AIRCRAFT,NOTES\n");
     fprintf(f, "# TYPE is one of PERSONAL, PRIVATE, BUSINESS, COMMERCIAL, CARGO, MILITARY (MIL),\n");
     fprintf(f, "# POLICE (LEO), EMERGENCY (ES), INTERESTING (INT), IMPORTANT.\n");
-    fprintf(f, "# AIRCRAFT is FIXED or HELI (manual designation; optional, a missing value means FIXED).\n");
+    fprintf(f, "# AIRCRAFT is FIXED, HELI or OTHER (manual designation; optional, a missing value means FIXED).\n");
     fprintf(f, "# NOTES is free text, optional, up to %d characters, no commas or quotes.\n", MAX_RULE_NOTES);
     fprintf(f, "# Prefix matches ignore case and include any following flight number.\n");
     fprintf(f, "# Use ? for one unknown letter or digit (e.g. S?NFRD). The longest matching rule wins.\n");

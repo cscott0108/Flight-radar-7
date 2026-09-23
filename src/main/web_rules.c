@@ -74,7 +74,7 @@ static esp_err_t SendTypeOptions(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* One <option> per manual aircraft type (Fixed-Wing / Helicopter). */
+/* One <option> per manual aircraft type (Fixed-Wing / Helicopter / Other). */
 static esp_err_t SendAircraftTypeOptions(httpd_req_t *req)
 {
     char option[96];
