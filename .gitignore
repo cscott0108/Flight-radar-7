@@ -12,3 +12,7 @@ src/.vscode/
 dependencies.lock
 src/dependencies.lock
 src/dependencies.lock.bak
+
+# Project Change Logs
+PROJECT_STATE_COMPACT.md
+PROJECT_STATE.md

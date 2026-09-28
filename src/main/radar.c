@@ -24,13 +24,22 @@ char selectedIcao24[16] = "";
 int selectedAircraft = -1;
 static bool autoSelectClosest = false;
 
+/* Forward declaration: full definition (with the "one authoritative
+ * geographic-offset calculation" doc comment) is below, next to
+ * Radar_ProjectPosition and Radar_GeoBearingAndDistance, which share it. */
+static bool Radar_GeoOffsetKm(float lat, float lon, float centerLat, float centerLon,
+                              float *eastKmOut, float *northKmOut);
+
 static float AircraftDistanceKm(const Aircraft *aircraft)
 {
     // Use the dead-reckoned position so auto-select-closest tracks aircraft
-    // between API polls rather than only at poll time.
-    float eastKm = (aircraft->predictedLon - radarCenterLon) *
-                   111.0f * cosf(radarCenterLat * 0.0174532925f);
-    float northKm = (aircraft->predictedLat - radarCenterLat) * 111.0f;
+    // between API polls rather than only at poll time. Shares the one
+    // authoritative geo-offset calculation with Radar_ProjectPosition and
+    // Radar_GeoBearingAndDistance (defined below in this file) instead of
+    // keeping its own copy of the east/north-km math.
+    float eastKm = 0.0f, northKm = 0.0f;
+    Radar_GeoOffsetKm(aircraft->predictedLat, aircraft->predictedLon,
+                      radarCenterLat, radarCenterLon, &eastKm, &northKm);
     return sqrtf(eastKm * eastKm + northKm * northKm);
 }
 
@@ -189,12 +198,19 @@ void Radar_SweepTick(void)
     }
 }
 
-bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLon,
-                           float radiusKm, int radiusPixels, int *x, int *y)
+/* The one authoritative geographic-offset calculation (flat-earth
+ * approximation, valid at radar ranges): east/north km from
+ * (centerLat,centerLon) to (lat,lon). Radar_ProjectPosition (screen
+ * position) and Radar_GeoBearingAndDistance (bearing/range, for the
+ * off-screen indicator) both derive from this and nothing else, so the
+ * coordinate system can never disagree with itself. */
+static bool Radar_GeoOffsetKm(float lat, float lon, float centerLat, float centerLon,
+                              float *eastKmOut, float *northKmOut)
 {
-    if (!x || !y || !isfinite(lat) || !isfinite(lon) || !isfinite(centerLat) ||
-        !isfinite(centerLon) || !isfinite(radiusKm) || radiusKm <= 0 || radiusPixels <= 0)
+    if (!eastKmOut || !northKmOut || !isfinite(lat) || !isfinite(lon) ||
+        !isfinite(centerLat) || !isfinite(centerLon))
         return false;
+
     float dx =
         lon - centerLon;
 
@@ -211,11 +227,20 @@ bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLo
             3.14159265f /
             180.0f);
 
-    float eastKm =
-        dx * kmPerDegLon;
+    *eastKmOut = dx * kmPerDegLon;
+    *northKmOut = dy * kmPerDegLat;
+    return true;
+}
 
-    float northKm =
-        dy * kmPerDegLat;
+bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLon,
+                           float radiusKm, int radiusPixels, int *x, int *y)
+{
+    if (!x || !y || !isfinite(radiusKm) || radiusKm <= 0 || radiusPixels <= 0)
+        return false;
+
+    float eastKm, northKm;
+    if (!Radar_GeoOffsetKm(lat, lon, centerLat, centerLon, &eastKm, &northKm))
+        return false;
 
     float distance =
         sqrtf(
@@ -235,6 +260,28 @@ bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLo
         (int)((-northKm / radiusKm) *
               radiusPixels);
 
+    return true;
+}
+
+bool Radar_GeoBearingAndDistance(float lat, float lon, float centerLat, float centerLon,
+                                 float *bearingDegOut, float *distanceKmOut)
+{
+    if (!bearingDegOut || !distanceKmOut)
+        return false;
+
+    float eastKm, northKm;
+    if (!Radar_GeoOffsetKm(lat, lon, centerLat, centerLon, &eastKm, &northKm))
+        return false;
+
+    *distanceKmOut = sqrtf(eastKm * eastKm + northKm * northKm);
+
+    /* Compass bearing (0=N, 90=E): atan2(east, north), same north-up
+     * convention as DrawAircraft's heading math (x=sin(bearing)*r,
+     * y=-cos(bearing)*r) and DrawCompassLabel, normalized to [0,360). */
+    float bearing = atan2f(eastKm, northKm) * (180.0f / 3.14159265f);
+    if (bearing < 0.0f)
+        bearing += 360.0f;
+    *bearingDegOut = bearing;
     return true;
 }
 
@@ -375,6 +422,156 @@ static void DrawBoldLabel(
         &shifted,
         text,
         NULL);
+}
+
+// Draws one airport marker at the given screen position. Dot mode (or a
+// directional marker whose runway text doesn't currently resolve to a valid
+// axis - see Airport_ParseRunwayAxis) draws the original plain dot;
+// otherwise draws the "[=( )=]"-style runway-axis marker: a short line along
+// the runway's physical axis, a perpendicular end-cap tick at each end, and
+// a small center dot, all in the airport's own configured color. Geometry
+// (axis math, line/cap lengths) is shared with the /airports SVG preview via
+// airports.h/.c - this function is only the LVGL-specific draw calls.
+static void DrawAirportMarker(
+    lv_draw_ctx_t *draw_ctx,
+    int cx,
+    int cy,
+    const AirportMarker *airport)
+{
+    const lv_color_t color = lv_color_hex(airport->color);
+    float axisDeg;
+    const bool directional =
+        airport->markerMode == AIRPORT_MARKER_DIRECTIONAL &&
+        Airport_ParseRunwayAxis(airport->runway, &axisDeg);
+
+    int centerDiameter = airport->diameter;
+    if (directional)
+    {
+        float dx1, dy1, dx2, dy2;
+        const float lineLength = airport->diameter * AIRPORT_RUNWAY_LINE_LENGTH_FACTOR;
+        Airport_RunwayAxisOffsets(axisDeg, lineLength, &dx1, &dy1, &dx2, &dy2);
+
+        const lv_point_t end1 = {cx + (int)lroundf(dx1), cy + (int)lroundf(dy1)};
+        const lv_point_t end2 = {cx + (int)lroundf(dx2), cy + (int)lroundf(dy2)};
+
+        lv_draw_line_dsc_t line;
+        lv_draw_line_dsc_init(&line);
+        line.color = color;
+        line.width = 2;
+        lv_draw_line(draw_ctx, &line, &end1, &end2);
+
+        // End-cap ticks: short segments perpendicular to the axis (+90 deg),
+        // centered on each runway end - the "[" and "]" of "[=( )=]".
+        float cdx, cdy, unusedX, unusedY;
+        const float capLength = airport->diameter * AIRPORT_RUNWAY_CAP_LENGTH_FACTOR;
+        Airport_RunwayAxisOffsets(axisDeg + 90.0f, capLength, &cdx, &cdy, &unusedX, &unusedY);
+
+        const lv_point_t cap1a = {end1.x - (int)lroundf(cdx), end1.y - (int)lroundf(cdy)};
+        const lv_point_t cap1b = {end1.x + (int)lroundf(cdx), end1.y + (int)lroundf(cdy)};
+        lv_draw_line(draw_ctx, &line, &cap1a, &cap1b);
+
+        const lv_point_t cap2a = {end2.x - (int)lroundf(cdx), end2.y - (int)lroundf(cdy)};
+        const lv_point_t cap2b = {end2.x + (int)lroundf(cdx), end2.y + (int)lroundf(cdy)};
+        lv_draw_line(draw_ctx, &line, &cap2a, &cap2b);
+
+        centerDiameter = (int)(airport->diameter * AIRPORT_RUNWAY_CENTER_DIAMETER_FACTOR);
+        if (centerDiameter < 4)
+            centerDiameter = 4;
+    }
+
+    const int half = centerDiameter / 2;
+    lv_area_t dotArea = {
+        .x1 = cx - half, .y1 = cy - half,
+        .x2 = cx - half + centerDiameter - 1,
+        .y2 = cy - half + centerDiameter - 1
+    };
+    lv_draw_rect_dsc_t dot;
+    lv_draw_rect_dsc_init(&dot);
+    dot.bg_color = color;
+    dot.bg_opa = LV_OPA_COVER;
+    dot.radius = LV_RADIUS_CIRCLE;
+    lv_draw_rect(draw_ctx, &dot, &dotArea);
+}
+
+// Off-screen aircraft boundary indicators (PHASE 6). Bounded so a burst of
+// out-of-range traffic can't grow this LVGL-draw-callback's stack usage
+// unpredictably (the LVGL task runs on a deliberately small 6 KB stack - see
+// PROJECT_STATE.md capacity audit); any indicators beyond this are simply
+// not drawn; nothing else about the radar is affected.
+#define MAX_OFFSCREEN_INDICATORS 24
+
+typedef struct
+{
+    float bearingDeg;
+    uint32_t colorRgb;
+} OffscreenIndicator;
+
+// Small triangular "blip" on the outer ring, pointing outward, at the given
+// true bearing from radar center. Position is geographic-bearing-only (never
+// aircraft heading, per PHASE 6) and uses the same Ring 3 pixel radius the
+// rings/sweep/on-screen aircraft already use - so it moves correctly with
+// radar range without any range value ever being hard-coded here.
+static void DrawOffscreenIndicator(
+    lv_draw_ctx_t *draw_ctx,
+    int cx,
+    int cy,
+    int ring3RadiusPx,
+    float bearingDeg,
+    uint32_t colorRgb)
+{
+    const float rad = bearingDeg * 0.0174532925f;
+    const float ux = sinf(rad);  // outward unit vector, north-up convention
+    const float uy = -cosf(rad);
+    const float px = -uy; // perpendicular unit vector
+    const float py = ux;
+
+    const float apexR = ring3RadiusPx + 7.0f;
+    const float baseR = ring3RadiusPx - 3.0f;
+    const float halfWidth = 4.0f;
+
+    const lv_point_t apex = {
+        cx + (int)lroundf(ux * apexR),
+        cy + (int)lroundf(uy * apexR)};
+    const lv_point_t base1 = {
+        cx + (int)lroundf(ux * baseR + px * halfWidth),
+        cy + (int)lroundf(uy * baseR + py * halfWidth)};
+    const lv_point_t base2 = {
+        cx + (int)lroundf(ux * baseR - px * halfWidth),
+        cy + (int)lroundf(uy * baseR - py * halfWidth)};
+
+    lv_draw_rect_dsc_t fill;
+    lv_draw_rect_dsc_init(&fill);
+    fill.bg_color = lv_color_hex(colorRgb);
+    fill.bg_opa = LV_OPA_COVER;
+    lv_point_t tri[3] = {apex, base1, base2};
+    lv_draw_triangle(draw_ctx, &fill, tri);
+}
+
+// Ascending-bearing insertion sort followed by a single forward pass that
+// nudges any indicator less than minGapDeg past its predecessor - a simple,
+// bounded separation pass ("do not over-engineer" per PROJECT_STATE.md), not
+// a clustering/grouping algorithm. count is always <= MAX_OFFSCREEN_INDICATORS.
+static void SeparateOffscreenIndicators(OffscreenIndicator *indicators, int count)
+{
+    const float minGapDeg = 3.5f;
+
+    for (int i = 1; i < count; i++)
+    {
+        OffscreenIndicator key = indicators[i];
+        int j = i - 1;
+        while (j >= 0 && indicators[j].bearingDeg > key.bearingDeg)
+        {
+            indicators[j + 1] = indicators[j];
+            j--;
+        }
+        indicators[j + 1] = key;
+    }
+
+    for (int i = 1; i < count; i++)
+    {
+        if (indicators[i].bearingDeg - indicators[i - 1].bearingDeg < minGapDeg)
+            indicators[i].bearingDeg = indicators[i - 1].bearingDeg + minGapDeg;
+    }
 }
 
 static void radar_draw_cb(
@@ -540,7 +737,51 @@ static void radar_draw_cb(
             &p2);
     }
 
-    // Airports sit above the sweep and rings, but below aircraft icons.
+    // Off-screen aircraft boundary indicators (PHASE 6): known aircraft
+    // beyond Ring 3, placed purely by geographic bearing from radar center
+    // (never aircraft heading), on Ring 3 itself. Drawn above the sweep/
+    // rings but below airports and on-screen aircraft. Uses the same
+    // gAircraft[] tracking/validity state and the same Ring 3 geographic
+    // radius (radarRadiusKm) and pixel radius (radius) as everything else -
+    // no second aircraft list, no hard-coded range.
+    {
+        static OffscreenIndicator indicators[MAX_OFFSCREEN_INDICATORS];
+        int indicatorCount = 0;
+
+        for (int i = 0; i < gAircraftCount && indicatorCount < MAX_OFFSCREEN_INDICATORS; i++)
+        {
+            Aircraft *a = &gAircraft[i];
+            if (!a->valid)
+                continue;
+
+            float bearingDeg, distanceKm;
+            if (!Radar_GeoBearingAndDistance(a->predictedLat, a->predictedLon,
+                                             radarCenterLat, radarCenterLon,
+                                             &bearingDeg, &distanceKm))
+                continue; // non-finite predicted position: never guess
+
+            if (distanceKm <= radarRadiusKm)
+                continue; // inside Ring 3: the normal marker below covers it
+
+            const CraftAppearance look =
+                ResolveAircraftAppearanceWithHint(a->callsign, a->icao24,
+                                                   a->providerTypeHint, a->hasProviderTypeHint);
+            indicators[indicatorCount].bearingDeg = bearingDeg;
+            indicators[indicatorCount].colorRgb = look.colorRgb;
+            indicatorCount++;
+        }
+
+        SeparateOffscreenIndicators(indicators, indicatorCount);
+
+        for (int i = 0; i < indicatorCount; i++)
+        {
+            DrawOffscreenIndicator(draw_ctx, cx, cy, radius,
+                                   indicators[i].bearingDeg, indicators[i].colorRgb);
+        }
+    }
+
+    // Airports sit above the sweep, rings and off-screen indicators, but
+    // below aircraft icons.
     size_t airportCount = Airports_Count();
     for (size_t i = 0; i < airportCount; i++)
     {
@@ -551,18 +792,7 @@ static void radar_draw_cb(
                                    radarCenterLat, radarCenterLon,
                                    radarRadiusKm, radius, &px, &py))
             continue;
-        int half = airport.diameter / 2;
-        lv_area_t dotArea = {
-            .x1 = cx + px - half, .y1 = cy + py - half,
-            .x2 = cx + px - half + airport.diameter - 1,
-            .y2 = cy + py - half + airport.diameter - 1
-        };
-        lv_draw_rect_dsc_t dot;
-        lv_draw_rect_dsc_init(&dot);
-        dot.bg_color = lv_color_hex(airport.color);
-        dot.bg_opa = LV_OPA_COVER;
-        dot.radius = LV_RADIUS_CIRCLE;
-        lv_draw_rect(draw_ctx, &dot, &dotArea);
+        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport);
     }
 
     for (int i = 0;

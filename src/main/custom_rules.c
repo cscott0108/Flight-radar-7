@@ -180,6 +180,26 @@ bool Operators_NormalizeCode(const char *input, char out[MAX_OPERATOR_CODE + 1])
 
 /* Trims, then accepts 1..MAX_OPERATOR_NAME printable ASCII characters. Commas
  * and double quotes are rejected so the CSV never needs quoting. */
+bool Operators_CodeFromCallsign(const char *callsign, char out[MAX_OPERATOR_CODE + 1])
+{
+    out[0] = '\0';
+    if (!callsign)
+        return false;
+    while (*callsign == ' ')
+        callsign++;
+    for (int i = 0; i < 3; i++) {
+        char ch = callsign[i];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')))
+            return false;
+    }
+    if (callsign[3] < '0' || callsign[3] > '9')
+        return false;
+    for (int i = 0; i < 3; i++)
+        out[i] = UpperChar(callsign[i]);
+    out[3] = '\0';
+    return true;
+}
+
 bool Operators_NormalizeName(const char *input, char out[MAX_OPERATOR_NAME + 1])
 {
     if (!input || !out)
@@ -975,10 +995,20 @@ const char *CraftSource_Name(CraftSource source)
     }
 }
 
+const char *AircraftTypeSource_Name(AircraftTypeSource source)
+{
+    switch (source) {
+    case ATYPE_SRC_REGISTRY: return "Registry";
+    case ATYPE_SRC_PROVIDER: return "Provider";
+    default: return "Default";
+    }
+}
+
 CraftResolution ResolveAircraft(const char *callsign, const char *hex)
 {
     (void)hex; /* Reserved for future ICAO address rules. */
     CraftResolution result = {.type = CRAFT_PERSONAL, .aircraftType = AIRCRAFT_FIXED_WING,
+                              .aircraftTypeSource = ATYPE_SRC_DEFAULT,
                               .source = CRAFT_SRC_FALLBACK, .operatorCode = "", .registryPrefix = ""};
     if (!callsign)
         callsign = "";
@@ -994,6 +1024,7 @@ CraftResolution ResolveAircraft(const char *callsign, const char *hex)
             if (length > longest && MatchesRulePattern(callsign, rules[i].prefix)) {
                 result.type = rules[i].type;
                 result.aircraftType = rules[i].aircraftType;
+                result.aircraftTypeSource = ATYPE_SRC_REGISTRY;
                 result.source = CRAFT_SRC_REGISTRY;
                 strcpy(result.registryPrefix, rules[i].prefix);
                 longest = length;
@@ -1080,8 +1111,10 @@ CraftResolution ResolveAircraftWithHint(
      * this specific aircraft and always wins. Otherwise, if the provider
      * offered a usable type hint, use it in place of the plain
      * Fixed-Wing default. */
-    if (result.source != CRAFT_SRC_REGISTRY && hasHint && AircraftType_IsValid((int)providerHint))
+    if (result.source != CRAFT_SRC_REGISTRY && hasHint && AircraftType_IsValid((int)providerHint)) {
         result.aircraftType = providerHint;
+        result.aircraftTypeSource = ATYPE_SRC_PROVIDER;
+    }
 
     return result;
 }

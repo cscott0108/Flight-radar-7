@@ -9,6 +9,13 @@ float GetRadarLat(void);
 float GetRadarLon(void);
 float GetRadarRange(void);
 
+/* Highest gAircraftCount observed since boot (post ground-filter - the same
+ * count already used everywhere else; the architecture doesn't separately
+ * retain a pre-filter provider count). Used only by the /diag page (PHASE 13
+ * runtime capacity report); updated once per successful poll, nothing else
+ * reads or resets it. */
+int GetMaxAircraftCountSinceBoot(void);
+
 void SetRadarSettings(
     float lat,
     float lon,
@@ -34,15 +41,24 @@ void SetRadarLowTrafficIntervalSeconds(
     uint32_t seconds);
 
 bool GetRadarDayNightEnabled(void);
+// The fixed offset used by the "Custom fixed UTC offset" time zone.
 int32_t GetRadarUtcOffsetMinutes(void);
 uint32_t GetRadarDayStartHour(void);
 uint32_t GetRadarDayEndHour(void);
 uint32_t GetRadarDayIntervalSeconds(void);
 uint32_t GetRadarNightIntervalSeconds(void);
 
+// Time zone and Automatic DST (see time_util.h). zoneId is an IANA id from
+// the built-in table or "CUSTOM"; customOffsetMinutes applies only to
+// "CUSTOM". Persisted to NVS; every time-dependent feature reads it through
+// time_util, so nothing else stores a zone.
+void SetRadarTimeZone(
+    const char *zoneId,
+    bool autoDst,
+    int32_t customOffsetMinutes);
+
 void SetRadarDayNightSchedule(
     bool enabled,
-    int32_t utcOffsetMinutes,
     uint32_t dayStartHour,
     uint32_t dayEndHour,
     uint32_t dayIntervalSec,

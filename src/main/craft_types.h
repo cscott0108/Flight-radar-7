@@ -96,3 +96,17 @@ bool AircraftType_Parse(const char *token, AircraftType *out);
  * legacyFile=true reads a pre-version-2 CSV, where PRIVATE (and PRV) meant
  * the old small-aircraft category and therefore map to Personal. */
 bool CraftType_Parse(const char *token, bool legacyFile, CraftType *out);
+
+/* ---- web UI icons ----
+ *
+ * Inline-SVG renderings of the radar markers, generated from the same
+ * definitions (CraftType_Appearance + the geometry constants above) so the web
+ * UI never invents its own shapes. Emit AircraftType_IconDefs() ONCE per page
+ * (it defines the <symbol>s, hidden), then AircraftType_IconUse() wherever an
+ * icon is wanted: it picks the symbol matching the resolved marker and sets the
+ * fill (craft type color) and ring/border color as CSS custom properties.
+ *
+ * Both return the number of bytes written (excluding the NUL), or 0 if `out`
+ * was too small (nothing is written then except a terminating NUL). */
+size_t AircraftType_IconDefs(char *out, size_t cap);
+size_t CraftType_IconUse(CraftType type, AircraftType aircraftType, char *out, size_t cap);

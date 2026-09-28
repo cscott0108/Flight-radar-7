@@ -212,7 +212,10 @@ bool AdsbLol_GetAircraftJson(
 
 bool AdsbLol_ParseAircraft(const char *json)
 {
-    gAircraftCount = 0;
+    /* gAircraft/gAircraftCount are only replaced once the response has been
+     * accepted as structurally valid (below). A malformed, truncated or
+     * unexpected response therefore leaves the previous poll's aircraft in
+     * place - the same stale-data behavior a failed HTTP request has. */
     int rawCount = 0;
     int rejectedCount = 0;
 
@@ -225,9 +228,20 @@ bool AdsbLol_ParseAircraft(const char *json)
     }
 
     cJSON *ac = cJSON_GetObjectItem(root, "ac");
-    if (!ac || cJSON_IsNull(ac))
+    if (!ac)
+    {
+        /* No "ac" key at all is not an empty sky (that is "ac":[]); it is an
+         * error/unknown document, so keep the previous aircraft. */
+        cJSON_Delete(root);
+        ProviderDiag_Warning("adsb.lol", "response has no \"ac\" field");
+        ProviderDiag_ParseResult("adsb.lol", false, 0, 0, 0);
+        return false;
+    }
+
+    if (cJSON_IsNull(ac))
     {
         /* No aircraft in range: a normal, successful empty response. */
+        gAircraftCount = 0;
         cJSON_Delete(root);
         ProviderDiag_ParseResult("adsb.lol", true, 0, 0, 0);
         return true;
@@ -242,6 +256,8 @@ bool AdsbLol_ParseAircraft(const char *json)
     }
 
     int count = cJSON_GetArraySize(ac);
+
+    gAircraftCount = 0; /* the response is valid: replace the previous list */
 
     for (int i = 0; i < count && gAircraftCount < MAX_AIRCRAFT; i++)
     {
@@ -260,7 +276,8 @@ bool AdsbLol_ParseAircraft(const char *json)
         cJSON *altBaro = cJSON_GetObjectItem(entry, "alt_baro");
         cJSON *category = cJSON_GetObjectItem(entry, "category");
 
-        if (!cJSON_IsString(hex) || !cJSON_IsNumber(lat) || !cJSON_IsNumber(lon))
+        if (!cJSON_IsString(hex) || !cJSON_IsNumber(lat) || !cJSON_IsNumber(lon) ||
+            !Aircraft_IsValidPosition(lat->valuedouble, lon->valuedouble))
         {
             rejectedCount++;
             continue;
@@ -303,6 +320,16 @@ bool AdsbLol_ParseAircraft(const char *json)
 
         if (track && cJSON_IsNumber(track))
             a->heading = (float)track->valuedouble;
+
+        /* Owner/operator: "ownOp" is emitted by readsb-based ADSBExchange-v2
+         * services when their aircraft database has an owner for the hex. It
+         * is NOT in the published v2 field list we could verify (which
+         * documents r, t, dbFlags but not ownOp), so it is parsed
+         * opportunistically: absent means no Provider Operator, never an
+         * error. */
+        cJSON *ownOp = cJSON_GetObjectItem(entry, "ownOp");
+        if (ownOp && cJSON_IsString(ownOp))
+            AircraftText_Sanitize(a->operatorName, sizeof(a->operatorName), ownOp->valuestring);
 
         const char *categoryStr = (category && cJSON_IsString(category)) ? category->valuestring : "";
         AircraftType hint = AIRCRAFT_FIXED_WING;

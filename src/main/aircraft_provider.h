@@ -19,6 +19,7 @@
  *     -> existing CraftType_Appearance() / renderer (unchanged)
  */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -26,6 +27,11 @@
 #include "craft_types.h"
 
 #define MAX_AIRCRAFT 200
+
+/* Longest operator/owner name kept per aircraft (matches MAX_OPERATOR_NAME + 1
+ * in custom_rules.h so a provider name and a configured name fit the same UI
+ * and CSV fields). */
+#define AIRCRAFT_OPERATOR_NAME_MAX 40
 
 /* An aircraft this low AND this slow is treated as parked/taxiing ground
  * clutter (or a ground vehicle broadcasting ADS-B) rather than a real
@@ -69,7 +75,45 @@ typedef struct
     AircraftType providerTypeHint;
     bool hasProviderTypeHint;
 
+    /* Operator/owner name as supplied by the provider (empty when the
+     * provider gives none - OpenSky never does). Plain printable ASCII with
+     * no commas or quotes (see AircraftText_Sanitize), so it is safe to drop
+     * into the CSV history and the web UI. This is the "Provider Operator";
+     * a configured operator (operators.csv) is looked up separately and never
+     * written here. */
+    char operatorName[AIRCRAFT_OPERATOR_NAME_MAX];
+
 } Aircraft;
+
+/* Copies src into dst (capacity cap, always NUL-terminated), keeping printable
+ * ASCII only, mapping commas/double quotes to spaces (the CSV convention used
+ * by the registry and operator files: no quoting), collapsing runs of spaces
+ * and trimming. Idempotent. Used for every provider-supplied or file-supplied
+ * free-text field. */
+static inline void AircraftText_Sanitize(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0)
+        return;
+    size_t used = 0;
+    bool pendingSpace = false;
+    for (const char *p = src ? src : ""; *p && used + 1 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == ',' || c == '"' || c == ' ' || c == '\t') {
+            pendingSpace = (used > 0);
+            continue;
+        }
+        if (c < 0x20 || c > 0x7E)
+            continue;
+        if (pendingSpace) {
+            if (used + 2 >= cap)
+                break;
+            dst[used++] = ' ';
+            pendingSpace = false;
+        }
+        dst[used++] = (char)c;
+    }
+    dst[used] = '\0';
+}
 
 extern Aircraft gAircraft[MAX_AIRCRAFT];
 extern int gAircraftCount;
@@ -159,3 +203,14 @@ void ProviderDiag_TypeResolution(
 /* Raw/Deep only: a bounded, credential-redacted preview of a response body.
  * Truncates internally; safe to pass the full buffer. */
 void ProviderDiag_RawPreview(const char *provider, const char *body, size_t bodyLen);
+
+/* A provider position is usable only if it is a finite point on Earth. Out of
+ * range values (a provider bug, a units mix-up, 1e999 overflowing to infinity)
+ * would otherwise be projected far off the radar. Both providers reject
+ * records that fail this and count them as "rejected". */
+static inline bool Aircraft_IsValidPosition(double latitude, double longitude)
+{
+    return isfinite(latitude) && isfinite(longitude) &&
+           latitude >= -90.0 && latitude <= 90.0 &&
+           longitude >= -180.0 && longitude <= 180.0;
+}

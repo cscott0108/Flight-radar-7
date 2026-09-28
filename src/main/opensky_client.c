@@ -17,6 +17,7 @@
 
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "adv_diag.h"
 
 #include "main.h"
 #include "radar.h" // for selectedIcao24, so debug logging can target the selected aircraft
@@ -87,12 +88,15 @@ static void LoadRateLimit(void)
         ESP_LOGW(TAG, "OpenSky HTTP 429 pause restored: %u seconds remaining", (unsigned)remaining);
 }
 
+// Normal (always-on) heap line at the two TLS entry points. DMA largest is
+// the figure that decides whether the AES DMA bounce buffers can be placed.
 static void LogHttpMemory(const char *stage)
 {
-    ESP_LOGI(TAG, "%s: internal heap free=%u largest=%u, PSRAM free=%u",
+    ESP_LOGI(TAG, "%s: internal heap free=%u largest=%u, DMA largest=%u, PSRAM free=%u",
              stage,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
@@ -171,7 +175,9 @@ static void LogOpenSkyStateFields(cJSON *state)
 bool OpenSky_ParseAircraft(
     const char *json)
 {
-    gAircraftCount = 0;
+    // gAircraft/gAircraftCount are only replaced once the response has been
+    // accepted as structurally valid (below), so a malformed or unexpected
+    // response leaves the previous poll's aircraft in place.
     int rawCount = 0;
     int rejectedCount = 0;
 
@@ -190,8 +196,19 @@ bool OpenSky_ParseAircraft(
     // aircraft match the queried bounding box — a normal, successful
     // response (nothing currently flying over a quiet area), not a
     // parse failure.
-    if (!states || cJSON_IsNull(states))
+    if (!states)
     {
+        // No "states" key at all is not an empty sky (that is "states":null);
+        // it is an error/unknown document, so keep the previous aircraft.
+        cJSON_Delete(root);
+        ProviderDiag_Warning("OpenSky", "response has no \"states\" field");
+        ProviderDiag_ParseResult("OpenSky", false, 0, 0, 0);
+        return false;
+    }
+
+    if (cJSON_IsNull(states))
+    {
+        gAircraftCount = 0;
         cJSON_Delete(root);
         ProviderDiag_ParseResult("OpenSky", true, 0, 0, 0);
         return true;
@@ -207,6 +224,8 @@ bool OpenSky_ParseAircraft(
 
     int count =
         cJSON_GetArraySize(states);
+
+    gAircraftCount = 0; // the response is valid: replace the previous list
 
     for (int i = 0;
          i < count &&
@@ -266,7 +285,8 @@ bool OpenSky_ParseAircraft(
 
         if (!cJSON_IsString(icao) ||
             !cJSON_IsNumber(lat) ||
-            !cJSON_IsNumber(lon))
+            !cJSON_IsNumber(lon) ||
+            !Aircraft_IsValidPosition(lat->valuedouble, lon->valuedouble))
         {
             rejectedCount++;
             continue;
@@ -460,6 +480,8 @@ static bool LoadCredentials(void)
 static bool RequestToken(void)
 {
     LogHttpMemory("Before OAuth TLS");
+    AdvDiag_HeapBaseline();
+    AdvDiag_AllocTraceBegin("OAuth");
 
     time_t now;
     time(&now);
@@ -506,6 +528,7 @@ static bool RequestToken(void)
         ESP_LOGE(TAG, "Could not allocate OAuth HTTP client");
         return false;
     }
+    AdvDiag_HeapCheckpoint("OAuth A after client_init");
 
     esp_http_client_set_method(
         client,
@@ -523,6 +546,7 @@ static bool RequestToken(void)
 
     esp_err_t request_err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
+    AdvDiag_HeapCheckpoint("OAuth B after perform (TLS still open)");
 
     if (request_err != ESP_OK)
     {
@@ -551,6 +575,10 @@ static bool RequestToken(void)
 
     esp_http_client_cleanup(
         client);
+    AdvDiag_HeapCheckpoint("OAuth C after client_cleanup");
+    AdvDiag_AllocTraceEnd("OAuth C");
+    AdvDiag_HeapDiff("OAuth C");
+    AdvDiag_PcbTraceStart();
 
     cJSON *root =
         cJSON_Parse(
@@ -587,6 +615,7 @@ static bool RequestToken(void)
         60;
 
     cJSON_Delete(root);
+    AdvDiag_HeapCheckpoint("OAuth D after cJSON_Delete");
 
     ESP_LOGI(
         TAG,
@@ -695,7 +724,11 @@ bool OpenSky_GetAircraftJson(
     // Normal diagnostics (unlike the OAuth request, which never logs its
     // body/headers - see RequestToken()).
     ProviderDiag_RequestStart("OpenSky", "aircraft request", url);
+    if (AdvDiag_Active())
+        ESP_LOGW(TAG, "JWT accessToken strlen=%u", (unsigned)strlen(accessToken));
     LogHttpMemory("Before aircraft TLS");
+    AdvDiag_HeapDiff("Before aircraft TLS");
+    AdvDiag_AircraftTraceBegin(); // Expert Debug ACTRACE window (no-op when off)
 
     esp_http_client_config_t config =
         {
@@ -711,12 +744,23 @@ bool OpenSky_GetAircraftJson(
             .buffer_size_tx = 4096,
         };
 
+    // Aircraft TLS fix: esp_http_client_init() malloc()s its TX (4096) and RX
+    // (2048) buffers; both are CPU-only (mbedTLS copies to/from its own PSRAM
+    // buffers), yet malloc() places them in scarce DMA-capable internal RAM,
+    // starving the 1600-byte MALLOC_CAP_DMA AES bounce buffers. For this one
+    // call only, send malloc() > 2047 bytes to PSRAM first (heap_caps.c uses
+    // size <= limit for internal, so 2048 would keep the RX buffer internal),
+    // then restore the configured threshold at once. Smaller allocations,
+    // including Wi-Fi/lwIP frame buffers, are unaffected.
+    heap_caps_malloc_extmem_enable(2047);
     esp_http_client_handle_t client =
         esp_http_client_init(&config);
+    heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
 
     if (!client)
     {
         ESP_LOGE(TAG, "Could not allocate aircraft HTTP client");
+        AdvDiag_AircraftTraceEnd(true);
         return false;
     }
 
@@ -728,7 +772,13 @@ bool OpenSky_GetAircraftJson(
     {
         char bearer[2200];
         snprintf(bearer, sizeof(bearer), "Bearer %s", accessToken);
+        // EXPERIMENT (aircraft TLS DMA headroom): the header value is a
+        // calloc(strlen+1) = 1523-byte copy of "Bearer <JWT>" (CPU-only).
+        // Send allocations > 1522 bytes to PSRAM first for this call only,
+        // then restore the configured threshold at once.
+        heap_caps_malloc_extmem_enable(1522);
         esp_http_client_set_header(client, "Authorization", bearer);
+        heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
     }
 
     esp_err_t err =
@@ -758,6 +808,7 @@ ESP_LOGI(TAG, "RequestToken start");
             esp_err_to_name(err));
 
         ProviderDiag_RequestDone("OpenSky", "aircraft request", 0, 0, false);
+        AdvDiag_AircraftTraceEnd(true); // dump what the failed attempt still holds
         esp_http_client_cleanup(client);
         return false;
     }
@@ -771,6 +822,7 @@ ESP_LOGI(TAG, "RequestToken start");
         status,
         (unsigned)responseLength);
 
+    AdvDiag_AircraftTraceEnd(status != 200);
     esp_http_client_cleanup(client);
 
     ProviderDiag_RequestDone("OpenSky", "aircraft request", status, responseLength, status == 200);

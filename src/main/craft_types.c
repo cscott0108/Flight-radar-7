@@ -216,3 +216,99 @@ bool AircraftType_Parse(const char *token, AircraftType *out)
     }
     return false;
 }
+
+/* ---- web UI icons ---- */
+
+/* The icon canvas is 20x20 with the marker centered at (10,10). ICON_UNIT
+ * scales the radar's "vertex distance" (10 px for the triangle) onto it. */
+#define ICON_CENTER 10
+#define ICON_TRI_RADIUS 8 /* triangle vertex distance in icon units */
+
+/* Same three-vertex construction as draw_aircraft.c's triangle (nose plus two
+ * rear vertices 2.5 rad off the heading), pointing up. sin(2.5)=0.598,
+ * cos(2.5)=-0.801; integer math only. */
+static void TriangleVertices(int radius, int *rx, int *ry)
+{
+    *rx = (radius * 598 + 500) / 1000;
+    *ry = (radius * 801 + 500) / 1000;
+}
+
+static size_t CopyIcon(char *out, size_t cap, const char *tmp, int written, size_t tmpCap)
+{
+    if (!out || cap == 0)
+        return 0;
+    if (written < 0 || (size_t)written >= tmpCap || (size_t)written >= cap) {
+        out[0] = '\0';
+        return 0;
+    }
+    memcpy(out, tmp, (size_t)written + 1);
+    return (size_t)written;
+}
+
+size_t AircraftType_IconDefs(char *out, size_t cap)
+{
+    char tmp[1400];
+    int fx, fy, ox, oy;
+    TriangleVertices(ICON_TRI_RADIUS, &fx, &fy);
+    TriangleVertices(ICON_TRI_RADIUS / 2, &ox, &oy); /* Personal's marker is half size */
+    const int c = ICON_CENTER;
+    const int r = ICON_TRI_RADIUS;
+    /* Diamond: nose r out, sides/tail 0.6r (draw_aircraft.c sideDist). Tip:
+     * two points 0.5r toward +-1 rad off the nose (sin1=.841, cos1=.540). */
+    const int side = (r * 6 + 5) / 10;
+    const int tipD = r / 2;
+    const int tipX = (tipD * 841 + 500) / 1000;
+    const int tipY = (tipD * 540 + 500) / 1000;
+    const int heliOuter = HELI_MARKER_DIAMETER_PX / 2;               /* 9 */
+    const int heliInner = heliOuter - HELI_RING_WIDTH_PX;            /* 6 */
+    const int borderW = CRAFT_BORDER_WIDTH_PX;
+
+    int n = snprintf(tmp, sizeof(tmp),
+        "<svg width='0' height='0' style='position:absolute' aria-hidden='true'><defs>"
+        /* Fixed-Wing: filled triangle; border only if --rg is set (Important). */
+        "<symbol id='at-tri' viewBox='0 0 20 20'><polygon points='%d,%d %d,%d %d,%d' fill='currentColor' "
+        "style='stroke:var(--rg,none);stroke-width:%d;stroke-linejoin:round'/></symbol>"
+        /* Fixed-Wing, Personal: small outlined triangle. */
+        "<symbol id='at-tri-o' viewBox='0 0 20 20'><polygon points='%d,%d %d,%d %d,%d' fill='none' "
+        "stroke='currentColor' stroke-width='2' stroke-linejoin='round'/></symbol>"
+        /* Helicopter: solid disc inside a ring (--rg, gray unless the craft type has a border). */
+        "<symbol id='at-heli' viewBox='0 0 20 20'><circle cx='%d' cy='%d' r='%d' style='fill:var(--rg,#%06X)'/>"
+        "<circle cx='%d' cy='%d' r='%d' fill='currentColor'/></symbol>"
+        /* Other: diamond with the fixed gray forward tip. */
+        "<symbol id='at-diamond' viewBox='0 0 20 20'><polygon points='%d,%d %d,%d %d,%d %d,%d' fill='currentColor' "
+        "style='stroke:var(--rg,none);stroke-width:%d;stroke-linejoin:round'/>"
+        "<polygon points='%d,%d %d,%d %d,%d' fill='#%06X'/></symbol>"
+        "</defs></svg>",
+        c, c - r, c + fx, c + fy, c - fx, c + fy, borderW,
+        c, c - r / 2, c + ox, c + oy, c - ox, c + oy,
+        c, c, heliOuter, (unsigned)HELI_RING_RGB, c, c, heliInner,
+        c, c - r, c + side, c, c, c + side, c - side, c, borderW,
+        c, c - r, c + tipX, c - tipY, c - tipX, c - tipY, (unsigned)OTHER_TIP_RGB);
+    return CopyIcon(out, cap, tmp, n, sizeof(tmp));
+}
+
+size_t CraftType_IconUse(CraftType type, AircraftType aircraftType, char *out, size_t cap)
+{
+    const CraftAppearance look = CraftType_Appearance(type, aircraftType);
+    const char *symbol = "at-tri";
+    switch (look.marker) {
+    case CRAFT_MARKER_SMALL_OUTLINE: symbol = "at-tri-o"; break;
+    case CRAFT_MARKER_SOLID_CIRCLE: symbol = "at-heli"; break;
+    case CRAFT_MARKER_DIAMOND: symbol = "at-diamond"; break;
+    default: break;
+    }
+
+    /* --rg carries the ring/border color. Set only when the marker has one
+     * (always for the helicopter; Important's border for the others), so a
+     * plain marker keeps the symbol's default (none / gray). */
+    char ring[24] = "";
+    if (look.ringWidthPx > 0)
+        snprintf(ring, sizeof(ring), ";--rg:#%06X", (unsigned)(look.ringRgb & 0xFFFFFFu));
+
+    char tmp[320];
+    int n = snprintf(tmp, sizeof(tmp),
+        "<svg class='ati' width='18' height='18' viewBox='0 0 20 20' role='img' aria-label='%s' "
+        "style='color:#%06X%s'><use href='#%s'/></svg>",
+        AircraftType_Name(aircraftType), (unsigned)(look.colorRgb & 0xFFFFFFu), ring, symbol);
+    return CopyIcon(out, cap, tmp, n, sizeof(tmp));
+}

@@ -936,6 +936,13 @@ CONFIG_EXAMPLE_LVGL_PORT_ROTATION_DEGREE=0
 # end of Example Configuration
 
 #
+# Flight Radar diagnostics
+#
+# default:
+CONFIG_FR_ALLOC_TRACE=y
+# end of Flight Radar diagnostics
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

@@ -246,24 +246,52 @@ void ProviderDiag_TypeResolution(
 /* Masks the value following any of a small set of sensitive key names, so a
  * Raw-level dump can never leak OAuth tokens or client secrets even if a
  * provider's response body happened to echo request parameters back. */
+/* Case-insensitive strstr (strcasestr is not standard C). */
+static char *FindNoCase(char *hay, const char *needle)
+{
+    size_t n = strlen(needle);
+    for (; *hay; hay++) {
+        if (strncasecmp(hay, needle, n) == 0)
+            return hay;
+    }
+    return NULL;
+}
+
+/* Masks the value that follows any credential-looking key, in JSON
+ * ("key":"value"), query-string (key=value) and header (Key: value) forms.
+ * A quoted value is masked up to its closing quote, so multi-word values such
+ * as "Bearer <token>" are fully hidden; an unquoted one ends at a delimiter.
+ * The keys are matched case-insensitively. */
 static void RedactSensitive(char *buf)
 {
     static const char *sensitiveKeys[] = {
-        "access_token", "client_secret", "authorization", "Authorization"
+        "access_token", "refresh_token", "id_token", "token", "client_secret", "client_id",
+        "password", "api_key", "apikey", "secret", "authorization"
     };
     for (size_t k = 0; k < sizeof(sensitiveKeys) / sizeof(sensitiveKeys[0]); k++) {
         char *p = buf;
         size_t keyLen = strlen(sensitiveKeys[k]);
-        while ((p = strstr(p, sensitiveKeys[k])) != NULL) {
-            char *valueStart = p + keyLen;
-            while (*valueStart == ':' || *valueStart == '=' || *valueStart == '"' || *valueStart == ' ')
-                valueStart++;
-            char *v = valueStart;
-            while (*v && *v != '"' && *v != '&' && *v != ',' && *v != '}' && *v != ' ')
-            {
-                *v = '*';
+        while ((p = FindNoCase(p, sensitiveKeys[k])) != NULL) {
+            char *v = p + keyLen;
+            if (*v == '"')
+                v++; /* closing quote of a JSON key */
+            while (*v == ' ')
                 v++;
+            if (*v != ':' && *v != '=') { /* just a word that contains the text, not key: value */
+                p += keyLen;
+                continue;
             }
+            v++;
+            while (*v == ' ')
+                v++;
+            bool quoted = (*v == '"');
+            if (quoted)
+                v++;
+            /* "Authorization: Bearer <token>" has a space inside its value, so for
+             * that key an unquoted value runs to the end of the line. */
+            bool spaceEnds = (strcmp(sensitiveKeys[k], "authorization") != 0);
+            while (*v && (quoted ? *v != '"' : (*v != '&' && *v != ',' && *v != '}' && (*v != ' ' || !spaceEnds) && *v != '\n' && *v != '\r' && *v != '"')))
+                *v++ = '*';
             p += keyLen;
         }
     }

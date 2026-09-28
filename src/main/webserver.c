@@ -7,6 +7,7 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -20,12 +21,26 @@
 #include "aircraft_provider.h"
 #include "web_rules.h"
 #include "web_airports.h"
+#include "web_diag.h"
+#include "web_seen.h"
+#include "seen_aircraft.h"
+#include "time_util.h"
+#include <time.h>
 
 static const char *TAG = "WEBSERVER";
 static httpd_handle_t server_handle = NULL;
 
 #define OPENSKY_NAMESPACE "opensky"
 #define WIFI_NAMESPACE "wifi"
+
+// Seen Aircraft changes are normally written to flash in batches (see
+// SEEN_FLUSH_INTERVAL_SEC); write any pending ones before a deliberate reboot
+// so a Wi-Fi or credentials change never costs the last few minutes of history.
+static void FlushHistoryBeforeRestart(void)
+{
+    if (SeenAircraft_IsDirty())
+        SeenAircraft_Flush();
+}
 
 // Sends a small self-contained HTML page that shows `message` and then
 // auto-navigates back to the setup home page after `delaySeconds`. The
@@ -161,16 +176,19 @@ static esp_err_t WifiSetupHandler(httpd_req_t *req)
         "won't reach it &mdash; check your router or the device's screen for its new address.",
         30);
     vTaskDelay(pdMS_TO_TICKS(500));
+    FlushHistoryBeforeRestart();
     esp_restart();
     return ESP_OK;
 }
 
 static esp_err_t RadarSetupHandler(httpd_req_t *req)
 {
-    if (req->content_len <= 0 || req->content_len > 384)
+    // 768 (was 384): a fully populated form with the provider, diagnostics and
+    // time zone fields is already close to 400 bytes.
+    if (req->content_len <= 0 || req->content_len > 768)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
 
-    char body[385];
+    char body[769];
     int received = httpd_req_recv(req, body, req->content_len);
     if (received <= 0)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed");
@@ -266,6 +284,30 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
                                        "UTC offset must be between -720 and 840 minutes");
 
         utcOffsetMinutes = (int32_t)parsed;
+    }
+
+    // Time zone: an IANA id from the built-in table, or CUSTOM (fixed offset
+    // above). Optional so an older cached form still posts; without a
+    // "timezone" field the zone and Automatic DST are left as they are.
+    TimeZoneConfig tzConfig;
+    TimeUtil_GetConfig(&tzConfig);
+
+    char zoneText[64];
+    if (FormValue(body, "timezone", zoneText, sizeof(zoneText)) &&
+        zoneText[0] != '\0')
+    {
+        size_t zoneIndex;
+
+        if (strcmp(zoneText, TIMEUTIL_ZONE_CUSTOM) != 0 &&
+            !TimeUtil_ZoneFind(zoneText, &zoneIndex))
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Unknown time zone");
+
+        // Both branches above accepted only a known id (or CUSTOM), all of which
+        // fit; the precision keeps the copy provably in bounds.
+        snprintf(tzConfig.zoneId, sizeof(tzConfig.zoneId), "%.*s",
+                 (int)sizeof(tzConfig.zoneId) - 1, zoneText);
+        tzConfig.autoDst = strstr(body, "auto_dst=on") != NULL;
     }
 
     char dayStartText[24];
@@ -424,9 +466,12 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
     SetRadarRefreshSeconds(refreshSeconds);
     SetRadarLowTrafficThreshold(lowThreshold);
     SetRadarLowTrafficIntervalSeconds(lowInterval);
+    SetRadarTimeZone(
+        tzConfig.zoneId,
+        tzConfig.autoDst,
+        utcOffsetMinutes);
     SetRadarDayNightSchedule(
         dayNightEnabled,
-        utcOffsetMinutes,
         dayStartHour,
         dayEndHour,
         dayIntervalSec,
@@ -442,11 +487,16 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
     Radar_SetAutoSelectClosest(strstr(body, "auto_closest=on") != NULL);
     SetRadarOpenSkyDebugEnabled(strstr(body, "opensky_debug=on") != NULL);
 
-    char response[600];
+    char response[700];
     int len = 0;
 
     len += snprintf(response + len, sizeof(response) - len,
         "Radar settings saved. ");
+
+    len += snprintf(response + len, sizeof(response) - len,
+        "Time zone: %s%s. ",
+        strcmp(tzConfig.zoneId, TIMEUTIL_ZONE_CUSTOM) == 0 ? "custom UTC offset" : tzConfig.zoneId,
+        (tzConfig.autoDst || strcmp(tzConfig.zoneId, TIMEUTIL_ZONE_CUSTOM) == 0) ? "" : " (daylight saving off)");
 
     if (GetRadarDayNightEnabled())
     {
@@ -607,6 +657,7 @@ static esp_err_t DeleteCredentialsHandler(httpd_req_t *req)
 
     SendRedirectPage(req, "OpenSky credentials deleted. Restarting.", 30);
     vTaskDelay(pdMS_TO_TICKS(500));
+    FlushHistoryBeforeRestart();
     esp_restart();
     return ESP_OK;
 }
@@ -626,7 +677,9 @@ static esp_err_t UploadHandler(
         return ESP_FAIL;
     }
 
-    char *buffer = malloc(totalLen + 1);
+    // CPU-only (httpd_req_recv copies into it, then cJSON_Parse reads it):
+    // keep it out of scarce internal DMA-capable RAM.
+    char *buffer = heap_caps_malloc(totalLen + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     if (!buffer)
     {
@@ -715,6 +768,7 @@ static esp_err_t UploadHandler(
         HTTPD_RESP_USE_STRLEN);
 
     vTaskDelay(pdMS_TO_TICKS(1000));
+    FlushHistoryBeforeRestart();
     esp_restart();
 
     return ESP_OK;
@@ -795,10 +849,93 @@ static void FormatFixed(
     }
 }
 
+// Time zone section of the setup page. Generated separately from the big
+// page template (it carries the whole zone list, about 9 KB) and streamed in
+// small chunks. All values here come from the built-in zone table, so none
+// needs HTML escaping, and none is ever passed as a format string.
+static esp_err_t SendTimeZoneFieldset(httpd_req_t *req)
+{
+    TimeZoneConfig cfg;
+    TimeUtil_GetConfig(&cfg);
+    bool custom = (strcmp(cfg.zoneId, TIMEUTIL_ZONE_CUSTOM) == 0);
+
+    if (httpd_resp_send_chunk(
+            req,
+            "<fieldset><legend>Time zone</legend>"
+            "<label>Time zone <select name='timezone'>",
+            HTTPD_RESP_USE_STRLEN) != ESP_OK)
+        return ESP_FAIL;
+
+    char chunk[1024];
+    size_t used = 0;
+
+    for (size_t i = 0; i < TimeUtil_ZoneCount(); i++)
+    {
+        char label[96];
+        char option[160];
+
+        TimeUtil_ZoneLabel(i, label, sizeof(label));
+
+        int length = snprintf(
+            option,
+            sizeof(option),
+            "<option value='%s'%s>%s</option>",
+            TimeUtil_ZoneId(i),
+            (!custom && strcmp(cfg.zoneId, TimeUtil_ZoneId(i)) == 0) ? " selected" : "",
+            label);
+
+        if (length <= 0 || length >= (int)sizeof(option))
+            continue;
+
+        if (used + (size_t)length > sizeof(chunk))
+        {
+            if (httpd_resp_send_chunk(req, chunk, (ssize_t)used) != ESP_OK)
+                return ESP_FAIL;
+            used = 0;
+        }
+
+        memcpy(chunk + used, option, (size_t)length);
+        used += (size_t)length;
+    }
+
+    if (used > 0 && httpd_resp_send_chunk(req, chunk, (ssize_t)used) != ESP_OK)
+        return ESP_FAIL;
+
+    char nowText[64];
+    time_t now = time(NULL);
+
+    if (TimeUtil_IsSynced((int64_t)now))
+        TimeUtil_FormatLocal((int64_t)now, nowText, sizeof(nowText));
+    else
+        snprintf(nowText, sizeof(nowText), "clock not synchronized yet");
+
+    int length = snprintf(
+        chunk,
+        sizeof(chunk),
+        "<option value='" TIMEUTIL_ZONE_CUSTOM "'%s>Custom fixed UTC offset</option></select></label>"
+        "<label><input name='auto_dst' type='checkbox'%s> Adjust for daylight saving time automatically</label>"
+        "<small>Turn this off for regions that do not observe daylight saving time, or to stay on standard time "
+        "all year. It has no effect for zones that never observe it.</small>"
+        "<label>Custom UTC offset <input name='utc_offset' type='number' min='-720' max='840' step='1' value='%d'> minutes</label>"
+        "<small>Used only with &quot;Custom fixed UTC offset&quot; (for example -420 = UTC-7, 330 = UTC+5:30) "
+        "and never adjusted for daylight saving. Zones not in the list can use this.</small>"
+        "<small>Device time: %s. Used for the day/night schedules and for Seen Aircraft timestamps "
+        "(stored in UTC, shown in this zone).</small></fieldset>",
+        custom ? " selected" : "",
+        cfg.autoDst ? " checked" : "",
+        (int)cfg.customOffsetMinutes,
+        nowText);
+
+    if (length <= 0 || length >= (int)sizeof(chunk))
+        return ESP_FAIL;
+
+    return httpd_resp_send_chunk(req, chunk, (ssize_t)length);
+}
+
 static esp_err_t RootHandler(
     httpd_req_t *req)
 {
-    const char htmlFormat[] =
+    const char htmlFormatA[] =
         "<!DOCTYPE html>"
         "<html>"
         "<head>"
@@ -820,7 +957,9 @@ static esp_err_t RootHandler(
         "<body>"
         "<h2>Flight Radar Setup</h2>"
         "<p><a href='/rules'>Craft Types: Registry, Operators and Current Aircraft</a> &middot; "
-        "<a href='/airports'>Add or Edit Airport Dots</a></p>"
+        "<a href='/seen'>Seen Aircraft</a> &middot; "
+        "<a href='/airports'>Add or Edit Airports</a> &middot; "
+        "<a href='/diag'>Runtime Capacity Report</a></p>"
         "<h3>Wi-Fi</h3>"
         "<form method='POST' action='/wifi'>"
         "<label>Network name <input name='ssid' maxlength='32'></label>"
@@ -842,7 +981,12 @@ static esp_err_t RootHandler(
         "<option value='ADSBLOL'%s>adsb.lol</option>"
         "</select></label>"
         "<small>OpenSky needs the client credentials configured above/below; adsb.lol is a free community API and needs no credentials. Switching providers takes effect on the next poll.</small>"
-        "</fieldset>"
+        "</fieldset>";
+
+    // Second half of the page, sent after the (separately generated) Time
+    // zone fieldset. Split so neither snprintf buffer nor this function's
+    // stack has to hold the whole page.
+    const char htmlFormatB[] =
         "<details><summary>Reduce polling when quiet</summary>"
         "<label>Slow down to a longer interval when fewer than "
         "<input name='low_threshold' type='number' min='0' max='500' step='1' value='%lu'> "
@@ -852,12 +996,11 @@ static esp_err_t RootHandler(
         "</details>"
         "<details><summary>Day/night polling schedule</summary>"
         "<label><input name='daynight_enabled' type='checkbox'%s> Enable day/night schedule</label>"
-        "<label>UTC offset <input name='utc_offset' type='number' min='-720' max='840' step='1' value='%ld'> minutes (For PDT -7 is -420 min, PST -8 is -480 min)</label>"
         "<label>Day starts at <input name='day_start' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label>"
         "<label>Day ends at <input name='day_end' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label>"
         "<label>Interval during the day <input name='day_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
         "<label>Interval overnight <input name='night_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
-        "<small>When enabled, this replaces the refresh interval above during those hours. Requires the device's clock to be synced over the network, which happens automatically once online; falls back to the day interval until then.</small>"
+        "<small>When enabled, this replaces the refresh interval above during those hours, in the time zone (and daylight saving setting) chosen above. Requires the device's clock to be synced over the network, which happens automatically once online; falls back to the day interval until then.</small>"
         "</details>"
         "<details><summary>Day/night brightness</summary>"
         "<label><input name='daynight_brightness_enabled' type='checkbox'%s> Enable day/night brightness</label>"
@@ -949,7 +1092,10 @@ static esp_err_t RootHandler(
         "</body>"
         "</html>";
 
-    char *html = malloc(8192);
+    // CPU-only page buffer (snprintf, then httpd_resp_send_chunk copies it
+    // into lwIP): PSRAM, so page generation does not take 8 KB of internal
+    // DMA-capable RAM from Wi-Fi/TLS. Freed with free() as before.
+    char *html = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     if (!html)
     {
@@ -967,47 +1113,61 @@ static esp_err_t RootHandler(
     FormatFixed(GetRadarLon(), 4, lonStr, sizeof(lonStr));
     FormatFixed(GetRadarRange(), 0, rangeStr, sizeof(rangeStr));
 
-    snprintf(
+    // Part A: up to and including the provider fieldset.
+    int lengthA = snprintf(
         html,
         8192,
-        htmlFormat,
+        htmlFormatA,
         latStr,
         lonStr,
         rangeStr,
         (unsigned long)GetRadarRefreshSeconds(),
         (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_OPENSKY) ? " selected" : "",
-        (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_ADSBLOL) ? " selected" : "",
-        (unsigned long)GetRadarLowTrafficThreshold(),
-        (unsigned long)GetRadarLowTrafficIntervalSeconds(),
-        GetRadarDayNightEnabled() ? " checked" : "",
-        (long)GetRadarUtcOffsetMinutes(),
-        (unsigned long)GetRadarDayStartHour(),
-        (unsigned long)GetRadarDayEndHour(),
-        (unsigned long)GetRadarDayIntervalSeconds(),
-        (unsigned long)GetRadarNightIntervalSeconds(),
-        GetRadarDayNightBrightnessEnabled() ? " checked" : "",
-        (unsigned long)GetRadarDayBrightnessPercent(),
-        (unsigned long)GetRadarNightBrightnessPercent(),
-        GetRadarIdleDimEnabled() ? " checked" : "",
-        (unsigned long)GetRadarIdleDimMinutes(),
-        (unsigned long)GetRadarIdleDimPercent(),
-        Radar_GetAutoSelectClosest() ? " checked" : "",
-        GetRadarOpenSkyDebugEnabled() ? " checked" : "",
-        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_OFF) ? " selected" : "",
-        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_NORMAL) ? " selected" : "",
-        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_VERBOSE) ? " selected" : "",
-        (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_RAW) ? " selected" : "",
-        (unsigned long)GetRadarBrightness(),
-        (unsigned long)GetRadarBrightness());
+        (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_ADSBLOL) ? " selected" : "");
 
     httpd_resp_set_type(
         req,
         "text/html");
 
-    esp_err_t err = httpd_resp_send(
-        req,
-        html,
-        HTTPD_RESP_USE_STRLEN);
+    esp_err_t err = ESP_FAIL;
+
+    if (lengthA > 0 && lengthA < 8192 &&
+        httpd_resp_send_chunk(req, html, lengthA) == ESP_OK &&
+        SendTimeZoneFieldset(req) == ESP_OK)
+    {
+        // Part B: everything after the time zone fieldset.
+        int lengthB = snprintf(
+            html,
+            8192,
+            htmlFormatB,
+            (unsigned long)GetRadarLowTrafficThreshold(),
+            (unsigned long)GetRadarLowTrafficIntervalSeconds(),
+            GetRadarDayNightEnabled() ? " checked" : "",
+            (unsigned long)GetRadarDayStartHour(),
+            (unsigned long)GetRadarDayEndHour(),
+            (unsigned long)GetRadarDayIntervalSeconds(),
+            (unsigned long)GetRadarNightIntervalSeconds(),
+            GetRadarDayNightBrightnessEnabled() ? " checked" : "",
+            (unsigned long)GetRadarDayBrightnessPercent(),
+            (unsigned long)GetRadarNightBrightnessPercent(),
+            GetRadarIdleDimEnabled() ? " checked" : "",
+            (unsigned long)GetRadarIdleDimMinutes(),
+            (unsigned long)GetRadarIdleDimPercent(),
+            Radar_GetAutoSelectClosest() ? " checked" : "",
+            GetRadarOpenSkyDebugEnabled() ? " checked" : "",
+            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_OFF) ? " selected" : "",
+            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_NORMAL) ? " selected" : "",
+            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_VERBOSE) ? " selected" : "",
+            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_RAW) ? " selected" : "",
+            (unsigned long)GetRadarBrightness(),
+            (unsigned long)GetRadarBrightness());
+
+        if (lengthB > 0 && lengthB < 8192 &&
+            httpd_resp_send_chunk(req, html, lengthB) == ESP_OK)
+        {
+            err = httpd_resp_send_chunk(req, NULL, 0);
+        }
+    }
 
     free(html);
 
@@ -1033,12 +1193,14 @@ esp_err_t StartWebServer(void)
     // headroom this time since this task is idle almost all the time and
     // the board has ~200KB+ of free internal RAM at boot.
     config.stack_size = 16384;
-    // Total registered handlers across webserver.c (6), web_rules.c (10) and
-    // web_airports.c (3) is 19 after the registry/operator page rework (was 18,
-    // and 16 before that, silently dropping the last handler to register -
-    // hence "no slots left" in the log). Set with headroom for future
-    // additions rather than the exact current count; each unused slot only
-    // costs one small httpd_uri_t-sized entry of heap.
+    // Total registered handlers across webserver.c (6), web_rules.c (11),
+    // web_airports.c (3), web_seen.c (3) and web_diag.c (1, added for the
+    // PHASE 1/13 runtime capacity page) is 24 (23 before /diag; 19 before
+    // the Seen Aircraft pages; it was 18, and 16 before that, silently
+    // dropping the last handler to register - hence "no slots left" in the
+    // log). Set with headroom for future additions rather than the exact
+    // current count; each unused slot only costs one small httpd_uri_t-sized
+    // entry of heap.
     config.max_uri_handlers = 28;
 
     if (httpd_start(
@@ -1048,6 +1210,14 @@ esp_err_t StartWebServer(void)
         server_handle = NULL;
         return ESP_FAIL;
     }
+
+    // Diagnostic-only heap checkpoint (PROJECT_STATE.md memory investigation),
+    // same style/tag as main.c's HeapCheckpoint().
+    ESP_LOGW("HEAPCHK",
+             "After httpd_start(): internal free=%u largest=%u, PSRAM free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     httpd_uri_t root_uri =
         {
@@ -1122,6 +1292,20 @@ esp_err_t StartWebServer(void)
     if (WebAirports_Register(server_handle) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register airport routes");
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
+    if (WebSeen_Register(server_handle) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register seen-aircraft routes");
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
+    if (WebDiag_Register(server_handle) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register diagnostics route");
         httpd_stop(server_handle);
         server_handle = NULL;
         return ESP_FAIL;

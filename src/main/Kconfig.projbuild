@@ -115,3 +115,18 @@ menu "Example Configuration"
                 Height of LVGL buffer. The width of the buffer is the same as that of the LCD.
     endmenu
 endmenu
+
+menu "Flight Radar diagnostics"
+    config FR_ALLOC_TRACE
+        bool "Advanced Diagnostics: compile in allocation-owner trace"
+        default n
+        help
+            Links malloc/calloc/realloc/free and heap_caps_* through IRAM wrappers
+            (linker --wrap) that can record each allocation's size and a short
+            backtrace. Costs roughly 1 KB of IRAM (taken from internal RAM on the
+            ESP32-S3) and a flag test on every allocation, so it cannot be fully
+            disabled at runtime and is OFF for normal builds. When enabled here,
+            recording additionally requires Advanced Diagnostics to be ON on /diag
+            (effective after reboot). Used to find owners of persistent internal
+            heap allocations; see PROJECT_STATE_COMPACT.md.
+endmenu

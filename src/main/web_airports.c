@@ -1,5 +1,6 @@
 #include "web_airports.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -63,6 +64,52 @@ static void FormatCoordinate(float value, char out[24])
              scaled / 1000000, scaled % 1000000);
 }
 
+/* Same geometry logic as radar.c's DrawAirportMarker: Airport_ParseRunwayAxis
+ * and Airport_RunwayAxisOffsets (both in airports.c) are the one
+ * authoritative runway-orientation calculation, shared by both renderers -
+ * this function only differs from the panel's in emitting SVG elements
+ * instead of LVGL draw calls, and in inlining the fallback-to-dot check the
+ * same way DrawAirportMarker does. */
+static esp_err_t SendAirportMarker(httpd_req_t *req, const AirportMarker *marker, int x, int y)
+{
+    char fill[8];
+    snprintf(fill, sizeof(fill), "#%06X", (unsigned)(marker->color & 0xFFFFFFu));
+
+    float axisDeg;
+    const bool directional =
+        marker->markerMode == AIRPORT_MARKER_DIRECTIONAL &&
+        Airport_ParseRunwayAxis(marker->runway, &axisDeg);
+
+    int centerDiameter = marker->diameter;
+    if (directional) {
+        float dx1, dy1, dx2, dy2;
+        const float lineLength = marker->diameter * AIRPORT_RUNWAY_LINE_LENGTH_FACTOR;
+        Airport_RunwayAxisOffsets(axisDeg, lineLength, &dx1, &dy1, &dx2, &dy2);
+        const int x1 = x + (int)lroundf(dx1), y1 = y + (int)lroundf(dy1);
+        const int x2 = x + (int)lroundf(dx2), y2 = y + (int)lroundf(dy2);
+
+        float cdx, cdy, unusedX, unusedY;
+        const float capLength = marker->diameter * AIRPORT_RUNWAY_CAP_LENGTH_FACTOR;
+        Airport_RunwayAxisOffsets(axisDeg + 90.0f, capLength, &cdx, &cdy, &unusedX, &unusedY);
+        const int cix = (int)lroundf(cdx), ciy = (int)lroundf(cdy);
+
+        if (SendFormat(req, "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='%s' stroke-width='2'/>",
+                       x1, y1, x2, y2, fill) != ESP_OK ||
+            SendFormat(req, "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='%s' stroke-width='2'/>",
+                       x1 - cix, y1 - ciy, x1 + cix, y1 + ciy, fill) != ESP_OK ||
+            SendFormat(req, "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='%s' stroke-width='2'/>",
+                       x2 - cix, y2 - ciy, x2 + cix, y2 + ciy, fill) != ESP_OK)
+            return ESP_FAIL;
+
+        centerDiameter = (int)(marker->diameter * AIRPORT_RUNWAY_CENTER_DIAMETER_FACTOR);
+        if (centerDiameter < 4)
+            centerDiameter = 4;
+    }
+
+    return SendFormat(req, "<circle cx='%d' cy='%d' r='%d' fill='%s'/>",
+                      x, y, centerDiameter / 2, fill);
+}
+
 static esp_err_t AirportsPage(httpd_req_t *req)
 {
     const float centerLat = GetRadarLat();
@@ -97,7 +144,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "<text x='195' y='385' fill='#00E060'>S</text><text x='15' y='194' fill='#00E060'>W</text>") != ESP_OK)
         return ESP_FAIL;
 
-    /* Airport circles precede aircraft polygons so aircraft cover them. */
+    /* Airport markers precede aircraft polygons so aircraft cover them. */
     size_t airportCount = Airports_Count();
     for (size_t i = 0; i < airportCount; i++) {
         AirportMarker marker;
@@ -106,9 +153,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             !Radar_ProjectPosition(marker.latitude, marker.longitude,
                                    centerLat, centerLon, radiusKm, 190, &x, &y))
             continue;
-        if (SendFormat(req, "<circle cx='%d' cy='%d' r='%u' fill='#%06X'/>",
-                       200 + x, 200 + y, (unsigned)(marker.diameter / 2),
-                       (unsigned)(marker.color & 0xFFFFFFu)) != ESP_OK)
+        if (SendAirportMarker(req, &marker, 200 + x, 200 + y) != ESP_OK)
             return ESP_FAIL;
     }
     int count = gAircraftCount;
@@ -208,10 +253,16 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "<label>Longitude <input id='longitude' name='longitude' type='number' step='any' min='-180' max='180' required></label>"
         "<label>Dot diameter <input id='diameter' name='diameter' type='number' min='6' max='24' value='12' required> pixels</label>"
         "<label>Dot color <input id='color' name='color' type='color' value='#FF0000' required></label>"
+        "<label>Marker <select id='mode' name='mode'><option value='0'>Dot</option>"
+        "<option value='1'>Directional (runway axis)</option></select></label>"
+        "<label>Primary runway <input id='runway' name='runway' maxlength='3' placeholder='e.g. 09L' "
+        "pattern='[0-9]{1,2}[LCRlcr]?' title='1-2 digit runway number (01-36), optional L/C/R'> "
+        "<small>Only used in Directional mode. Reciprocal ends (09/27, 18/36, ...) point the same way. "
+        "Left blank or unrecognized falls back to the dot automatically.</small></label>"
         "<button type='submit'>Save airport</button><button type='button' onclick='newAirport()'>New dot</button>"
-        "</form><h2>Saved airports</h2><table><tr><th>Name</th><th>Position</th><th>Size</th><th>Color</th><th></th></tr>") != ESP_OK)
+        "</form><h2>Saved airports</h2><table><tr><th>Name</th><th>Position</th><th>Size</th><th>Color</th><th>Marker</th><th></th></tr>") != ESP_OK)
         return ESP_FAIL;
-    if (!airportCount && Send(req, "<tr><td colspan='5'>No airports saved</td></tr>") != ESP_OK)
+    if (!airportCount && Send(req, "<tr><td colspan='6'>No airports saved</td></tr>") != ESP_OK)
         return ESP_FAIL;
     for (size_t i = 0; i < airportCount; i++) {
         AirportMarker marker;
@@ -221,15 +272,30 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         FormatCoordinate(marker.longitude, airportLon);
         char colorHex[8];
         snprintf(colorHex, sizeof(colorHex), "#%06X", (unsigned)(marker.color & 0xFFFFFFu));
+        float axisDeg;
+        const bool showsDirectional = marker.markerMode == AIRPORT_MARKER_DIRECTIONAL &&
+                                      Airport_ParseRunwayAxis(marker.runway, &axisDeg);
         if (Send(req, "<tr><td>") != ESP_OK ||
             SendEscaped(req, marker.name) != ESP_OK ||
             SendFormat(req,
                 "</td><td>%s, %s</td><td>%u px</td>"
                 "<td><span style='display:inline-block;width:1em;height:1em;vertical-align:middle;"
-                "border:1px solid #888;background:%s'></span> %s</td><td>"
-                "<button type='button' data-index='%u' data-lat='%s' data-lon='%s' data-size='%u' data-color='%s' data-name='",
-                airportLat, airportLon, (unsigned)marker.diameter, colorHex, colorHex,
-                (unsigned)i, airportLat, airportLon, (unsigned)marker.diameter, colorHex) != ESP_OK ||
+                "border:1px solid #888;background:%s'></span> %s</td>",
+                airportLat, airportLon, (unsigned)marker.diameter, colorHex, colorHex) != ESP_OK)
+            return ESP_FAIL;
+        if (marker.markerMode == AIRPORT_MARKER_DIRECTIONAL) {
+            if (SendFormat(req, "<td>Directional, runway %s%s</td>",
+                           marker.runway[0] ? marker.runway : "(none)",
+                           showsDirectional ? "" : " &mdash; unrecognized, showing dot") != ESP_OK)
+                return ESP_FAIL;
+        } else if (Send(req, "<td>Dot</td>") != ESP_OK) {
+            return ESP_FAIL;
+        }
+        if (SendFormat(req,
+                "<td><button type='button' data-index='%u' data-lat='%s' data-lon='%s' data-size='%u' "
+                "data-color='%s' data-mode='%u' data-runway='%s' data-name='",
+                (unsigned)i, airportLat, airportLon, (unsigned)marker.diameter, colorHex,
+                (unsigned)marker.markerMode, marker.runway) != ESP_OK ||
             SendEscaped(req, marker.name) != ESP_OK ||
             Send(req, "' onclick='editAirport(this)'>Edit</button>"
                       "<form class='inline' method='post' action='/airports/delete'>") != ESP_OK ||
@@ -238,7 +304,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             return ESP_FAIL;
     }
     if (Send(req,
-        "</table><p>Up to 10 airports. Dots outside the current radar range remain saved "
+        "</table><p>Up to 100 airports. Dots outside the current radar range remain saved "
         "and appear when the range includes them.</p>"
         "<script>const map=document.getElementById('map'),dot=document.getElementById('candidate');"
         "const centerLat=") != ESP_OK ||
@@ -250,6 +316,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "const latInput=document.getElementById('latitude'),lonInput=document.getElementById('longitude');"
         "const nameInput=document.getElementById('name'),sizeInput=document.getElementById('diameter');"
         "const colorInput=document.getElementById('color');"
+        "const modeInput=document.getElementById('mode'),runwayInput=document.getElementById('runway');"
         "const indexInput=document.getElementById('index');"
         "function preview(){let lat=Number(latInput.value),lon=Number(lonInput.value);"
         "if(!latInput.value||!lonInput.value){dot.setAttribute('visibility','hidden');return;}"
@@ -266,10 +333,13 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "lonInput.value=(centerLon+dx/190*rangeKm/(111*Math.cos(centerLat*Math.PI/180))).toFixed(6);"
         "preview();});"
         "function newAirport(){f.reset();indexInput.value='-1';sizeInput.value='12';colorInput.value='#FF0000';"
+        "modeInput.value='0';runwayInput.value='';"
         "dot.setAttribute('visibility','hidden');location.hash='editor';}"
         "function editAirport(b){indexInput.value=b.dataset.index;nameInput.value=b.dataset.name;"
         "latInput.value=b.dataset.lat;lonInput.value=b.dataset.lon;"
-        "sizeInput.value=b.dataset.size;colorInput.value=b.dataset.color;preview();location.hash='editor';}"
+        "sizeInput.value=b.dataset.size;colorInput.value=b.dataset.color;"
+        "modeInput.value=b.dataset.mode;runwayInput.value=b.dataset.runway;"
+        "preview();location.hash='editor';}"
         "['latitude','longitude','diameter','color'].forEach(id=>document.getElementById(id).addEventListener('input',preview));"
         "</script><p><a href='/'>Back to setup</a></p></body></html>") != ESP_OK)
         return ESP_FAIL;
@@ -359,7 +429,8 @@ static bool ParseHtmlColor(const char *text, uint32_t *out)
 static esp_err_t SaveAirport(httpd_req_t *req)
 {
     char body[256], indexText[12], name[64], latText[32], lonText[32], sizeText[12], colorText[16];
-    long index, diameter;
+    char modeText[4], runwayText[AIRPORT_RUNWAY_LENGTH + 1];
+    long index, diameter, mode;
     AirportMarker marker = {0};
     if (!ReadForm(req, body) ||
         !GetField(body, "index", indexText, sizeof(indexText)) ||
@@ -368,15 +439,28 @@ static esp_err_t SaveAirport(httpd_req_t *req)
         !GetField(body, "longitude", lonText, sizeof(lonText)) ||
         !GetField(body, "diameter", sizeText, sizeof(sizeText)) ||
         !GetField(body, "color", colorText, sizeof(colorText)) ||
+        !GetField(body, "mode", modeText, sizeof(modeText)) ||
+        !GetField(body, "runway", runwayText, sizeof(runwayText)) ||
         !ParseLong(indexText, &index) || !ParseLong(sizeText, &diameter) ||
+        !ParseLong(modeText, &mode) ||
         !ParseFloat(latText, &marker.latitude) ||
         !ParseFloat(lonText, &marker.longitude) ||
         !ParseHtmlColor(colorText, &marker.color) ||
         index < -1 || index >= MAX_AIRPORTS ||
-        diameter < 6 || diameter > 24 || strlen(name) > AIRPORT_NAME_LENGTH)
+        diameter < 6 || diameter > 24 || strlen(name) > AIRPORT_NAME_LENGTH ||
+        (mode != AIRPORT_MARKER_DOT && mode != AIRPORT_MARKER_DIRECTIONAL) ||
+        strlen(runwayText) > AIRPORT_RUNWAY_LENGTH)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid airport details");
+    /* A runway that doesn't parse (empty, out of range, malformed) is not a
+     * rejected submission - it just means this airport falls back to the
+     * dot at render time, the same as if directional mode were never picked.
+     * See Airport_ParseRunwayAxis / PHASE 5 "Missing / Invalid Orientation". */
     strcpy(marker.name, name);
     marker.diameter = (uint8_t)diameter;
+    marker.markerMode = (uint8_t)mode;
+    for (char *c = runwayText; *c; c++)
+        *c = (char)toupper((unsigned char)*c);
+    strcpy(marker.runway, runwayText);
     if (marker.name[0] == '\0' || marker.latitude < -90 || marker.latitude > 90 ||
         marker.longitude < -180 || marker.longitude > 180)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid airport position or name");

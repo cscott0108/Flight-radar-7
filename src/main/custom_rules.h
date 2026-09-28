@@ -74,9 +74,19 @@ typedef enum {
     CRAFT_SRC_FALLBACK
 } CraftSource;
 
+/* Where the final AircraftType came from (independent of CraftSource, which
+ * explains the craft type/color). Shown by "Decided by" on the Current
+ * Aircraft page and by provider diagnostics. */
+typedef enum {
+    ATYPE_SRC_DEFAULT = 0, /* nothing decided it: Fixed-Wing default */
+    ATYPE_SRC_REGISTRY,    /* explicit registry rule (always wins) */
+    ATYPE_SRC_PROVIDER     /* the active provider's automatic hint */
+} AircraftTypeSource;
+
 typedef struct {
     CraftType type;
     AircraftType aircraftType; /* manual designation; Fixed-Wing unless a registry rule says otherwise */
+    AircraftTypeSource aircraftTypeSource;
     CraftSource source;
     char operatorCode[MAX_OPERATOR_CODE + 1]; /* set when source == CRAFT_SRC_OPERATOR */
     char registryPrefix[MAX_RULE_PREFIX + 1]; /* matching rule, set when source == CRAFT_SRC_REGISTRY */
@@ -108,6 +118,11 @@ bool Operators_Get(size_t index, OperatorInfo *out);
 bool Operators_Find(const char *code, OperatorInfo *out);
 bool Operators_NormalizeCode(const char *input, char out[MAX_OPERATOR_CODE + 1]);
 bool Operators_NormalizeName(const char *input, char out[MAX_OPERATOR_NAME + 1]);
+/* Airline-style call sign (three letters then a digit, e.g. FDX1234) -> "FDX".
+ * Returns false (out = "") for anything else (N123AB, blank). Shared by the
+ * Current Aircraft page and the Seen Aircraft history so both derive the
+ * operator code identically. */
+bool Operators_CodeFromCallsign(const char *callsign, char out[MAX_OPERATOR_CODE + 1]);
 /* Edits a built-in operator or adds/updates a custom one. */
 bool Operators_Set(const char *code, const char *name, CraftType type);
 /* Built-in only: discards the user's changes and returns to the default. */
@@ -122,6 +137,7 @@ CraftType evaluateAircraftType(const char *callsign, const char *hex);
  * used by every renderer (radar and web preview). */
 CraftAppearance ResolveAircraftAppearance(const char *callsign, const char *hex);
 const char *CraftSource_Name(CraftSource source);
+const char *AircraftTypeSource_Name(AircraftTypeSource source); /* "Registry", "Provider", "Default" */
 
 /* Multi-provider Aircraft Type resolution (see PROJECT_STATE.md "Automatic
  * Aircraft Type Detection"). Precedence:

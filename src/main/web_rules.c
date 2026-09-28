@@ -11,8 +11,10 @@
 #include "freertos/task.h"
 
 #include "craft_types.h"
+#include "aircraft_provider.h"
 #include "custom_rules.h"
 #include "opensky_client.h"
+#include "web_util.h"
 
 static const char *TAG = "WebRules";
 
@@ -59,6 +61,28 @@ static void EscapeInto(char *dst, size_t cap, const char *src)
         used += length;
     }
     dst[used] = '\0';
+}
+
+/* Appends to a NUL-terminated buffer without overflowing (silently truncates). */
+static void AppendRaw(char *buf, size_t cap, const char *text)
+{
+    size_t used = strlen(buf);
+    if (used + 1 >= cap)
+        return;
+    size_t room = cap - used - 1;
+    size_t n = strlen(text);
+    if (n > room)
+        n = room;
+    memcpy(buf + used, text, n);
+    buf[used + n] = '\0';
+}
+
+static void AppendEscaped(char *buf, size_t cap, const char *text)
+{
+    size_t used = strlen(buf);
+    if (used + 1 >= cap)
+        return;
+    EscapeInto(buf + used, cap - used, text);
 }
 
 /* One <option> per craft type, straight from the central table. */
@@ -196,7 +220,7 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "$('dmsg').textContent='Saving...';" \
     "try{var r=await fetch('/rules/save',{method:'POST',body:p});" \
     "var t=(await r.text()).split('\\n');" \
-    "if(r.ok){D.close();try{sessionStorage.setItem('msg',t[1]||'Saved.');}catch(e){}location.reload();return;}" \
+    "if(r.ok){D.close();try{sessionStorage.setItem('msg',t[1]||'Saved.');}catch(e){}location.replace('/rules');return;}" \
     "$('dmsg').textContent=t[1]||'Save failed.';" \
     "if(r.status===409){ex={key:t[2],name:t[3],type:t[4],atype:t[5],notes:t[6]};$('dedit').hidden=false;}" \
     "}catch(e){$('dmsg').textContent='Could not reach the device.';}}" \
@@ -222,104 +246,170 @@ static void TrimCopy(char *dst, size_t cap, const char *src)
     dst[length] = '\0';
 }
 
-/* Airline-style call sign (three letters then a digit, e.g. FDX1234) -> "FDX".
- * Anything else (N123AB, blank) has no derivable ICAO code. */
-static void DeriveIcao(const char *callsign, char out[MAX_OPERATOR_CODE + 1])
-{
-    out[0] = '\0';
-    for (int i = 0; i < 3; i++) {
-        char c = callsign[i];
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
-            return;
-    }
-    if (callsign[3] < '0' || callsign[3] > '9')
-        return;
-    for (int i = 0; i < 3; i++) {
-        char c = callsign[i];
-        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
-    }
-    out[3] = '\0';
-}
-
-/* One Current Aircraft row. Everything the Add/Edit dialog needs is carried in
- * HTML-escaped data- attributes, so no extra request is needed to prepopulate. */
-static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
-{
-    char callsign[sizeof(gAircraft[index].callsign)];
-    char hex[sizeof(gAircraft[index].icao24)];
-    memcpy(callsign, gAircraft[index].callsign, sizeof(callsign));
-    memcpy(hex, gAircraft[index].icao24, sizeof(hex));
-    callsign[sizeof(callsign) - 1] = '\0';
-    hex[sizeof(hex) - 1] = '\0';
-
-    char cs[sizeof(callsign)], hx[sizeof(hex)];
-    TrimCopy(cs, sizeof(cs), callsign);
-    TrimCopy(hx, sizeof(hx), hex);
-
-    CraftResolution resolved = ResolveAircraft(cs, hx);
-    bool hasReg = (resolved.source == CRAFT_SRC_REGISTRY);
-
+/* Everything one Current Aircraft row (and the Add/Edit dialog it opens)
+ * needs, computed once. The same builder feeds the table rows and the
+ * "?edit=" auto-open used by the Seen Aircraft page, so both open the one
+ * existing dialog with identical prefill. */
+typedef struct {
+    char cs[16];
+    char hx[12];
+    char providerOp[AIRCRAFT_OPERATOR_NAME_MAX];
+    CraftResolution resolved;
+    bool hasReg;
+    bool hasOp;
     char icao[MAX_OPERATOR_CODE + 1];
-    if (resolved.source == CRAFT_SRC_OPERATOR)
-        snprintf(icao, sizeof(icao), "%s", resolved.operatorCode);
-    else
-        DeriveIcao(cs, icao);
-
     OperatorInfo op;
-    bool hasOp = icao[0] && Operators_Find(icao, &op);
+    char regKey[MAX_RULE_PREFIX + 1];
+    char regNotes[MAX_RULE_NOTES + 1];
+} AircraftInfo;
+
+static void BuildAircraftInfo(AircraftInfo *info, const char *callsign, const char *hex,
+                              const char *providerOp, AircraftType hint, bool hasHint)
+{
+    memset(info, 0, sizeof(*info));
+    TrimCopy(info->cs, sizeof(info->cs), callsign ? callsign : "");
+    TrimCopy(info->hx, sizeof(info->hx), hex ? hex : "");
+    TrimCopy(info->providerOp, sizeof(info->providerOp), providerOp ? providerOp : "");
+
+    /* Same resolution the radar uses, provider hint included, so the Aircraft
+     * Type shown here is the one actually drawn. */
+    info->resolved = ResolveAircraftWithHint(info->cs, info->hx, hint, hasHint);
+    info->hasReg = (info->resolved.source == CRAFT_SRC_REGISTRY);
+
+    if (info->resolved.source == CRAFT_SRC_OPERATOR)
+        snprintf(info->icao, sizeof(info->icao), "%s", info->resolved.operatorCode);
+    else
+        Operators_CodeFromCallsign(info->cs, info->icao);
+    info->hasOp = info->icao[0] && Operators_Find(info->icao, &info->op);
 
     /* Registry prefill: the matched rule when editing, otherwise the call sign
      * (blank if it is not a valid registry pattern). */
-    char regKey[MAX_RULE_PREFIX + 1] = "";
-    if (hasReg)
-        snprintf(regKey, sizeof(regKey), "%s", resolved.registryPrefix);
-    else
-        if (!CustomRules_NormalizePrefix(cs, regKey))
-            regKey[0] = '\0'; /* the normalizer may have partially written */
-
-    char decided[32];
-    if (resolved.source == CRAFT_SRC_OPERATOR)
-        snprintf(decided, sizeof(decided), "Operator %s", resolved.operatorCode);
-    else
-        snprintf(decided, sizeof(decided), "%s", CraftSource_Name(resolved.source));
-
-    /* Registry note, if any - not shown as its own column here (this table
-     * is meant to stay compact); carried instead as a data attribute for the
-     * Add/Edit dialog to prefill, and as a tooltip on the call sign cell. */
-    char regNotes[MAX_RULE_NOTES + 1] = "";
-    if (hasReg) {
+    if (info->hasReg) {
+        snprintf(info->regKey, sizeof(info->regKey), "%s", info->resolved.registryPrefix);
         CustomRule regRule;
-        if (CustomRules_Find(resolved.registryPrefix, &regRule))
-            snprintf(regNotes, sizeof(regNotes), "%s", regRule.notes);
+        if (CustomRules_Find(info->resolved.registryPrefix, &regRule))
+            snprintf(info->regNotes, sizeof(info->regNotes), "%s", regRule.notes);
+    } else if (!CustomRules_NormalizePrefix(info->cs, info->regKey)) {
+        info->regKey[0] = '\0'; /* the normalizer may have partially written */
     }
+}
 
-    char eCs[128], eShown[128], eQuery[128], eReg[64], eName[256], eDecided[64], eRegNotes[MAX_RULE_NOTES * 6 + 1];
-    EscapeInto(eCs, sizeof(eCs), cs);
-    EscapeInto(eShown, sizeof(eShown), cs[0] ? cs : "(empty)");
-    EscapeInto(eRegNotes, sizeof(eRegNotes), regNotes);
-    EscapeInto(eQuery, sizeof(eQuery), cs[0] ? cs : hx);
-    EscapeInto(eReg, sizeof(eReg), regKey);
-    EscapeInto(eName, sizeof(eName), hasOp ? op.name : "");
-    EscapeInto(eDecided, sizeof(eDecided), decided);
+/* The Add/Edit button. Everything the dialog needs rides in HTML-escaped
+ * data- attributes, so no extra request is needed to prefill it. With
+ * autoOpen the button is hidden and clicked by a script (Seen Aircraft ->
+ * "Add/Edit" link). */
+static esp_err_t SendEditButton(httpd_req_t *req, const AircraftInfo *info, bool autoOpen)
+{
+    char eCs[128], eReg[64], eName[256], eRegNotes[MAX_RULE_NOTES * 6 + 1];
+    EscapeInto(eCs, sizeof(eCs), info->cs);
+    EscapeInto(eReg, sizeof(eReg), info->regKey);
+    EscapeInto(eName, sizeof(eName), info->hasOp ? info->op.name : "");
+    EscapeInto(eRegNotes, sizeof(eRegNotes), info->regNotes);
 
-    const char *regType = CraftType_CsvName(resolved.type);
-    const char *opType = CraftType_CsvName(hasOp ? op.type : resolved.type);
-    /* Aircraft Type is only ever set on registry rules; a registry match
-     * carries its saved value, anything else prefills Fixed-Wing. */
-    const char *regAircraftType = AircraftType_CsvName(hasReg ? resolved.aircraftType : AIRCRAFT_FIXED_WING);
+    const char *regType = CraftType_CsvName(info->resolved.type);
+    const char *opType = CraftType_CsvName(info->hasOp ? info->op.type : info->resolved.type);
+    /* Prefill with the Aircraft Type actually in effect: the registry rule's
+     * value when one matched, else the provider's hint, else Fixed-Wing. */
+    const char *regAircraftType = AircraftType_CsvName(info->resolved.aircraftType);
 
     return SendRow(req,
-        "<tr><td title='%s'>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>"
-        "<button type='button' data-q='%s' onclick='lookup(this)'%s>&#128270; Lookup</button>"
-        "<button type='button' data-cs='%s' data-reg='%s' data-regtype='%s' data-regatype='%s' data-regnotes='%s' "
-        "data-hasreg='%s' data-icao='%s' data-opname='%s' data-optype='%s' data-hasop='%s' onclick='dOpen(this)'>%s</button>"
-        "</td></tr>",
-        eRegNotes, eShown, icao[0] ? icao : "---", CraftType_Name(resolved.type),
-        AircraftType_Name(resolved.aircraftType), eDecided,
-        eQuery, eQuery[0] ? "" : " disabled",
+        "<button type='button'%s data-cs='%s' data-reg='%s' data-regtype='%s' data-regatype='%s' data-regnotes='%s' "
+        "data-hasreg='%s' data-icao='%s' data-opname='%s' data-optype='%s' data-hasop='%s' onclick='dOpen(this)'%s>%s</button>",
+        autoOpen ? " id='autoOpen'" : "",
         eCs, eReg, regType, regAircraftType, eRegNotes,
-        hasReg ? "1" : "0", icao, eName, opType, hasOp ? "1" : "0",
-        (hasReg || hasOp) ? "&#9998; Edit" : "&#10133; Add");
+        info->hasReg ? "1" : "0", info->icao, eName, opType, info->hasOp ? "1" : "0",
+        autoOpen ? " hidden" : "",
+        (info->hasReg || info->hasOp) ? "&#9998; Edit" : "&#10133; Add");
+}
+
+/* One Current Aircraft row. Columns: Call Sign | ICAO24 | Craft Type |
+ * Aircraft Type (icon) | Operator | Registry | Decided by | Actions. Provider
+ * operator, configured operator and registry note are kept apart on purpose:
+ * they come from different places and mean different things. */
+static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
+{
+    /* Snapshot the fields first: the poll task rewrites gAircraft[] in place. */
+    Aircraft snap;
+    memcpy(&snap, &gAircraft[index], sizeof(snap));
+    snap.callsign[sizeof(snap.callsign) - 1] = '\0';
+    snap.icao24[sizeof(snap.icao24) - 1] = '\0';
+    snap.operatorName[sizeof(snap.operatorName) - 1] = '\0';
+
+    AircraftInfo info;
+    BuildAircraftInfo(&info, snap.callsign, snap.icao24, snap.operatorName,
+                      snap.providerTypeHint, snap.hasProviderTypeHint);
+    const CraftResolution *res = &info.resolved;
+
+    /* Decided by: craft type (color) and Aircraft Type (shape) can come from
+     * different places, so both are stated. */
+    char craftBy[64];
+    if (res->source == CRAFT_SRC_REGISTRY)
+        snprintf(craftBy, sizeof(craftBy), "Registry %s", res->registryPrefix);
+    else if (res->source == CRAFT_SRC_OPERATOR)
+        snprintf(craftBy, sizeof(craftBy), "Operator %s", res->operatorCode);
+    else
+        snprintf(craftBy, sizeof(craftBy), "%s", CraftSource_Name(res->source));
+
+    char eShown[128], eQuery[128], eHx[64], eCraftBy[128];
+    EscapeInto(eShown, sizeof(eShown), info.cs[0] ? info.cs : "(empty)");
+    EscapeInto(eQuery, sizeof(eQuery), info.cs[0] ? info.cs : info.hx);
+    EscapeInto(eHx, sizeof(eHx), info.hx);
+    EscapeInto(eCraftBy, sizeof(eCraftBy), craftBy);
+
+    char icon[240];
+    if (CraftType_IconUse(res->type, res->aircraftType, icon, sizeof(icon)) == 0)
+        icon[0] = '\0';
+
+    /* Operator cell: the provider's name if any (labelled Provider), and the
+     * configured operator (from the call sign's ICAO code) shown separately
+     * when present. Escaped straight into the cell to keep stack use low. */
+    char operatorCell[640];
+    operatorCell[0] = '\0';
+    if (info.providerOp[0]) {
+        AppendEscaped(operatorCell, sizeof(operatorCell), info.providerOp);
+        AppendRaw(operatorCell, sizeof(operatorCell), "<small>Provider</small>");
+        if (info.hasOp) {
+            AppendRaw(operatorCell, sizeof(operatorCell), "<small>Configured: ");
+            AppendEscaped(operatorCell, sizeof(operatorCell), info.op.name);
+            AppendRaw(operatorCell, sizeof(operatorCell), " (");
+            AppendEscaped(operatorCell, sizeof(operatorCell), info.icao);
+            AppendRaw(operatorCell, sizeof(operatorCell), ")</small>");
+        }
+    } else if (info.hasOp) {
+        AppendEscaped(operatorCell, sizeof(operatorCell), info.op.name);
+        AppendRaw(operatorCell, sizeof(operatorCell), "<small>Configured (");
+        AppendEscaped(operatorCell, sizeof(operatorCell), info.icao);
+        AppendRaw(operatorCell, sizeof(operatorCell), ")</small>");
+    } else {
+        AppendRaw(operatorCell, sizeof(operatorCell), "&mdash;");
+    }
+
+    /* Registry cell: the matched rule's prefix and its note. */
+    char registryCell[MAX_RULE_NOTES * 6 + 160];
+    registryCell[0] = '\0';
+    if (info.hasReg) {
+        AppendEscaped(registryCell, sizeof(registryCell), info.regKey);
+        if (info.regNotes[0]) {
+            AppendRaw(registryCell, sizeof(registryCell), "<small>");
+            AppendEscaped(registryCell, sizeof(registryCell), info.regNotes);
+            AppendRaw(registryCell, sizeof(registryCell), "</small>");
+        }
+    } else {
+        AppendRaw(registryCell, sizeof(registryCell), "&mdash;");
+    }
+
+    if (SendRow(req,
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s%s</td><td>%s</td><td>%s</td>"
+            "<td>Craft: %s<small>Type: %s</small></td><td>"
+            "<button type='button' data-q='%s' onclick='lookup(this)'%s>&#128270; Lookup</button>",
+            eShown, info.hx[0] ? eHx : "---", CraftType_Name(res->type),
+            icon, AircraftType_Name(res->aircraftType), operatorCell, registryCell,
+            eCraftBy, AircraftTypeSource_Name(res->aircraftTypeSource),
+            eQuery, eQuery[0] ? "" : " disabled") != ESP_OK)
+        return ESP_FAIL;
+    if (SendEditButton(req, &info, false) != ESP_OK)
+        return ESP_FAIL;
+    return SendChunk(req, "</td></tr>");
 }
 
 static esp_err_t RulesPage(httpd_req_t *req)
@@ -328,9 +418,11 @@ static esp_err_t RulesPage(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     if (SendChunk(req,
         "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Craft Type Configuration</title><style>body{font:16px sans-serif;max-width:820px;margin:2em auto;padding:0 1em}"
+        "<title>Craft Type Configuration</title><style>body{font:16px sans-serif;max-width:1000px;margin:2em auto;padding:0 1em}"
         "table{border-collapse:collapse;width:100%}td,th{padding:.4em;border:1px solid #ccc;text-align:left}"
         "form.inline{display:inline}fieldset{margin:1em 0}small{color:#666}"
+        ".ati{background:#1b1b1b;border-radius:4px;vertical-align:middle;margin-right:4px}"
+        "table.ca{font-size:.9em}table.ca small{display:block}"
         "button{margin:.15em}[hidden]{display:none!important}"
         "dialog{max-width:26em;width:90%;border:1px solid #888;border-radius:6px}"
         "dialog label{display:block;margin:.6em 0}"
@@ -381,6 +473,7 @@ static esp_err_t RulesPage(httpd_req_t *req)
             return ESP_FAIL;
     }
 
+    LogHttpdMemory("rules page after section A (registry rules)");
     if (SendChunk(req,
         "</table><h2>B. ICAO / operator configuration</h2>"
         "<p>The ICAO code (for example FDX in FDX1234) selects the craft type for every matching flight. "
@@ -435,25 +528,59 @@ static esp_err_t RulesPage(httpd_req_t *req)
             return ESP_FAIL;
     }
 
+    LogHttpdMemory("rules page after section B (operators)");
+
+    char iconDefs[900];
+    if (AircraftType_IconDefs(iconDefs, sizeof(iconDefs)) == 0)
+        iconDefs[0] = '\0';
     if (SendChunk(req, "</table><h2>Current aircraft</h2>"
                        "<p><small>Lookup opens a web search for the call sign in this browser. "
-                       "Add / Edit changes the registry or operator lists above.</small></p><table>"
-                       "<tr><th>Call Sign</th><th>ICAO</th><th>Craft Type</th><th>Aircraft Type</th><th>Decided by</th>"
-                       "<th>Actions</th></tr>") != ESP_OK)
+                       "Add / Edit changes the registry or operator lists above. "
+                       "<a href='/seen'>Seen Aircraft history</a></small></p>") != ESP_OK ||
+        SendChunk(req, iconDefs) != ESP_OK ||
+        SendChunk(req, "<table class='ca'>"
+                       "<tr><th>Call Sign</th><th>ICAO24</th><th>Craft Type</th><th>Aircraft Type</th><th>Operator</th>"
+                       "<th>Registry</th><th>Decided by</th><th>Actions</th></tr>") != ESP_OK)
         return ESP_FAIL;
     int aircraftCount = gAircraftCount;
     if (aircraftCount < 0) aircraftCount = 0;
     if (aircraftCount > MAX_AIRCRAFT) aircraftCount = MAX_AIRCRAFT;
-    if (!aircraftCount && SendChunk(req, "<tr><td colspan='6'>No aircraft in range</td></tr>") != ESP_OK)
+    if (!aircraftCount && SendChunk(req, "<tr><td colspan='8'>No aircraft in range</td></tr>") != ESP_OK)
         return ESP_FAIL;
     for (int i = 0; i < aircraftCount; i++) {
         if (SendAircraftRow(req, i) != ESP_OK)
             return ESP_FAIL;
     }
     if (SendChunk(req, "</table><p><a href='/'>Back to setup</a></p>") != ESP_OK ||
-        SendChunk(req, AIRCRAFT_DIALOG_HTML) != ESP_OK ||
-        SendChunk(req, PAGE_SCRIPT_EDITING) != ESP_OK ||
+        SendChunk(req, AIRCRAFT_DIALOG_HTML) != ESP_OK)
+        return ESP_FAIL;
+
+    /* "?edit=<call sign>&hex=<icao24>" (linked from the Seen Aircraft page)
+     * opens this page's existing Add/Edit dialog for that aircraft: a hidden
+     * button carrying the same data- attributes as a table row is clicked once
+     * the dialog script has loaded. The aircraft need not be in range now. */
+    char query[192];
+    char editCs[24] = "", editHex[16] = "";
+    bool autoOpen = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        bool haveCs = httpd_query_key_value(query, "edit", editCs, sizeof(editCs)) == ESP_OK;
+        bool haveHex = httpd_query_key_value(query, "hex", editHex, sizeof(editHex)) == ESP_OK;
+        WebUtil_UrlDecodeInPlace(editCs);
+        WebUtil_UrlDecodeInPlace(editHex);
+        autoOpen = haveCs || haveHex;
+    }
+    if (autoOpen) {
+        AircraftInfo info;
+        /* The provider's type hint is not known for a stored sighting; use
+         * the last recorded type via the plain resolution (registry/default). */
+        BuildAircraftInfo(&info, editCs, editHex, "", AIRCRAFT_FIXED_WING, false);
+        if (SendEditButton(req, &info, true) != ESP_OK)
+            return ESP_FAIL;
+    }
+
+    if (SendChunk(req, PAGE_SCRIPT_EDITING) != ESP_OK ||
         SendChunk(req, PAGE_SCRIPT_AIRCRAFT) != ESP_OK ||
+        (autoOpen && SendChunk(req, "var ao=document.getElementById('autoOpen');if(ao){ao.click();}") != ESP_OK) ||
         SendChunk(req, "</script></body></html>") != ESP_OK)
         return ESP_FAIL;
     esp_err_t done = httpd_resp_send_chunk(req, NULL, 0);

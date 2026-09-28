@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -32,6 +33,20 @@
 #include "radar.h"
 #include "custom_rules.h"
 #include "airports.h"
+#include "seen_aircraft.h"
+#include "history_manager.h"
+#include "adv_diag.h"
+#include "boot_warmup.h"
+#include "expert_debug.h"
+#include "fr_lv_pool.h"
+
+// Build-time A/B switch: flip to 0 and reflash to test whether TF/SD mount
+// is contributing to internal-heap fragmentation behind the
+// "esp-aes: Failed to allocate memory" / OpenSky TLS failures reported
+// after this feature was added, without removing any code. Remove this
+// switch once that question is settled (see PROJECT_STATE.md).
+#define TF_HISTORY_ENABLED 1
+#include "time_util.h"
 
 #define MAX_WIFI_NETWORKS 30
 #define DEFAULT_SCAN_LIST_SIZE 30
@@ -79,7 +94,6 @@ static volatile uint32_t radarLowTrafficThreshold = RADAR_LOW_TRAFFIC_THRESHOLD_
 static volatile uint32_t radarLowTrafficIntervalSec = RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC;
 
 static volatile bool radarDayNightEnabled = false;
-static volatile int32_t radarUtcOffsetMinutes = 0;
 static volatile uint32_t radarDayStartHour = RADAR_DAY_START_HOUR_DEFAULT;
 static volatile uint32_t radarDayEndHour = RADAR_DAY_END_HOUR_DEFAULT;
 static volatile uint32_t radarDayIntervalSec = RADAR_DAY_INTERVAL_DEFAULT_SEC;
@@ -565,6 +579,141 @@ static void SaveRadarU32Setting(
     }
 }
 
+// String setting under RADAR_NAMESPACE (used for the IANA time zone id).
+static bool LoadRadarStringSetting(
+    const char *key,
+    char *value,
+    size_t valueSize)
+{
+    nvs_handle_t handle;
+
+    if (nvs_open(RADAR_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+    {
+        return false;
+    }
+
+    size_t length = valueSize;
+    esp_err_t err = nvs_get_str(handle, key, value, &length);
+
+    nvs_close(handle);
+
+    return err == ESP_OK;
+}
+
+static void SaveRadarStringSetting(
+    const char *key,
+    const char *value)
+{
+    nvs_handle_t handle;
+
+    if (nvs_open(RADAR_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        nvs_set_str(handle, key, value);
+
+        esp_err_t err = nvs_commit(handle);
+
+        ESP_LOGW(
+            "RADAR",
+            "Saving %s=%s commit=%s",
+            key,
+            value,
+            esp_err_to_name(err));
+
+        nvs_close(handle);
+    }
+}
+
+// Applies and persists the time zone. Everything time-dependent (day/night
+// schedules, Seen Aircraft timestamps, web pages) reads it through time_util,
+// so this is the only place the zone is stored.
+//   tz_id   IANA zone id, or "CUSTOM" for a fixed offset
+//   tz_dst  Automatic DST on/off
+//   utcoff  the fixed offset (minutes + 720), unchanged from earlier
+//           firmware: it is the custom offset now, and is also what a
+//           pre-time-zone install is migrated from (see LoadTimeZoneSettings)
+void SetRadarTimeZone(
+    const char *zoneId,
+    bool autoDst,
+    int32_t customOffsetMinutes)
+{
+    TimeZoneConfig cfg;
+
+    TimeUtil_DefaultConfig(&cfg);
+    snprintf(cfg.zoneId, sizeof(cfg.zoneId), "%s", zoneId ? zoneId : TIMEUTIL_DEFAULT_ZONE);
+    cfg.autoDst = autoDst;
+    cfg.customOffsetMinutes = (int)customOffsetMinutes;
+
+    if (!TimeUtil_SetConfig(&cfg))
+    {
+        ESP_LOGW("RADAR", "Ignoring invalid time zone %s / offset %ld", cfg.zoneId, (long)customOffsetMinutes);
+        return;
+    }
+
+    SaveRadarStringSetting("tz_id", cfg.zoneId);
+    SaveRadarU32Setting("tz_dst", cfg.autoDst ? 1 : 0);
+    SaveRadarU32Setting("utcoff", (uint32_t)(cfg.customOffsetMinutes + 720)); // store as unsigned
+}
+
+// Boot-time load. Existing installations only ever stored "utcoff": they
+// are migrated to a fixed-offset zone with DST off, which reproduces their
+// old day/night behavior exactly. Nothing is written here (no flash wear on
+// every boot); the migrated state is persisted when the user next saves the
+// setup page. A fresh install gets UTC with Automatic DST on.
+static void LoadTimeZoneSettings(void)
+{
+    TimeZoneConfig cfg;
+
+    TimeUtil_DefaultConfig(&cfg);
+
+    uint32_t storedUtcOffset = 720; // encoded as offsetMinutes + 720
+    bool haveUtcOffset = LoadRadarU32Setting("utcoff", &storedUtcOffset);
+
+    if (haveUtcOffset)
+    {
+        cfg.customOffsetMinutes = (int)storedUtcOffset - 720;
+    }
+
+    char storedZone[TIMEUTIL_ZONE_ID_MAX];
+    uint32_t storedDst = 1;
+
+    if (LoadRadarStringSetting("tz_id", storedZone, sizeof(storedZone)))
+    {
+        LoadRadarU32Setting("tz_dst", &storedDst);
+        snprintf(cfg.zoneId, sizeof(cfg.zoneId), "%s", storedZone);
+        cfg.autoDst = (storedDst != 0);
+    }
+    else if (haveUtcOffset)
+    {
+        snprintf(cfg.zoneId, sizeof(cfg.zoneId), "%s", TIMEUTIL_ZONE_CUSTOM);
+        cfg.autoDst = false;
+    }
+
+    if (!TimeUtil_SetConfig(&cfg))
+    {
+        // Unknown zone id (for example a table change) or an out-of-range
+        // offset: fall back to the safest interpretation of what is stored.
+        ESP_LOGW("RADAR", "Stored time zone '%s' is not usable; falling back", cfg.zoneId);
+
+        if (haveUtcOffset)
+        {
+            snprintf(cfg.zoneId, sizeof(cfg.zoneId), "%s", TIMEUTIL_ZONE_CUSTOM);
+            cfg.autoDst = false;
+        }
+        else
+        {
+            TimeUtil_DefaultConfig(&cfg);
+        }
+
+        if (cfg.customOffsetMinutes < TIMEUTIL_CUSTOM_MIN_MINUTES ||
+            cfg.customOffsetMinutes > TIMEUTIL_CUSTOM_MAX_MINUTES)
+        {
+            cfg.customOffsetMinutes = 0;
+        }
+
+        TimeUtil_SetConfig(&cfg);
+    }
+}
+
 uint32_t GetRadarRefreshSeconds(void)
 {
     return radarRefreshSec;
@@ -635,9 +784,16 @@ bool GetRadarDayNightEnabled(void)
     return radarDayNightEnabled;
 }
 
+// The fixed offset used when the time zone is "Custom fixed UTC offset".
+// The active zone/DST configuration itself lives in time_util (see
+// SetRadarTimeZone below); this only exposes its custom-offset field.
 int32_t GetRadarUtcOffsetMinutes(void)
 {
-    return radarUtcOffsetMinutes;
+    TimeZoneConfig tz;
+
+    TimeUtil_GetConfig(&tz);
+
+    return tz.customOffsetMinutes;
 }
 
 uint32_t GetRadarDayStartHour(void)
@@ -666,7 +822,6 @@ uint32_t GetRadarNightIntervalSeconds(void)
 // the same values it just read back out of it on every single boot).
 static void ApplyRadarDayNightSchedule(
     bool enabled,
-    int32_t utcOffsetMinutes,
     uint32_t dayStartHour,
     uint32_t dayEndHour,
     uint32_t dayIntervalSec,
@@ -674,17 +829,6 @@ static void ApplyRadarDayNightSchedule(
 {
     radarDayNightEnabled = enabled;
 
-    // Offsets run from UTC-12:00 to UTC+14:00 in real timezones.
-    if (utcOffsetMinutes < -720)
-    {
-        utcOffsetMinutes = -720;
-    }
-    else if (utcOffsetMinutes > 840)
-    {
-        utcOffsetMinutes = 840;
-    }
-
-    radarUtcOffsetMinutes = utcOffsetMinutes;
     radarDayStartHour = ClampHourOfDay(dayStartHour);
     radarDayEndHour = ClampHourOfDay(dayEndHour);
     radarDayIntervalSec = ClampRefreshSeconds(dayIntervalSec);
@@ -693,7 +837,6 @@ static void ApplyRadarDayNightSchedule(
 
 void SetRadarDayNightSchedule(
     bool enabled,
-    int32_t utcOffsetMinutes,
     uint32_t dayStartHour,
     uint32_t dayEndHour,
     uint32_t dayIntervalSec,
@@ -701,14 +844,12 @@ void SetRadarDayNightSchedule(
 {
     ApplyRadarDayNightSchedule(
         enabled,
-        utcOffsetMinutes,
         dayStartHour,
         dayEndHour,
         dayIntervalSec,
         nightIntervalSec);
 
     SaveRadarU32Setting("dnenabled", radarDayNightEnabled ? 1 : 0);
-    SaveRadarU32Setting("utcoff", (uint32_t)(radarUtcOffsetMinutes + 720)); // store as unsigned
     SaveRadarU32Setting("daystart", radarDayStartHour);
     SaveRadarU32Setting("dayend", radarDayEndHour);
     SaveRadarU32Setting("dayint", radarDayIntervalSec);
@@ -834,22 +975,20 @@ void SetRadarIdleDimSettings(
 static bool IsSystemTimeValid(
     time_t now)
 {
-    return now > 1700000000; // ~Nov 2023; anything before this is unsynced.
+    return TimeUtil_IsSynced((int64_t)now); // ~Nov 2023; anything before this is unsynced.
 }
 
 static bool IsCurrentlyDaytime(
     time_t now)
 {
-    struct tm utcTm;
-
-    gmtime_r(&now, &utcTm);
-
-    long localMinutesOfDay =
-        ((long)utcTm.tm_hour * 60 + utcTm.tm_min + radarUtcOffsetMinutes) % 1440;
+    // Local time comes from the central time utility (configured zone +
+    // Automatic DST), so the schedule follows the same clock as every web page.
+    int localMinutesOfDay = TimeUtil_LocalMinutesOfDay((int64_t)now);
 
     if (localMinutesOfDay < 0)
     {
-        localMinutesOfDay += 1440;
+        // Not synchronized; callers check IsSystemTimeValid first.
+        return true;
     }
 
     uint32_t localHour = (uint32_t)(localMinutesOfDay / 60);
@@ -1143,6 +1282,7 @@ void ConnectToWifi(
 
 void InitTime(void)
 {
+    AdvDiag_HeapCheckpoint("CP1 before esp_sntp_init");
     esp_sntp_setoperatingmode(
         SNTP_OPMODE_POLL);
 
@@ -1151,6 +1291,8 @@ void InitTime(void)
         "pool.ntp.org");
 
     esp_sntp_init();
+
+    AdvDiag_HeapCheckpoint("CP2 after esp_sntp_init");
 }
 
 static void wifi_event_handler(
@@ -1544,6 +1686,16 @@ static void ui_status_timer_cb(lv_timer_t *t)
     }
 }
 
+// PHASE 1.2/13 capacity diagnostics: cheap high-water mark, updated in the
+// one place gAircraftCount already changes. No polling, no separate
+// tracking task - see web_diag.c for where this is read.
+static int maxAircraftCountSinceBoot = 0;
+
+int GetMaxAircraftCountSinceBoot(void)
+{
+    return maxAircraftCountSinceBoot;
+}
+
 static void radar_update_timer_cb(void *pvParameters)
 {
     while (1)
@@ -1553,6 +1705,19 @@ static void radar_update_timer_cb(void *pvParameters)
             AircraftProvider_GetRateLimitSeconds() == 0)
         {
             const char *json = NULL;
+            // One-time, in RadarTask's own context (this function IS the
+            // RadarTask task body - see xTaskCreate in app_main), before its
+            // first network call: create this task's lwIP per-thread
+            // semaphore now, while nothing transient sits in front of it,
+            // instead of inside the first OAuth request. See boot_warmup.h.
+            // wifiConnectedState implies esp_netif_init() (lwIP) has run.
+            static bool firstFetchDone = false;
+            if (!firstFetchDone)
+            {
+                firstFetchDone = true;
+                BootWarmup_NetCurrentTask();
+                AdvDiag_HeapCheckpoint("CP3 RadarTask first fetch, before GetAircraftJson");
+            }
             if (AircraftProvider_GetAircraftJson(
                     radarLat,
                     radarLon,
@@ -1562,7 +1727,36 @@ static void radar_update_timer_cb(void *pvParameters)
                 if (AircraftProvider_ParseAircraft(json))
                 {
                     ESP_LOGI("AircraftProvider", "Aircraft in response: %d", gAircraftCount);
+                    if (gAircraftCount > maxAircraftCountSinceBoot)
+                        maxAircraftCountSinceBoot = gAircraftCount;
                     lastApiUpdateMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+                    // Provider-independent history: RAM only here; the CSV is
+                    // written in batches by SeenAircraft_FlushIfDue below.
+                    SeenAircraft_ObservePoll(gAircraft, gAircraftCount, (int64_t)time(NULL));
+
+                    // Persistent (TF) history: one classification resolve per
+                    // aircraft per poll (the radar/preview paths already re-resolve
+                    // live and uncached every sweep tick - see PROJECT_STATE.md - so
+                    // one more resolve here, at poll cadence rather than 30 ms sweep
+                    // cadence, is negligible). RAM-only unless this is an aircraft
+                    // first sighting this session; TF writes are coalesced separately
+                    // by HistoryManager_FlushIfDue below.
+#if TF_HISTORY_ENABLED
+                    {
+                        int64_t nowUtc = (int64_t)time(NULL);
+                        for (int hi = 0; hi < gAircraftCount; hi++) {
+                            if (!gAircraft[hi].valid)
+                                continue;
+                            CraftResolution hres = ResolveAircraftWithHint(
+                                gAircraft[hi].callsign,
+                                gAircraft[hi].icao24,
+                                gAircraft[hi].providerTypeHint,
+                                gAircraft[hi].hasProviderTypeHint);
+                            HistoryManager_Observe(gAircraft[hi].icao24, gAircraft[hi].callsign, hres, nowUtc);
+                        }
+                    }
+#endif
 
                     if (lvgl_port_lock(0))
                     {
@@ -1590,6 +1784,18 @@ static void radar_update_timer_cb(void *pvParameters)
         {
             vTaskDelay(pdMS_TO_TICKS(250));
             waitedMs += 250;
+
+            // Cheap check: writes flash at most once per
+            // SEEN_FLUSH_INTERVAL_SEC, and only if something changed.
+            SeenAircraft_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
+
+            // Same coalescing pattern for TF-backed persistent history -
+            // cheap, writes at most once per HM_SYNC_INTERVAL_SEC, and only
+            // the aircraft that actually changed (history_manager.c). A
+            // missing/unavailable TF card makes this a no-op every time.
+#if TF_HISTORY_ENABLED
+            HistoryManager_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
+#endif
         }
     }
 }
@@ -1678,6 +1884,19 @@ void app_main()
 
     waveshare_esp32_s3_rgb_lcd_init(); // Initialize the Waveshare ESP32-S3 RGB LCD
 
+    // One-shot check of LVGL's built-in TLSF pool, now provided from PSRAM
+    // by components/fr_lvgl_pool (see fr_lv_pool.h).
+    FrLvPool_LogHeap("After LVGL init");
+    if (lvgl_port_lock(-1))
+    {
+        lv_mem_monitor_t lvMon;
+        lv_mem_monitor(&lvMon);
+        lvgl_port_unlock();
+        ESP_LOGI("LV_POOL", "LVGL TLSF pool: total=%u free=%u biggest=%u used=%u%% frag=%u%%",
+                 (unsigned)lvMon.total_size, (unsigned)lvMon.free_size, (unsigned)lvMon.free_biggest_size,
+                 (unsigned)lvMon.used_pct, (unsigned)lvMon.frag_pct);
+    }
+
     esp_err_t ret = nvs_flash_init();
 
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -1691,10 +1910,46 @@ void app_main()
 
     ESP_ERROR_CHECK(ret);
 
+    // Advanced Diagnostics setting is read once here (reboot to change), then
+    // the one-time crypto initializations are triggered while internal RAM
+    // is still plentiful - before CustomRules/Airports/SEEN/History/UI/Wi-Fi
+    // carve it up, and after the LCD has taken its GDMA channels. See
+    // boot_warmup.h for why this prevents the aircraft TLS AES failure.
+    AdvDiag_LoadAtBoot();
+    ExpertDebug_LoadAtBoot(); // forensic hooks; registers nothing unless ON
+    BootWarmup_Crypto();
+
     if (!CustomRules_Init())
         ESP_LOGW("CRAFT_RULES", "Could not load one or more saved craft lists; built-in classification remains active");
     if (!Airports_Init())
         ESP_LOGW("AIRPORTS", "Could not load saved airport dots");
+
+    // Seen Aircraft history: needs SPIFFS, which CustomRules_Init mounted.
+    if (!SeenAircraft_Init())
+        ESP_LOGW("SEEN", "Could not initialize the seen-aircraft history");
+
+    // Persistent (TF/microSD) aircraft history: layered underneath the
+    // existing RAM Hot Seen cache above, never replacing it. A missing or
+    // unmountable TF card leaves this in RAM-only degraded mode; the radar
+    // and every existing feature are unaffected either way (see
+    // PROJECT_STATE.md "Persistent (TF) aircraft history").
+    //
+#if TF_HISTORY_ENABLED
+    {
+        size_t heapBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        bool historyOk = HistoryManager_Init();
+        size_t heapAfter = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t largestAfter = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        ESP_LOGW("HISTORY", "TF/SD mount internal-heap cost: free %u -> %u (-%d), largest block %u -> %u (-%d)",
+                 (unsigned)heapBefore, (unsigned)heapAfter, (int)heapBefore - (int)heapAfter,
+                 (unsigned)largestBefore, (unsigned)largestAfter, (int)largestBefore - (int)largestAfter);
+        if (!historyOk)
+            ESP_LOGW("HISTORY", "TF card not available - persistent history disabled; Hot Seen and radar continue normally");
+    }
+#else
+    ESP_LOGW("HISTORY", "TF_HISTORY_ENABLED=0: persistent history compiled out for this build (A/B test)");
+#endif
 
     // Loads the persisted provider selection/debug level and initializes
     // every provider (OpenSky credentials, response buffers) unconditionally
@@ -1786,15 +2041,17 @@ void app_main()
         radarLowTrafficIntervalSec = RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC;
     }
 
+    // Time zone first: the schedules below (and UpdateDayNightBrightness at
+    // the end of this function) read it.
+    LoadTimeZoneSettings();
+
     uint32_t storedDayNightEnabled = 0;
-    uint32_t storedUtcOffset = 720; // encoded as offsetMinutes + 720
     uint32_t storedDayStart = RADAR_DAY_START_HOUR_DEFAULT;
     uint32_t storedDayEnd = RADAR_DAY_END_HOUR_DEFAULT;
     uint32_t storedDayInterval = RADAR_DAY_INTERVAL_DEFAULT_SEC;
     uint32_t storedNightInterval = RADAR_NIGHT_INTERVAL_DEFAULT_SEC;
 
     LoadRadarU32Setting("dnenabled", &storedDayNightEnabled);
-    LoadRadarU32Setting("utcoff", &storedUtcOffset);
     LoadRadarU32Setting("daystart", &storedDayStart);
     LoadRadarU32Setting("dayend", &storedDayEnd);
     LoadRadarU32Setting("dayint", &storedDayInterval);
@@ -1802,7 +2059,6 @@ void app_main()
 
     ApplyRadarDayNightSchedule(
         storedDayNightEnabled != 0,
-        (int32_t)storedUtcOffset - 720,
         storedDayStart,
         storedDayEnd,
         storedDayInterval,
