@@ -143,13 +143,11 @@ The card is optional either way: without one, or if it fails, the radar, WebUI a
 
 ## 🗺️ Roadmap
 
-- [ ] Adjustable/independent distance-ring spacing
-- [ ] ADS-B receiver hardware integration (local reception, not just remote APIs)
-- [ ] Aircraft-type inference from adsb.lol's ICAO type code (`t` field), as a secondary signal alongside the current ADS-B category-based hint
-- [ ] Import for Seen Aircraft history (export exists; import is deliberately not implemented yet)
-- [ ] Verify TF/microSD long-term history over a longer run: lookup hits after reboot, flush cycle, soak (writes and reboot persistence already confirmed on a working card)
-- [ ] TF follow-ups: migrate existing Seen history to the card, ~12-hour hot Seen cache, background task for card work, compaction
-- [ ] Revisit touchscreen support if a working fix for this board's GT911 issue ever surfaces
+## 🗺️ Roadmap
+
+- [ ] Verify TF/microSD long-term history over a longer run: lookup hits after reboot, flush cycles, multi-day soak, index behavior, and storage integrity. Writes and reboot persistence have already been confirmed on a working card.
+- [ ] History CSV export.
+- [ ] Revisit touchscreen support if a working fix for this board's GT911 issue can be validated on the current board revision.
 
 ---
 
