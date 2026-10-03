@@ -132,6 +132,13 @@ bool Operators_DeleteCustom(const char *code);
 
 /* ---- lookup ---- */
 CraftResolution ResolveAircraft(const char *callsign, const char *hex);
+/* Same resolver with the registry / operator stages chosen by the caller
+ * instead of by the Features switches. ResolveAircraft() and
+ * ResolveAircraftWithHint() pass Features_RegisteredEnabled() /
+ * Features_OperatorsEnabled(); the Seen history and the Add/Edit dialog pass
+ * true/true so stored data and "already configured" stay accurate even while
+ * a switch is OFF. */
+CraftResolution ResolveAircraftOpts(const char *callsign, const char *hex, bool useRegistry, bool useOperators);
 CraftType evaluateAircraftType(const char *callsign, const char *hex);
 /* The single resolve -> classification -> aircraft type -> appearance path
  * used by every renderer (radar and web preview). */
@@ -158,6 +165,14 @@ CraftResolution ResolveAircraftWithHint(
     const char *hex,
     AircraftType providerHint,
     bool hasHint);
+
+CraftResolution ResolveAircraftWithHintOpts(
+    const char *callsign,
+    const char *hex,
+    AircraftType providerHint,
+    bool hasHint,
+    bool useRegistry,
+    bool useOperators);
 
 CraftAppearance ResolveAircraftAppearanceWithHint(
     const char *callsign,

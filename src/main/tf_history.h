@@ -38,6 +38,7 @@
  * bucket files (still bounded - one sequential pass, not held in RAM). */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define TF_ICAO_MAX 9
@@ -91,7 +92,8 @@ bool TfHistory_Upsert(uint32_t bucketFingerprint, const TfHistoryRecord *rec);
 bool TfHistory_RebuildIndex(void);
 
 typedef struct {
-    bool mounted;
+    bool mounted;          /* filesystem mount succeeded (esp_vfs_fat_sdspi_mount returned OK) and has not been unmounted */
+    bool historyAvailable; /* TfHistory_IsAvailable(): mounted AND directory/index usable, i.e. writes are accepted */
     uint64_t capacityBytes;
     uint64_t usedBytes;
     uint64_t freeBytes;
@@ -114,3 +116,209 @@ typedef struct {
 } TfHistoryStats;
 
 void TfHistory_GetStats(TfHistoryStats *out);
+
+/* ===================================================================
+ * TF diagnostics (read by /diag; nothing here changes storage behavior)
+ * ===================================================================
+ *
+ * Every init stage records its own result so "mounted yes, index 0/4096"
+ * can be told apart from "init failed at stage X with esp_err/errno Y".
+ * `espErr` is an esp_err_t, `errnoVal` is errno captured immediately after
+ * the failing call, `fatfsErr` is a FRESULT where the API exposes one
+ * (f_getfree); 0 means "not applicable / OK". */
+
+typedef enum {
+    TF_RES_NOT_RUN = 0,
+    TF_RES_OK = 1,
+    TF_RES_FAIL = 2,
+    TF_RES_SKIPPED = 3
+} TfResult;
+
+typedef struct {
+    uint8_t result;   /* TfResult */
+    uint8_t fatfsErr; /* FRESULT, 0 = none */
+    int16_t errnoVal;
+    int32_t espErr;
+    uint32_t us;
+} TfStepInfo;
+
+typedef enum {
+    TF_STAGE_SPI_BUS = 0,     /* spi_bus_initialize (INVALID_STATE = already initialized, tolerated) */
+    TF_STAGE_MOUNT,           /* esp_vfs_fat_sdspi_mount */
+    TF_STAGE_FS_INFO,         /* f_getfree: capacity/free/filesystem type */
+    TF_STAGE_HIST_DIR,        /* /sdcard/history exists or mkdir */
+    TF_STAGE_INDEX_CHECK,     /* open index.dat, size == expected */
+    TF_STAGE_INDEX_CREATE,    /* create empty index.dat (only if missing/wrong size) */
+    TF_STAGE_INDEX_REBUILD,   /* rebuild from bucket files (only after create) */
+    TF_STAGE_INDEX_COUNT,     /* count occupied slots of an existing valid index */
+    TF_STAGE_COUNT
+} TfInitStage;
+
+typedef enum {
+    TF_INDEX_NOT_INIT = 0, /* init never reached the index (or unmounted) */
+    TF_INDEX_LOADED,       /* existing index.dat had the right size; slots counted */
+    TF_INDEX_REBUILT,      /* index.dat was missing/wrong size: created empty, then rebuilt from buckets */
+    TF_INDEX_FAILED        /* index.dat could not be created */
+} TfIndexState;
+
+typedef struct {
+    bool attempted;        /* TfHistory_Init/Reinit has run at least once */
+    bool ok;               /* last init made history available */
+    int8_t firstFailedStage; /* TfInitStage of the first failing stage in the last init, -1 = none */
+    uint8_t indexState;    /* TfIndexState */
+    uint8_t fsType;        /* 0 unknown, 1 FAT12, 2 FAT16, 3 FAT32, 4 exFAT (FATFS fs_type) */
+    bool busAlreadyInit;   /* spi_bus_initialize said INVALID_STATE (tolerated by the existing code) */
+    bool dirExisted;       /* history dir was already there before init tried mkdir */
+    bool indexFileOpened;  /* index.dat could be opened for reading */
+    bool indexSizeValid;
+    int32_t indexSizeBytes;     /* -1 = unknown/missing */
+    uint32_t indexSizeExpected;
+    uint32_t runs;         /* number of init runs (boot + diagnostic reinit) */
+    TfStepInfo stage[TF_STAGE_COUNT];
+    int8_t lastErrStage;   /* stage of lastError, -1 = none */
+    int32_t lastEspErr;
+    int32_t lastErrno;
+    char lastError[128];   /* human-readable, e.g. "stage=index_create esp_err=ESP_OK errno=28(...) ..." */
+    char lastRuntimeError[48]; /* last failed Upsert/Lookup op (best-effort errno), empty if none */
+    const char *historyDir;
+    const char *indexPath;
+    const char *scratchPath;
+} TfInitInfo;
+
+const char *TfHistory_StageName(int stage);
+void TfHistory_GetInitInfo(TfInitInfo *out);
+
+/* ---- unmount / reinitialize (real teardown only; no GPIO/power control) ----
+ *
+ * Unmount: esp_vfs_fat_sdcard_unmount() then spi_bus_free(). Reinit runs the
+ * normal init path again (spi_bus_initialize + mount + history dir + index).
+ * Both are serialized against Lookup/Upsert by an internal mutex. Neither
+ * formats, erases or deletes anything on the card. The caller (web_diag.c)
+ * pauses/resumes History Manager around them. */
+typedef enum {
+    TF_TR_REQUEST = 0,    /* unmount requested */
+    TF_TR_FS_UNMOUNT,     /* esp_vfs_fat_sdcard_unmount */
+    TF_TR_BUS_FREE,       /* spi_bus_free */
+    TF_TR_REMOUNT_REQ,    /* reinit requested (refused if still mounted) */
+    TF_TR_BUS_INIT,       /* spi_bus_initialize */
+    TF_TR_MOUNT,          /* esp_vfs_fat_sdspi_mount */
+    TF_TR_HISTORY_INIT,   /* history dir + index (history available again?) */
+    TF_TR_COUNT
+} TfTraceStep;
+
+typedef struct {
+    bool active;     /* at least one unmount/reinit requested since boot */
+    uint32_t runs;   /* number of requests */
+    TfStepInfo step[TF_TR_COUNT];
+} TfReinitTrace;
+
+bool TfHistory_Unmount(void);
+bool TfHistory_Reinit(void);
+const char *TfHistory_TraceStepName(int step);
+void TfHistory_GetReinitTrace(TfReinitTrace *out);
+
+/* ---- non-destructive filesystem self-test ----
+ *
+ * Uses ONLY a scratch file (TfInitInfo.scratchPath): create, write 64 known
+ * bytes, fflush+fsync, close, reopen, read, verify, delete. Never touches
+ * index.dat, bucket files, Seen data or History Manager state. Needs the
+ * card mounted; does not need history to be available. */
+typedef enum {
+    TF_ST_LOCK = 0,
+    TF_ST_MOUNTED,
+    TF_ST_DIR,
+    TF_ST_OPEN_W,
+    TF_ST_WRITE,
+    TF_ST_FLUSH,
+    TF_ST_CLOSE_W,
+    TF_ST_OPEN_R,
+    TF_ST_READ,
+    TF_ST_VERIFY,
+    TF_ST_CLOSE_R,
+    TF_ST_DELETE,
+    TF_ST_COUNT
+} TfSelfTestStep;
+
+typedef struct {
+    bool ran;
+    bool passed;
+    int8_t failedStep; /* TfSelfTestStep, -1 = none */
+    uint32_t runs;
+    uint32_t totalUs, writeUs, readUs;
+    TfStepInfo step[TF_ST_COUNT];
+} TfSelfTestResult;
+
+bool TfHistory_RunSelfTest(void);
+const char *TfHistory_SelfTestStepName(int step);
+void TfHistory_GetSelfTest(TfSelfTestResult *out);
+
+/* ===================================================================
+ * Read-only browsing (used by /history; web_history.c)
+ * ===================================================================
+ *
+ * Strictly observational: none of these calls writes, renames or deletes
+ * anything, none touches the index or bucket files except to read them,
+ * and none updates the lifetime counters in TfHistoryStats.
+ *
+ * Resource bounds (by construction, not by convention):
+ *   - no heap allocation; at most TF_BROWSE_CHUNK_MAX records (8 x 52 B on
+ *     disk) are in RAM per call;
+ *   - the TF mutex is held for ONE bounded call (one bucket read, or one
+ *     directory pass) and never while any HTTP output is produced;
+ *   - every call re-checks availability, so an unmount/reinit between
+ *     chunks simply ends the page with TF_BR_UNAVAILABLE.
+ *
+ * Buckets are visited in ascending fingerprint order (00000000 =
+ * unassigned first, FFFFFFFE = registry-defined last) by finding "the
+ * smallest fingerprint greater than X" with one directory pass each time:
+ * O(1) RAM, stable order, no list of buckets is ever held. */
+
+#define TF_BROWSE_CHUNK_MAX 8u
+
+typedef enum {
+    TF_BR_OK = 0,
+    TF_BR_UNAVAILABLE, /* card not mounted / history not available (e.g. during diagnostic unmount) */
+    TF_BR_BUSY,        /* could not get the TF mutex within the browse wait; nothing was read */
+    TF_BR_END,         /* no further bucket / record */
+    TF_BR_IO           /* directory or file could not be read */
+} TfBrowseStatus;
+
+typedef enum {
+    TF_REC_LIVE = 0,       /* the index points at exactly this record: authoritative */
+    TF_REC_SUPERSEDED,     /* the index points at a different record (other bucket or a later one) for this aircraft */
+    TF_REC_NOT_INDEXED,    /* index is readable but has no entry for this aircraft (e.g. index rebuilt without this bucket) */
+    TF_REC_INDEX_UNKNOWN,  /* index.dat could not be read: liveness not determined */
+    TF_REC_CORRUPT         /* CRC mismatch, short read or empty slot: contents not trusted/shown */
+} TfRecState;
+
+typedef struct {
+    TfHistoryRecord rec; /* valid unless state == TF_REC_CORRUPT */
+    uint8_t state;       /* TfRecState */
+} TfBrowseRecord;
+
+/* Smallest bucket fingerprint strictly greater than `after` (or the smallest
+ * of all when afterValid is false). *headerOk is false if that bucket's
+ * 20-byte header is missing or fails its CRC (then *recordCount is 0). */
+TfBrowseStatus TfHistory_NextBucket(bool afterValid, uint32_t after, uint32_t *fpOut,
+                                    uint32_t *recordCountOut, bool *headerOkOut);
+
+/* Header record count of one specific bucket. TF_BR_END if the file does not
+ * exist or its header is unreadable. */
+TfBrowseStatus TfHistory_BucketInfo(uint32_t fp, uint32_t *recordCountOut);
+
+/* Reads up to maxN (<= TF_BROWSE_CHUNK_MAX) consecutive records of bucket fp
+ * starting at record index startIdx and classifies each against the index.
+ * *gotN = records returned; *recordCountOut = the bucket's current count.
+ * TF_BR_END with *gotN == 0 means startIdx is at/after the end. */
+TfBrowseStatus TfHistory_BrowseChunk(uint32_t fp, uint32_t startIdx, size_t maxN,
+                                     TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut);
+
+/* Is the record at (fp, recordIdx) the one the index currently considers
+ * authoritative for icao24? Pure read of index.dat; result in *stateOut
+ * (TfRecState: LIVE, SUPERSEDED, NOT_INDEXED or INDEX_UNKNOWN). */
+TfBrowseStatus TfHistory_IsLive(const char *icao24, uint32_t fp, uint32_t recordIdx, uint8_t *stateOut);
+
+/* Exact ICAO24 lookup through the existing index WITHOUT touching the
+ * lookup/miss counters or timings (unlike TfHistory_Lookup, which is the
+ * History Manager's counted path). TF_BR_END = not in the index. */
+TfBrowseStatus TfHistory_FindForBrowse(const char *icao24, TfBrowseRecord *out, uint32_t *fpOut, uint32_t *recordIdxOut);

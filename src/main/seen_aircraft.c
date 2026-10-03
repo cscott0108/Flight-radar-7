@@ -277,8 +277,12 @@ void SeenAircraft_ObservePoll(const Aircraft *list, int count, int64_t nowUtc)
         snprintf(obs.icao24, sizeof(obs.icao24), "%.8s", a->icao24);
         snprintf(obs.callsign, sizeof(obs.callsign), "%.8s", a->callsign);
 
-        /* The same resolution the radar and Current Aircraft use. */
-        CraftResolution res = ResolveAircraftWithHint(a->callsign, a->icao24, a->providerTypeHint, a->hasProviderTypeHint);
+        /* The same resolution the radar and Current Aircraft use, but always
+         * with the registry and operator stages on (ignoring the Features
+         * switches): the Seen history records what the aircraft is configured
+         * as, so turning a matching switch OFF never degrades stored records. */
+        CraftResolution res = ResolveAircraftWithHintOpts(a->callsign, a->icao24, a->providerTypeHint,
+                                                          a->hasProviderTypeHint, true, true);
         obs.craftType = res.type;
         obs.aircraftType = res.aircraftType;
 
@@ -311,7 +315,7 @@ void SeenAircraft_Describe(const SeenRecord *record, SeenConfigInfo *out)
     out->source = CRAFT_SRC_FALLBACK;
     if (!record)
         return;
-    CraftResolution res = ResolveAircraft(record->callsign, record->icao24);
+    CraftResolution res = ResolveAircraftOpts(record->callsign, record->icao24, true, true);
     out->source = res.source;
     if (res.source == CRAFT_SRC_REGISTRY) {
         out->configured = true;

@@ -1,4 +1,5 @@
 #include "web_airports.h"
+#include "web_style.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -121,14 +122,12 @@ static esp_err_t AirportsPage(httpd_req_t *req)
     FormatCoordinate(radiusKm, rangeText);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
 
-    if (Send(req,
-        "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Airport Dots</title><style>body{font:16px sans-serif;max-width:850px;margin:1em auto;padding:0 1em}"
-        "svg{width:min(100%,400px);height:auto;background:#0A1024;touch-action:none;cursor:crosshair}"
-        "label{display:block;margin:.5em 0}input{font:inherit}table{border-collapse:collapse;width:100%}"
-        "td,th{border:1px solid #bbb;padding:.4em;text-align:left}form.inline{display:inline}"
-        "button{margin:.2em;padding:.3em .6em}</style></head><body>"
-        "<p><a href='/'>Back to setup</a></p><h1>Airport dots</h1>"
+    if (WebStyle_SendHead(req, "Airport Dots", WEBPAGE_NONE,
+            "body{max-width:850px}"
+            "svg{width:min(100%,400px);height:auto;background:#0A1024;touch-action:none;cursor:crosshair}"
+            "label{display:block;margin:.5em 0}button{margin:.2em;padding:.3em .6em}") != ESP_OK ||
+        Send(req,
+        "<h1>Airport dots</h1>"
         "<p>This is a snapshot of the radar when this page opened. Click inside the outer ring, "
         "name the airport, and save. Reload for recent aircraft. Saved dots stay at their latitude "
         "and longitude when you change radar range or center.</p>") != ESP_OK ||

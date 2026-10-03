@@ -11,8 +11,10 @@
 
 #include "craft_types.h"
 #include "custom_rules.h"
+#include "feature_flags.h"
 #include "seen_aircraft.h"
 #include "time_util.h"
+#include "web_style.h"
 #include "web_util.h"
 
 static const char *TAG = "WebSeen";
@@ -148,7 +150,7 @@ static esp_err_t SendRecordRow(httpd_req_t *req, const SeenRecord *r)
     WebUtil_EscapeHtml(eTitle, sizeof(eTitle), info.registryNote[0] ? info.registryNote : info.configuredOperator);
     ConfiguredText(&info, eCfg, sizeof(eCfg));
 
-    /* Links into the existing Add/Edit dialog on /rules. */
+    /* Links into the existing Add/Edit dialog on /registered. */
     char encCs[SEEN_CALLSIGN_MAX * 3 + 1], encHx[SEEN_ICAO_MAX * 3 + 1];
     WebUtil_UrlEncode(encCs, sizeof(encCs), r->callsign);
     WebUtil_UrlEncode(encHx, sizeof(encHx), r->icao24);
@@ -166,7 +168,7 @@ static esp_err_t SendRecordRow(httpd_req_t *req, const SeenRecord *r)
     return SendFormat(req,
         "<tr><td data-s='%s'>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
         "<td title='%s'>%s</td><td>%lu</td><td>%s</td><td>%s</td>"
-        "<td><a href='/rules?edit=%s&amp;hex=%s'>%s</a></td></tr>",
+        "<td><a href='/registered?edit=%s&amp;hex=%s'>%s</a></td></tr>",
         AircraftType_CsvName(r->aircraftType), icon, AircraftType_Name(r->aircraftType),
         eIcao, r->callsign[0] ? eCs : "&mdash;", CraftType_Name(r->craftType), opCell,
         eTitle, eCfg, (unsigned long)r->seenCount, first, last,
@@ -252,15 +254,14 @@ static esp_err_t SeenPage(httpd_req_t *req)
         AppendOptions(sortOpts, sizeof(sortOpts), st, sl, SORT_CHOICES, pq.sortIndex);
     }
 
-    if (SendChunk(req,
-            "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<title>Seen Aircraft</title><style>body{font:16px sans-serif;max-width:1100px;margin:2em auto;padding:0 1em}"
-            "table{border-collapse:collapse;width:100%;font-size:.9em}td,th{padding:.35em;border:1px solid #ccc;text-align:left;white-space:nowrap}"
-            "small{color:#666;display:block}form.f label{margin-right:.8em;display:inline-block}"
-            ".ati{background:#1b1b1b;border-radius:4px;vertical-align:middle;margin-right:4px}"
-            ".w{overflow-x:auto}.meta{color:#444}a{color:#2a7a2a}</style></head><body>"
-            "<p><a href='/'>Back to setup</a> &middot; <a href='/rules'>Craft Types and Current Aircraft</a></p>"
-            "<h1>Seen Aircraft</h1>") != ESP_OK ||
+    if (WebStyle_SendHead(req, "Seen Aircraft", WEBPAGE_SEEN,
+            "body{max-width:1100px}table{font-size:.9em}td,th{padding:.35em;white-space:nowrap}"
+            "small{display:block}form.f label{margin-right:.8em;display:inline-block}"
+            ".meta{color:var(--mut)}") != ESP_OK ||
+        SendChunk(req, "<h1>Seen Aircraft</h1>") != ESP_OK ||
+        (!Features_SeenEnabled() &&
+         SendChunk(req, "<p class='wn'>Seen logging is <b>OFF</b> (Setup &rarr; Features). "
+                        "No new aircraft are being recorded; existing history is kept and shown below.</p>") != ESP_OK) ||
         SendChunk(req, iconDefs) != ESP_OK ||
         SendFormat(req, "<p class='meta'>%s</p>", clockLine) != ESP_OK ||
         SendFormat(req,
@@ -321,7 +322,7 @@ static esp_err_t SeenPage(httpd_req_t *req)
             "</p><p><small>Seen counts visits: an aircraft that returns after %d minutes or more counts again. "
             "History holds up to %d aircraft; the least recently seen are dropped first. Times are stored in UTC and "
             "shown in the time zone set on the setup page. Changes are saved to flash about every %d minutes. "
-            "Add / Edit opens the Registry / Operator dialog.</small></p>"
+            "Add / Edit opens the Registry / Operator dialog. The persistent record kept on the TF card is on the <a href='/history'>History</a> page.</small></p>"
             "<form method='post' action='/seen/clear' onsubmit=\"return confirm('Delete the entire seen-aircraft history? This cannot be undone.')\">"
             "<button>Clear history</button></form></body></html>",
             SEEN_VISIT_GAP_SEC / 60, SEEN_MAX_RECORDS, SEEN_FLUSH_INTERVAL_SEC / 60) != ESP_OK) {

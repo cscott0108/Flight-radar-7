@@ -1,6 +1,9 @@
 #include "webserver.h"
+#include "web_style.h"
+#include "feature_flags.h"
 
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,6 +25,7 @@
 #include "web_rules.h"
 #include "web_airports.h"
 #include "web_diag.h"
+#include "web_history.h"
 #include "web_seen.h"
 #include "seen_aircraft.h"
 #include "time_util.h"
@@ -51,14 +55,14 @@ static void SendRedirectPage(
     const char *message,
     int delaySeconds)
 {
-    char html[640];
+    char html[896];
 
     snprintf(
         html,
         sizeof(html),
-        "<!DOCTYPE html><html><head>"
+        "<!DOCTYPE html><html%s><head>"
         "<meta http-equiv='refresh' content='%d;url=/'>"
-        "<style>body{font-family:sans-serif;text-align:center;margin-top:3em;}</style>"
+        "<style>body{font-family:sans-serif;text-align:center;margin-top:3em;}" WEBSTYLE_MINI_CSS "</style>"
         "</head><body>"
         "<p>%s</p>"
         "<p id='countdown'>Returning to the home page in %d seconds&hellip;</p>"
@@ -72,6 +76,7 @@ static void SendRedirectPage(
         "},1000);"
         "</script>"
         "</body></html>",
+        WebStyle_HtmlAttr(),
         delaySeconds,
         message,
         delaySeconds,
@@ -214,8 +219,15 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
 
     end = NULL;
     float range = strtof(rangeText, &end);
-    if (end == rangeText || range < 1.0f || range > 5000.0f)
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Range must be between 1 and 5000 km");
+    // Supported choices are the dropdown values. A range already stored on the
+    // device from older firmware (any value) may be re-posted unchanged, so an
+    // existing configuration is never rejected or silently altered.
+    bool rangeOk = (end != rangeText) &&
+                   (fabsf(range - 25.0f) < 0.01f || fabsf(range - 50.0f) < 0.01f ||
+                    fabsf(range - 75.0f) < 0.01f || fabsf(range - 100.0f) < 0.01f ||
+                    fabsf(range - GetRadarRange()) < 0.01f);
+    if (!rangeOk)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Range must be 25, 50, 75 or 100 km");
 
     // Refresh interval is optional so older bookmarked forms still post.
     char refreshText[24];
@@ -936,28 +948,8 @@ static esp_err_t RootHandler(
     httpd_req_t *req)
 {
     const char htmlFormatA[] =
-        "<!DOCTYPE html>"
-        "<html>"
-        "<head>"
-        "<style>"
-        "body{font-family:sans-serif;max-width:640px;margin:0 auto;padding:1em;line-height:1.5;color:#222;}"
-        "h2{border-bottom:2px solid #4CAF50;padding-bottom:4px;margin-top:1.2em;}"
-        "h3{margin-top:0;}"
-        "fieldset{border:1px solid #bbb;border-radius:6px;margin:1em 0;padding:0.6em 1em 1em;}"
-        "legend{font-weight:bold;padding:0 6px;}"
-        "details{border:1px solid #ddd;border-radius:6px;margin:0.8em 0;padding:0.2em 1em;}"
-        "details summary{cursor:pointer;font-weight:bold;padding:6px 0;}"
-        "label{display:block;margin:0.6em 0;}"
-        "input[type=number],input[type=text],input[type=password]{width:130px;}"
-        "small{color:#666;display:block;margin:2px 0 10px 0;}"
-        "button{margin:0.8em 0;padding:6px 16px;}"
-        "a{color:#2a7a2a;}"
-        "</style>"
-        "</head>"
-        "<body>"
         "<h2>Flight Radar Setup</h2>"
-        "<p><a href='/rules'>Craft Types: Registry, Operators and Current Aircraft</a> &middot; "
-        "<a href='/seen'>Seen Aircraft</a> &middot; "
+        "<p><a href='#features'>Features &amp; appearance</a> &middot; "
         "<a href='/airports'>Add or Edit Airports</a> &middot; "
         "<a href='/diag'>Runtime Capacity Report</a></p>"
         "<h3>Wi-Fi</h3>"
@@ -971,7 +963,7 @@ static esp_err_t RootHandler(
         "<fieldset><legend>Location &amp; range</legend>"
         "<label>Latitude <input name='latitude' type='number' step='any' min='-90' max='90' value='%s'></label>"
         "<label>Longitude <input name='longitude' type='number' step='any' min='-180' max='180' value='%s'></label>"
-        "<label>Range <input name='range' type='number' step='any' min='1' max='5000' value='%s'> km</label>"
+        "<label>Range <select name='range'>%s</select> km</label>"
         "<label>Aircraft data refresh interval <input name='refresh' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
         "<small>10-600 s. Values below 25 s risk exceeding OpenSky's 4000 requests/day API limit; the active provider's own safe minimum is enforced automatically either way.</small>"
         "</fieldset>"
@@ -1088,9 +1080,7 @@ static esp_err_t RootHandler(
         "<form method='POST' action='/delete-credentials' "
         "onsubmit=\"return confirm('Delete stored OpenSky credentials?')\">"
         "<button type='submit'>Delete OpenSky credentials</button>"
-        "</form>"
-        "</body>"
-        "</html>";
+        "</form>";
 
     // CPU-only page buffer (snprintf, then httpd_resp_send_chunk copies it
     // into lwIP): PSRAM, so page generation does not take 8 KB of internal
@@ -1111,7 +1101,31 @@ static esp_err_t RootHandler(
 
     FormatFixed(GetRadarLat(), 4, latStr, sizeof(latStr));
     FormatFixed(GetRadarLon(), 4, lonStr, sizeof(lonStr));
-    FormatFixed(GetRadarRange(), 0, rangeStr, sizeof(rangeStr));
+    FormatFixed(GetRadarRange(), 2, rangeStr, sizeof(rangeStr));
+
+    // Range dropdown: exactly 25/50/75/100 km, the current radarRangeKm preselected.
+    // If the stored value is none of these (older firmware allowed any number) it
+    // is shown as an extra selected entry so saving the form does not change it.
+    char rangeOpts[384];
+    {
+        static const int choices[] = {25, 50, 75, 100};
+        const float cur = GetRadarRange();
+        bool matched = false;
+        size_t n = 0;
+        rangeOpts[0] = '\0';
+        for (size_t i = 0; i < sizeof(choices) / sizeof(choices[0]); i++)
+        {
+            bool sel = fabsf(cur - (float)choices[i]) < 0.01f;
+            matched = matched || sel;
+            n += (size_t)snprintf(rangeOpts + n, sizeof(rangeOpts) - n,
+                                  "<option value='%d'%s>%d</option>",
+                                  choices[i], sel ? " selected" : "", choices[i]);
+        }
+        if (!matched)
+            snprintf(rangeOpts + n, sizeof(rangeOpts) - n,
+                     "<option value='%s' selected>%s (current, not a standard choice)</option>",
+                     rangeStr, rangeStr);
+    }
 
     // Part A: up to and including the provider fieldset.
     int lengthA = snprintf(
@@ -1120,18 +1134,24 @@ static esp_err_t RootHandler(
         htmlFormatA,
         latStr,
         lonStr,
-        rangeStr,
+        rangeOpts,
         (unsigned long)GetRadarRefreshSeconds(),
         (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_OPENSKY) ? " selected" : "",
         (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_ADSBLOL) ? " selected" : "");
 
-    httpd_resp_set_type(
-        req,
-        "text/html");
-
     esp_err_t err = ESP_FAIL;
 
+    // Shared head (CSS variables, dark mode class, nav bar) is streamed from
+    // constants; the page-specific rules below are the setup form's old layout.
+    static const char setupCss[] =
+        "body{max-width:640px;margin:0 auto;padding:1em}h3{margin-top:0}"
+        "label{display:block;margin:0.6em 0}"
+        "input[type=number],input[type=text],input[type=password]{width:130px}"
+        "small{display:block;margin:2px 0 10px 0}"
+        "button{margin:0.8em 0;padding:6px 16px}";
+
     if (lengthA > 0 && lengthA < 8192 &&
+        WebStyle_SendHead(req, "Flight Radar Setup", WEBPAGE_SETUP, setupCss) == ESP_OK &&
         httpd_resp_send_chunk(req, html, lengthA) == ESP_OK &&
         SendTimeZoneFieldset(req) == ESP_OK)
     {
@@ -1163,7 +1183,9 @@ static esp_err_t RootHandler(
             (unsigned long)GetRadarBrightness());
 
         if (lengthB > 0 && lengthB < 8192 &&
-            httpd_resp_send_chunk(req, html, lengthB) == ESP_OK)
+            httpd_resp_send_chunk(req, html, lengthB) == ESP_OK &&
+            WebStyle_SendFeatureControls(req) == ESP_OK &&
+            httpd_resp_send_chunk(req, "</body></html>", HTTPD_RESP_USE_STRLEN) == ESP_OK)
         {
             err = httpd_resp_send_chunk(req, NULL, 0);
         }
@@ -1201,7 +1223,9 @@ esp_err_t StartWebServer(void)
     // log). Set with headroom for future additions rather than the exact
     // current count; each unused slot only costs one small httpd_uri_t-sized
     // entry of heap.
-    config.max_uri_handlers = 28;
+    // Now 30: the above plus /current, /registered, /operators (web_rules.c)
+    // and POST /features (web_style.c). 36 leaves headroom.
+    config.max_uri_handlers = 36;
 
     if (httpd_start(
             &server_handle,
@@ -1289,6 +1313,13 @@ esp_err_t StartWebServer(void)
         server_handle = NULL;
         return ESP_FAIL;
     }
+    if (WebStyle_Register(server_handle) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register features route");
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
     if (WebAirports_Register(server_handle) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register airport routes");
@@ -1299,6 +1330,13 @@ esp_err_t StartWebServer(void)
     if (WebSeen_Register(server_handle) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register seen-aircraft routes");
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
+    if (WebHistory_Register(server_handle) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register history route");
         httpd_stop(server_handle);
         server_handle = NULL;
         return ESP_FAIL;

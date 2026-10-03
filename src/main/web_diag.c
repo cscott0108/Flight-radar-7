@@ -1,4 +1,7 @@
 #include "web_diag.h"
+#include "web_style.h"
+#include "feature_flags.h"
+#include "fw_version.h"
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -214,13 +217,14 @@ static esp_err_t AdvancedPost(httpd_req_t *req)
     char refresh[80] = "";
     if (reboot)
         snprintf(refresh, sizeof(refresh), "<meta http-equiv='refresh' content='20;url=/diag#%s'>", anchor);
-    char page[640];
+    char page[896];
     snprintf(page, sizeof(page),
-             "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>%s"
-             "<title>Diagnostics</title></head><body style='font:16px sans-serif;max-width:750px;margin:1em auto;padding:0 1em'>"
+             "<!doctype html><html%s><head><meta name='viewport' content='width=device-width,initial-scale=1'>%s"
+             "<title>Diagnostics</title><style>" WEBSTYLE_MINI_CSS "</style></head>"
+             "<body style='font:16px sans-serif;max-width:750px;margin:1em auto;padding:0 1em'>"
              "<p>%s saved as <b>%s</b>. %s</p><p><a href='/diag#%s'>Back to diagnostics</a></p>"
              "</body></html>",
-             refresh, modeName, enable ? "ON" : "OFF",
+             WebStyle_HtmlAttr(), refresh, modeName, enable ? "ON" : "OFF",
              reboot ? "Rebooting now; this page returns to /diag in about 20 seconds."
                     : "Reboot required: the current run keeps its existing setting until the next restart.",
              anchor);
@@ -238,15 +242,295 @@ static esp_err_t AdvancedPost(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ---- TF diagnostics (see tf_history.h "TF diagnostics") ----
+static const char *ResText(uint8_t r)
+{
+    switch (r)
+    {
+    case TF_RES_OK: return "OK";
+    case TF_RES_FAIL: return "<b>FAILED</b>";
+    case TF_RES_SKIPPED: return "skipped";
+    default: return "not run";
+    }
+}
+
+static const char *FsTypeText(uint8_t t)
+{
+    switch (t)
+    {
+    case 1: return "FAT12";
+    case 2: return "FAT16";
+    case 3: return "FAT32";
+    case 4: return "exFAT";
+    default: return "unknown (not read)";
+    }
+}
+
+static const char *IndexStateText(uint8_t st)
+{
+    switch (st)
+    {
+    case TF_INDEX_LOADED: return "loaded (existing index.dat, slots counted)";
+    case TF_INDEX_REBUILT: return "created empty, then rebuilt from bucket files";
+    case TF_INDEX_FAILED: return "FAILED (index.dat could not be created)";
+    default: return "not initialized";
+    }
+}
+
+// One row for a step/stage: value = result, evidence = the raw codes.
+static esp_err_t StepRow(httpd_req_t *req, const char *label, const TfStepInfo *s)
+{
+    char ev[160];
+    if (s->result == TF_RES_NOT_RUN || s->result == TF_RES_SKIPPED)
+        snprintf(ev, sizeof(ev), "-");
+    else
+        snprintf(ev, sizeof(ev), "esp_err=%s (%d) errno=%d fatfs=%u time=%u us",
+                 esp_err_to_name((esp_err_t)s->espErr), (int)s->espErr, (int)s->errnoVal,
+                 (unsigned)s->fatfsErr, (unsigned)s->us);
+    return Row(req, label, ResText(s->result), ev);
+}
+
+static esp_err_t TfSection(httpd_req_t *req)
+{
+    TfHistoryStats tf;
+    TfHistory_GetStats(&tf);
+    TfInitInfo in;
+    TfHistory_GetInitInfo(&in);
+    HistoryManagerStats hm;
+    HistoryManager_GetStats(&hm);
+    char buf[160];
+    char esc[192];
+
+    if (Send(req, "<h2 id='tf'>TF history (persistent, warm layer under Hot Seen)</h2>"
+                  "<table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
+        return ESP_FAIL;
+    if (Row(req, "TF card mounted (filesystem)", tf.mounted ? "yes" : "no",
+            "Measured (esp_vfs_fat_sdspi_mount result; cleared by a diagnostic unmount). Says nothing about the history layer - see the next rows") != ESP_OK) return ESP_FAIL;
+    if (Row(req, "Filesystem", tf.mounted ? FsTypeText(in.fsType) : "-", "Measured (FATFS fs_type via f_getfree)") != ESP_OK) return ESP_FAIL;
+    if (tf.mounted)
+    {
+        // Own (larger) buffer: three %llu fields size against uint64's full range for -Werror=format-truncation.
+        char tfSpaceBuf[128];
+        snprintf(tfSpaceBuf, sizeof(tfSpaceBuf), "%llu / %llu bytes (%llu free)",
+                 (unsigned long long)tf.usedBytes, (unsigned long long)tf.capacityBytes, (unsigned long long)tf.freeBytes);
+        if (Row(req, "TF used / capacity", tfSpaceBuf, "Measured (f_getfree)") != ESP_OK) return ESP_FAIL;
+    }
+    snprintf(buf, sizeof(buf), "%s (%s)", in.historyDir ? in.historyDir : "?",
+             in.dirExisted ? "existed at init" : ResText(in.stage[TF_STAGE_HIST_DIR].result));
+    if (Row(req, "History path", buf, "Existing constant TF_HISTORY_DIR; init stat()s it, else mkdir()s it (stage history_dir below)") != ESP_OK) return ESP_FAIL;
+
+    if (!in.attempted)
+        snprintf(buf, sizeof(buf), "not attempted");
+    else if (!in.ok)
+        snprintf(buf, sizeof(buf), "FAILED at stage %s", in.firstFailedStage >= 0 ? TfHistory_StageName(in.firstFailedStage) : "?");
+    else if (in.firstFailedStage >= 0)
+        snprintf(buf, sizeof(buf), "OK, but stage %s recorded a failure", TfHistory_StageName(in.firstFailedStage));
+    else
+        snprintf(buf, sizeof(buf), "OK");
+    if (Row(req, "History init", buf, "Measured (TfHistory_Init / diagnostic reinit; per-stage detail below)") != ESP_OK) return ESP_FAIL;
+    if (Row(req, "History available (writes accepted)", tf.historyAvailable ? "yes" : "no", "Measured (TfHistory_IsAvailable)") != ESP_OK) return ESP_FAIL;
+    if (Row(req, "History Manager TF-ready", HistoryManager_IsTfReady() ? "yes" : "no (no TF writes/lookups are made)", "Measured (set from the init result; paused during unmount)") != ESP_OK) return ESP_FAIL;
+
+    if (in.indexSizeBytes >= 0)
+        snprintf(buf, sizeof(buf), "%s; file %d B (expected %u B)", IndexStateText(in.indexState), (int)in.indexSizeBytes, (unsigned)in.indexSizeExpected);
+    else
+        snprintf(buf, sizeof(buf), "%s; file not found at init (expected %u B)", IndexStateText(in.indexState), (unsigned)in.indexSizeExpected);
+    if (Row(req, "Index state", buf, "Measured (index.dat size check at init)") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.indexSlotsUsed, (unsigned)tf.indexSlotsTotal);
+    if (Row(req, "Index slots used / total", buf,
+            in.indexState == TF_INDEX_NOT_INIT ? "0 here means the index was NOT initialized (not that it is empty)"
+                                               : "Counted from index.dat at init (valid index) or from the rebuild; 0 = genuinely empty") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u", (unsigned)tf.writes);
+    if (Row(req, "Writes since boot (creates + updates)", buf, "Measured") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.creates, (unsigned)tf.updates);
+    if (Row(req, "  creates / updates", buf, "Measured") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.lookups, (unsigned)tf.lookupMisses);
+    if (Row(req, "Lookups / misses", buf, "Measured") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u", (unsigned)tf.errors);
+    if (Row(req, "I/O or CRC errors handled", buf, "Measured (a corrupt record is treated as absent and self-heals on next write). Not counted while history is unavailable") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u", (unsigned)tf.recoveryOps);
+    if (Row(req, "Corrupt records skipped during scans", buf, "Measured") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u", (unsigned)tf.indexRebuilds);
+    if (Row(req, "Index rebuilds since boot", buf, "Measured (missing/corrupt index detected at mount)") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u us / %u us / %u us", (unsigned)tf.lastLookupUs, (unsigned)tf.bestLookupUs, (unsigned)tf.worstLookupUs);
+    if (Row(req, "Lookup time: last / best / worst", buf, "Measured (esp_timer_get_time around the index probe + record read)") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u us / %u us / %u us", (unsigned)tf.lastWriteUs, (unsigned)tf.bestWriteUs, (unsigned)tf.worstWriteUs);
+    if (Row(req, "Write time: last / best / worst", buf, "Measured (esp_timer_get_time around the record + header write)") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u us / %u us / %u us", (unsigned)tf.lastRecoveryUs, (unsigned)tf.bestRecoveryUs, (unsigned)tf.worstRecoveryUs);
+    if (Row(req, "Index rebuild time: last / best / worst", buf, "Measured") != ESP_OK) return ESP_FAIL;
+
+    WebUtil_EscapeHtml(esc, sizeof(esc), in.lastError[0] ? in.lastError : "none");
+    if (Row(req, "Last init error", esc, "First failing stage of the most recent init, with esp_err / errno / FATFS code") != ESP_OK) return ESP_FAIL;
+    WebUtil_EscapeHtml(esc, sizeof(esc), in.lastRuntimeError[0] ? in.lastRuntimeError : "none");
+    if (Row(req, "Last runtime error (Upsert/Lookup)", esc, "Best-effort errno at the failing call") != ESP_OK) return ESP_FAIL;
+
+    snprintf(buf, sizeof(buf), "%u / %u (%u dirty)", (unsigned)hm.shadowSlotsUsed, (unsigned)hm.shadowSlotsCap, (unsigned)hm.dirtyNow);
+    if (Row(req, "History Manager RAM shadow slots / cap", buf, "Measured / Calculated (one slot per currently-tracked aircraft, not the archive)") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)(hm.shadowSlotsCap * (unsigned)(sizeof(TfHistoryRecord) + 16)));
+    if (Row(req, "History Manager allocation (PSRAM heap, approx.)", buf, "Calculated") != ESP_OK) return ESP_FAIL;
+    if (Send(req, "</table>") != ESP_OK)
+        return ESP_FAIL;
+
+    // ---- init stages ----
+    snprintf(buf, sizeof(buf), "<h3>TF init stages (init run #%u)</h3>"
+                               "<table><tr><th>Stage</th><th>Result</th><th>Codes</th></tr>", (unsigned)in.runs);
+    if (Send(req, buf) != ESP_OK)
+        return ESP_FAIL;
+    for (int i = 0; i < TF_STAGE_COUNT; i++)
+        if (StepRow(req, TfHistory_StageName(i), &in.stage[i]) != ESP_OK)
+            return ESP_FAIL;
+    if (Send(req, "</table><p class='ev'>index_check: errno=2 with result OK means index.dat was missing (normal on a fresh card). "
+                  "spi_bus_init OK with esp_err=ESP_ERR_INVALID_STATE means the bus was already initialized (tolerated). "
+                  "index_create/index_rebuild only run when the index is missing or the wrong size; index_count only when it was valid.</p>") != ESP_OK)
+        return ESP_FAIL;
+
+    // ---- self-test result ----
+    TfSelfTestResult st;
+    TfHistory_GetSelfTest(&st);
+    if (st.ran)
+    {
+        if (st.passed)
+            snprintf(buf, sizeof(buf), "<b>PASSED</b>");
+        else if (st.failedStep >= TF_ST_OPEN_W && st.failedStep <= TF_ST_FLUSH)
+            snprintf(buf, sizeof(buf), "<b>FAILED</b> at step: %s - the card mounts but cannot be written; it may be "
+                                       "read-only or defective", TfHistory_SelfTestStepName(st.failedStep));
+        else
+            snprintf(buf, sizeof(buf), "<b>FAILED</b> at step: %s", TfHistory_SelfTestStepName(st.failedStep));
+        if (Send(req, "<h3>TF filesystem self-test (last run)</h3><table><tr><th>Step</th><th>Result</th><th>Codes</th></tr>") != ESP_OK ||
+            Row(req, "Overall", buf, "Scratch file only; index.dat, buckets and Seen data are never touched") != ESP_OK)
+            return ESP_FAIL;
+        char tm[96];
+        snprintf(tm, sizeof(tm), "total %u us, write %u us, read %u us (run #%u)",
+                 (unsigned)st.totalUs, (unsigned)st.writeUs, (unsigned)st.readUs, (unsigned)st.runs);
+        if (Row(req, "Timing", tm, in.scratchPath ? in.scratchPath : "") != ESP_OK)
+            return ESP_FAIL;
+        for (int i = 0; i < TF_ST_COUNT; i++)
+            if (StepRow(req, TfHistory_SelfTestStepName(i), &st.step[i]) != ESP_OK)
+                return ESP_FAIL;
+        if (Send(req, "</table>") != ESP_OK)
+            return ESP_FAIL;
+    }
+
+    // ---- unmount / reinit trace ----
+    TfReinitTrace tr;
+    TfHistory_GetReinitTrace(&tr);
+    if (tr.active)
+    {
+        snprintf(buf, sizeof(buf), "<h3>TF unmount / reinitialize sequence (request #%u)</h3>"
+                                   "<table><tr><th>Transition</th><th>Result</th><th>Codes</th></tr>", (unsigned)tr.runs);
+        if (Send(req, buf) != ESP_OK)
+            return ESP_FAIL;
+        for (int i = 0; i < TF_TR_COUNT; i++)
+            if (StepRow(req, TfHistory_TraceStepName(i), &tr.step[i]) != ESP_OK)
+                return ESP_FAIL;
+        if (Send(req, "</table>") != ESP_OK)
+            return ESP_FAIL;
+    }
+
+    // ---- actions ----
+    return Send(req,
+        "<p class='ev'>Browse the stored aircraft records on the <a href='/history'>History</a> page.</p>"
+        "<h3>TF diagnostic actions</h3>"
+        "<form method='POST' action='/diag/tf' style='display:inline'>"
+        "<input type='hidden' name='act' value='selftest'><button type='submit'>Run TF self-test</button></form> "
+        "<form method='POST' action='/diag/tf' style='display:inline' "
+        "onsubmit=\"return confirm('Unmount the TF card?\\nHistory writes pause until you press Reinitialize TF. No data is erased.')\">"
+        "<input type='hidden' name='act' value='unmount'><button type='submit'>Unmount TF</button></form> "
+        "<form method='POST' action='/diag/tf' style='display:inline'>"
+        "<input type='hidden' name='act' value='reinit'><button type='submit'>Reinitialize TF</button></form>"
+        "<p class='ev'>Self-test: writes, flushes, re-reads and deletes one 64-byte scratch file in the history folder. "
+        "Unmount closes the filesystem and frees the SPI bus (nothing is formatted or deleted); Reinitialize then runs the normal "
+        "mount + history/index initialization again and shows which transition succeeded. Reinitialize is refused while the card is "
+        "still mounted - Unmount first.</p>");
+}
+
+static esp_err_t RebootSection(httpd_req_t *req)
+{
+    return Send(req,
+        "<h2 id='reboot'>Device</h2>"
+        "<form method='POST' action='/diag/tf' "
+        "onsubmit=\"return confirm('Reboot the Flight Radar?\\nAll persistent data will be preserved.')\">"
+        "<input type='hidden' name='act' value='reboot'><button type='submit'>Reboot Device</button></form>"
+        "<p class='ev'>Normal software restart (esp_restart). Settings (NVS), SPIFFS files, Seen data and the TF card contents are kept; "
+        "pending Seen changes are saved first and the TF card is unmounted cleanly. The page returns in about 20 seconds.</p>");
+}
+
+// POST /diag/tf  act=selftest | unmount | reinit | reboot  (one handler slot for all four)
+static esp_err_t TfActionPost(httpd_req_t *req)
+{
+    char body[48] = {0};
+    int total = 0;
+    if (req->content_len >= sizeof(body))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Form too large");
+    while (total < (int)req->content_len)
+    {
+        int got = httpd_req_recv(req, body + total, sizeof(body) - 1 - total);
+        if (got <= 0)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Could not read form");
+        total += got;
+    }
+    body[total] = '\0';
+
+    char act[16];
+    if (httpd_query_key_value(body, "act", act, sizeof(act)) != ESP_OK)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing action");
+
+    if (strcmp(act, "reboot") == 0)
+    {
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        char page[1024];
+        snprintf(page, sizeof(page),
+                 "<!doctype html><html%s><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<meta http-equiv='refresh' content='20;url=/diag#reboot'><title>Rebooting</title><style>" WEBSTYLE_MINI_CSS "</style></head>"
+                 "<body style='font:16px sans-serif;max-width:750px;margin:1em auto;padding:0 1em'>"
+                 "<p>Rebooting now; this page returns to /diag in about 20 seconds.</p>"
+                 "<p><a href='/diag#reboot'>Back to diagnostics</a></p></body></html>",
+                 WebStyle_HtmlAttr());
+        httpd_resp_sendstr(req, page);
+        // Same order as the other deliberate restarts: let the response go
+        // out, flush pending Seen history, then restart. The TF card is
+        // unmounted first (bounded wait, best effort) so FAT is left clean.
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (SeenAircraft_IsDirty())
+            SeenAircraft_Flush();
+        HistoryManager_TfPause();
+        (void)TfHistory_Unmount();
+        esp_restart();
+        return ESP_OK; // not reached
+    }
+
+    if (strcmp(act, "selftest") == 0)
+    {
+        (void)TfHistory_RunSelfTest(); // result is stored and rendered by TfSection
+    }
+    else if (strcmp(act, "unmount") == 0)
+    {
+        HistoryManager_TfPause();
+        (void)TfHistory_Unmount();
+        HistoryManager_TfResume(); // stays paused unless the unmount did not actually take effect
+    }
+    else if (strcmp(act, "reinit") == 0)
+    {
+        HistoryManager_TfPause();
+        (void)TfHistory_Reinit();
+        HistoryManager_TfResume(); // resumes only if history became available again
+    }
+    else
+    {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown action");
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/diag#tf");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static esp_err_t DiagPage(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-
-    if (Send(req,
-        "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Diagnostics</title><style>body{font:16px sans-serif;max-width:750px;margin:1em auto;padding:0 1em}"
-        "table{border-collapse:collapse;width:100%}td,th{border:1px solid #bbb;padding:.35em .5em;text-align:left}"
-        "th{background:#eee}.ev{color:#666;font-size:.85em}h2{margin-top:1.6em}</style></head><body>"
+    /* Directly URL-accessible (/diag); intentionally not one of the nav pages. */
+    if (WebStyle_SendHead(req, "Diagnostics", WEBPAGE_NONE,
+            "body{max-width:750px}.ev{color:var(--mut);font-size:.85em}h2{margin-top:1.6em}") != ESP_OK ||
+        Send(req,
         "<p><a href='/'>Back to setup</a></p><h1>Runtime capacity report</h1>"
         "<p>Every value below is read live from this device right now - reload the page for a fresh "
         "snapshot. \"Since boot\" values reset on reboot, not on reload. This page adds negligible "
@@ -269,7 +553,10 @@ static esp_err_t DiagPage(httpd_req_t *req)
              (long long)(uptimeUs / 1000000),
              (long long)(uptimeUs / 3600000000LL),
              (long long)((uptimeUs / 60000000LL) % 60));
+    char fwEsc[80];
+    WebUtil_EscapeHtml(fwEsc, sizeof(fwEsc), FW_VERSION_STRING);
     if (Send(req, "<h2>Identity</h2><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK ||
+        Row(req, "Firmware Build", fwEsc, "Compiled in from src/VERSION at build time (always shown, not an Advanced Diagnostic)") != ESP_OK ||
         Row(req, "Uptime", uptimeText, "Measured (esp_timer_get_time)") != ESP_OK ||
         SendFormat(req, "<tr><td>Radar center</td><td>%.4f, %.4f</td><td class='ev'>Measured (current setting)</td></tr>",
                    GetRadarLat(), GetRadarLon()) != ESP_OK)
@@ -303,6 +590,17 @@ static esp_err_t DiagPage(httpd_req_t *req)
         if (Row(req, "Current DST state", buf, "Measured (TimeUtil_ToLocal against the current clock)") != ESP_OK) return ESP_FAIL;
     } else {
         if (Row(req, "Current DST state", "unknown (clock not synchronized yet)", "TimeUtil_IsSynced() is false") != ESP_OK) return ESP_FAIL;
+    }
+    if (Send(req, "</table>") != ESP_OK)
+        return ESP_FAIL;
+
+    // ---- Feature switches (read from the in-RAM flags; no extra work) ----
+    if (Send(req, "<h2>Features</h2><table><tr><th>Feature</th><th>State</th><th>Evidence</th></tr>") != ESP_OK)
+        return ESP_FAIL;
+    for (int f = 0; f < FEATURE_COUNT; f++) {
+        if (Row(req, Features_Name((FeatureId)f), Features_Get((FeatureId)f) ? "ON" : "OFF",
+                "Persistent setting (NVS \"radar\"), applied immediately; Setup page > Features") != ESP_OK)
+            return ESP_FAIL;
     }
     if (Send(req, "</table>") != ESP_OK)
         return ESP_FAIL;
@@ -468,50 +766,13 @@ static esp_err_t DiagPage(httpd_req_t *req)
         return ESP_FAIL;
 
     // ---- TF (persistent) history ----
-    TfHistoryStats tf;
-    TfHistory_GetStats(&tf);
-    HistoryManagerStats hm;
-    HistoryManager_GetStats(&hm);
-    if (Send(req, "<h2>TF history (persistent, warm layer under Hot Seen)</h2><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
-        return ESP_FAIL;
-    if (Row(req, "TF card mounted", tf.mounted ? "yes" : "no (radar/Hot Seen unaffected either way)", "Measured (TfHistory_Init result)") != ESP_OK) return ESP_FAIL;
-    if (tf.mounted) {
-        // Own (larger) buffer, same reasoning as uptimeText above: three
-        // %llu fields size against uint64's full 20-digit range for
-        // -Werror=format-truncation, not against a realistic TF card size.
-        char tfSpaceBuf[128];
-        snprintf(tfSpaceBuf, sizeof(tfSpaceBuf), "%llu / %llu bytes (%llu free)",
-                 (unsigned long long)tf.usedBytes, (unsigned long long)tf.capacityBytes, (unsigned long long)tf.freeBytes);
-        if (Row(req, "TF used / capacity", tfSpaceBuf, "Measured (f_getfree)") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.indexSlotsUsed, (unsigned)tf.indexSlotsTotal);
-        if (Row(req, "Index slots used / total", buf, "Measured / Calculated (fixed-size open-addressing hash index)") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u", (unsigned)tf.writes);
-        if (Row(req, "Writes since boot (creates + updates)", buf, "Measured") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.creates, (unsigned)tf.updates);
-        if (Row(req, "  creates / updates", buf, "Measured") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.lookups, (unsigned)tf.lookupMisses);
-        if (Row(req, "Lookups / misses", buf, "Measured") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u", (unsigned)tf.errors);
-        if (Row(req, "I/O or CRC errors handled", buf, "Measured (a corrupt record is treated as absent and self-heals on next write)") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u", (unsigned)tf.recoveryOps);
-        if (Row(req, "Corrupt records skipped during scans", buf, "Measured") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u", (unsigned)tf.indexRebuilds);
-        if (Row(req, "Index rebuilds since boot", buf, "Measured (missing/corrupt index detected at mount)") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u us / %u us / %u us", (unsigned)tf.lastLookupUs, (unsigned)tf.bestLookupUs, (unsigned)tf.worstLookupUs);
-        if (Row(req, "Lookup time: last / best / worst", buf, "Measured (esp_timer_get_time around the index probe + record read)") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u us / %u us / %u us", (unsigned)tf.lastWriteUs, (unsigned)tf.bestWriteUs, (unsigned)tf.worstWriteUs);
-        if (Row(req, "Write time: last / best / worst", buf, "Measured (esp_timer_get_time around the record + header write)") != ESP_OK) return ESP_FAIL;
-        snprintf(buf, sizeof(buf), "%u us / %u us / %u us", (unsigned)tf.lastRecoveryUs, (unsigned)tf.bestRecoveryUs, (unsigned)tf.worstRecoveryUs);
-        if (Row(req, "Index rebuild time: last / best / worst", buf, "Measured") != ESP_OK) return ESP_FAIL;
-    }
-    snprintf(buf, sizeof(buf), "%u / %u (%u dirty)", (unsigned)hm.shadowSlotsUsed, (unsigned)hm.shadowSlotsCap, (unsigned)hm.dirtyNow);
-    if (Row(req, "History Manager RAM shadow slots / cap", buf, "Measured / Calculated (one slot per currently-tracked aircraft, not the archive - see PROJECT_STATE.md)") != ESP_OK) return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)(hm.shadowSlotsCap * (unsigned)(sizeof(TfHistoryRecord) + 16)));
-    if (Row(req, "History Manager allocation (PSRAM heap, approx.)", buf, "Calculated") != ESP_OK) return ESP_FAIL;
-    if (Send(req, "</table>") != ESP_OK)
+    if (TfSection(req) != ESP_OK)
         return ESP_FAIL;
 
     if (AdvancedSection(req) != ESP_OK)
+        return ESP_FAIL;
+
+    if (RebootSection(req) != ESP_OK)
         return ESP_FAIL;
 
     if (Send(req,
@@ -541,5 +802,13 @@ esp_err_t WebDiag_Register(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = AdvancedPost,
         .user_ctx = NULL};
-    return httpd_register_uri_handler(server, &adv_uri);
+    err = httpd_register_uri_handler(server, &adv_uri);
+    if (err != ESP_OK)
+        return err;
+    httpd_uri_t tf_uri = {
+        .uri = "/diag/tf",
+        .method = HTTP_POST,
+        .handler = TfActionPost,
+        .user_ctx = NULL};
+    return httpd_register_uri_handler(server, &tf_uri);
 }

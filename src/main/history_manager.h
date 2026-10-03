@@ -48,6 +48,13 @@ void HistoryManager_Observe(
  * 7/8). Returns true if anything was written to TF this call. */
 bool HistoryManager_FlushIfDue(uint32_t nowMonotonicSec);
 
+/* Diagnostic hooks (web_diag.c TF unmount/reinit). Pause stops all TF access
+ * from History Manager without touching its shadow slots; Resume re-enables
+ * it only if TfHistory_IsAvailable(). No other History Manager behavior changes. */
+void HistoryManager_TfPause(void);
+void HistoryManager_TfResume(void);
+bool HistoryManager_IsTfReady(void);
+
 typedef struct {
     uint32_t shadowSlotsUsed;
     uint32_t shadowSlotsCap;

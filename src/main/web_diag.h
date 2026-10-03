@@ -2,7 +2,10 @@
 
 #include "esp_http_server.h"
 
-/* PHASE 1/13 lightweight runtime capacity page: GET /diag. Read-only, no
+/* PHASE 1/13 lightweight runtime capacity page: GET /diag. The page itself is
+ * read-only; the only state-changing endpoint is POST /diag/tf (TF self-test,
+ * TF unmount/reinit, Reboot Device - see web_diag.c) plus the existing
+ * POST /diag/advanced. No
  * persistence, no polling of its own - every value is read live from
  * existing ESP-IDF accessors or existing project counters (main.c,
  * airports.c, seen_aircraft.c, custom_rules.c) at request time, the same

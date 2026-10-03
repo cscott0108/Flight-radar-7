@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_spiffs.h"
+#include "feature_flags.h"
 #include "esp_log.h"
 
 static const char *TAG = "CustomRules";
@@ -1004,7 +1005,11 @@ const char *AircraftTypeSource_Name(AircraftTypeSource source)
     }
 }
 
-CraftResolution ResolveAircraft(const char *callsign, const char *hex)
+/* The single resolver. useRegistry / useOperators let a caller skip those two
+ * stages; ResolveAircraft() passes the persistent Features switches, so with a
+ * switch OFF no matching work is done and the aircraft falls through to the
+ * next stage (ultimately Personal). Data is never touched. */
+CraftResolution ResolveAircraftOpts(const char *callsign, const char *hex, bool useRegistry, bool useOperators)
 {
     (void)hex; /* Reserved for future ICAO address rules. */
     CraftResolution result = {.type = CRAFT_PERSONAL, .aircraftType = AIRCRAFT_FIXED_WING,
@@ -1017,7 +1022,7 @@ CraftResolution ResolveAircraft(const char *callsign, const char *hex)
 
     /* 1. Registry: longest matching rule wins. */
     size_t longest = 0;
-    if (rulesLock) {
+    if (useRegistry && rulesLock) {
         xSemaphoreTake(rulesLock, portMAX_DELAY);
         for (size_t i = 0; i < rulesCount; i++) {
             size_t length = strlen(rules[i].prefix);
@@ -1056,7 +1061,7 @@ CraftResolution ResolveAircraft(const char *callsign, const char *hex)
 
     /* 3. Operator: longest matching ICAO/operator code (user rows override
      *    the built-in of the same code). */
-    if (rulesLock) {
+    if (useOperators && rulesLock) {
         xSemaphoreTake(rulesLock, portMAX_DELAY);
         longest = 0;
         for (size_t i = 0; i < opCount; i++) {
@@ -1087,6 +1092,11 @@ CraftResolution ResolveAircraft(const char *callsign, const char *hex)
     return result;
 }
 
+CraftResolution ResolveAircraft(const char *callsign, const char *hex)
+{
+    return ResolveAircraftOpts(callsign, hex, Features_RegisteredEnabled(), Features_OperatorsEnabled());
+}
+
 CraftType evaluateAircraftType(const char *callsign, const char *hex)
 {
     return ResolveAircraft(callsign, hex).type;
@@ -1104,7 +1114,19 @@ CraftResolution ResolveAircraftWithHint(
     AircraftType providerHint,
     bool hasHint)
 {
-    CraftResolution result = ResolveAircraft(callsign, hex);
+    return ResolveAircraftWithHintOpts(callsign, hex, providerHint, hasHint,
+                                       Features_RegisteredEnabled(), Features_OperatorsEnabled());
+}
+
+CraftResolution ResolveAircraftWithHintOpts(
+    const char *callsign,
+    const char *hex,
+    AircraftType providerHint,
+    bool hasHint,
+    bool useRegistry,
+    bool useOperators)
+{
+    CraftResolution result = ResolveAircraftOpts(callsign, hex, useRegistry, useOperators);
 
     /* A registry rule (whatever aircraftType it carries, including the
      * default Fixed-Wing) is an explicit, user-configured decision about

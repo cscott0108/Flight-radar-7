@@ -32,6 +32,7 @@
 #include "webserver.h"
 #include "radar.h"
 #include "custom_rules.h"
+#include "feature_flags.h"
 #include "airports.h"
 #include "seen_aircraft.h"
 #include "history_manager.h"
@@ -324,6 +325,21 @@ void setUICoords()
         lv_label_set_text(
             uic_LabelCoords,
             buf);
+
+        // On-screen range label: always the same radarRangeKm the radar
+        // filters and draws with (ui_Label29 used to be a fixed placeholder).
+        if (ui_Label29)
+        {
+            char rangeBuf[24];
+            snprintf(
+                rangeBuf,
+                sizeof(rangeBuf),
+                "< %.0f km >",
+                (double)radarRangeKm);
+            lv_label_set_text(
+                ui_Label29,
+                rangeBuf);
+        }
 
         if (showAircraftLabels)
             lv_obj_add_state(ui_Switch3, LV_STATE_CHECKED);
@@ -1733,7 +1749,10 @@ static void radar_update_timer_cb(void *pvParameters)
 
                     // Provider-independent history: RAM only here; the CSV is
                     // written in batches by SeenAircraft_FlushIfDue below.
-                    SeenAircraft_ObservePoll(gAircraft, gAircraftCount, (int64_t)time(NULL));
+                    // Seen Logging switch (WebUI Setup > Features). OFF skips only
+                    // new Seen records; existing records stay and tracking continues.
+                    if (Features_SeenEnabled())
+                        SeenAircraft_ObservePoll(gAircraft, gAircraftCount, (int64_t)time(NULL));
 
                     // Persistent (TF) history: one classification resolve per
                     // aircraft per poll (the radar/preview paths already re-resolve
@@ -1918,6 +1937,11 @@ void app_main()
     AdvDiag_LoadAtBoot();
     ExpertDebug_LoadAtBoot(); // forensic hooks; registers nothing unless ON
     BootWarmup_Crypto();
+
+    // Persistent feature switches + dark mode (NVS "radar"); absent keys keep
+    // the defaults (all features ON, light theme). Must precede CustomRules_Init
+    // consumers, the radar task and the web server.
+    Features_Init();
 
     if (!CustomRules_Init())
         ESP_LOGW("CRAFT_RULES", "Could not load one or more saved craft lists; built-in classification remains active");

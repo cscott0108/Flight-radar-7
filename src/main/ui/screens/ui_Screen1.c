@@ -780,7 +780,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_x(ui_Label29, 0);
     lv_obj_set_y(ui_Label29, 20);
     lv_obj_set_align(ui_Label29, LV_ALIGN_BOTTOM_MID);
-    lv_label_set_text(ui_Label29, "< 100 km >");
+    lv_label_set_text(ui_Label29, "< -- km >"); /* set from the configured range by setUICoords() in main.c */
 
     ui_PanelBottom = lv_obj_create(ui_Screen1);
     lv_obj_set_height(ui_PanelBottom, 50);

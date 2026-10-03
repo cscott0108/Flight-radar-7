@@ -1,3 +1,44 @@
+# ---- Firmware build identifier -------------------------------------------
+# src/VERSION is the single authoritative source. It is read here, at CMake
+# configure time, and compiled into the firmware through a generated header
+# (fw_version.h, FW_VERSION_STRING); /diag prints it. Nothing reads the file at
+# runtime. A missing, empty or malformed file fails the build on purpose - there
+# is no UNKNOWN / 0.0.0 / timestamp / git-hash fallback.
+# Editing src/VERSION re-runs CMake (CMAKE_CONFIGURE_DEPENDS) and, because
+# file(GENERATE) only rewrites the header when its content changes, rebuilds
+# only the files that include it.
+get_filename_component(FW_VERSION_FILE "${CMAKE_CURRENT_LIST_DIR}/../VERSION" ABSOLUTE)
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FW_VERSION_FILE}")
+    if(NOT EXISTS "${FW_VERSION_FILE}")
+        message(FATAL_ERROR
+            "Firmware version file not found: ${FW_VERSION_FILE}\n"
+            "Create it as a one-line text file containing the build identifier, e.g.  07.03.12-TF1")
+    endif()
+    file(READ "${FW_VERSION_FILE}" FW_VERSION_RAW)
+    string(STRIP "${FW_VERSION_RAW}" FW_VERSION_STR)
+    if("${FW_VERSION_STR}" STREQUAL "")
+        message(FATAL_ERROR
+            "Firmware version file is empty: ${FW_VERSION_FILE}\n"
+            "Put the build identifier on one line, e.g.  07.03.12-TF1")
+    endif()
+    # Opaque identifier: letters, digits, '.', '-', '_' and '+' only (also keeps it
+    # safe inside a C string and a CMake generator expression). Not parsed.
+    if(FW_VERSION_STR MATCHES "[^A-Za-z0-9._+-]")
+        message(FATAL_ERROR
+            "Firmware version \"${FW_VERSION_STR}\" in ${FW_VERSION_FILE} has unsupported characters.\n"
+            "Use a single line of letters, digits, '.', '-', '_' or '+' (for example 07.03.12-TF1).")
+    endif()
+    string(LENGTH "${FW_VERSION_STR}" FW_VERSION_LEN)
+    if(FW_VERSION_LEN GREATER 48)
+        message(FATAL_ERROR "Firmware version in ${FW_VERSION_FILE} is ${FW_VERSION_LEN} characters; the limit is 48.")
+    endif()
+    set(FW_VERSION_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(GENERATE OUTPUT "${FW_VERSION_GEN_DIR}/fw_version.h"
+        CONTENT "#pragma once\n/* Generated from src/VERSION by main/CMakeLists.txt - do not edit. */\n#define FW_VERSION_STRING \"${FW_VERSION_STR}\"\n")
+    message(STATUS "Firmware build identifier (src/VERSION): ${FW_VERSION_STR}")
+endif()
+
 # Collect all UI C files under src/main/ui/
 file(GLOB_RECURSE SRC_UI "ui/*.c")
 
@@ -20,7 +61,10 @@ idf_component_register(
         "web_airports.c"
         "web_diag.c"
         "web_seen.c"
+        "web_history.c"
         "web_util.c"
+        "web_style.c"
+        "feature_flags.c"
         "seen_aircraft.c"
         "time_util.c"
         "radar.c"
@@ -35,6 +79,10 @@ idf_component_register(
         "."
         "ui"
 )
+
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    target_include_directories(${COMPONENT_LIB} PRIVATE "${FW_VERSION_GEN_DIR}")
+endif()
 
 # Apply warning suppressions for LVGL if loaded
 idf_component_get_property(lvgl_lib lvgl__lvgl COMPONENT_LIB)

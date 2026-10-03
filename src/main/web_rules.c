@@ -15,6 +15,8 @@
 #include "custom_rules.h"
 #include "opensky_client.h"
 #include "web_util.h"
+#include "web_style.h"
+#include "feature_flags.h"
 
 static const char *TAG = "WebRules";
 
@@ -132,7 +134,7 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
 /* ---- Current Aircraft: Lookup / Add / Edit support ---- */
 
 /* Static page fragments. Sent with SendChunk (no printf), so '%' is not special. */
-#define AIRCRAFT_DIALOG_HTML \
+#define AIRCRAFT_DIALOG_A \
     "<dialog id='dlg'><h3 id='dt'>Add Aircraft</h3><p><b id='dcs'></b></p>" \
     "<div id='s1'><p>What would you like to configure?</p>" \
     "<label><input type='radio' name='k' value='reg'> Registry Number<small id='nreg'></small></label>" \
@@ -141,18 +143,24 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "<p><button type='button' onclick='dNext()'>Continue</button> <button type='button' onclick='dClose()'>Cancel</button></p></div>" \
     "<div id='s2' hidden><label><span id='lkt'></span><input type='text' id='fkey' autocomplete='off'></label>" \
     "<label id='lo' hidden>Airline / Operator <input type='text' id='fname' maxlength='39' autocomplete='off'></label>" \
-    "<label>Craft Type <select id='ftype'></select></label>" \
-    "<label>Aircraft Type <select id='fatype'></select></label>" \
+    "<label>Craft Type <select id='ftype'>"
+
+/* Dialog part B sits between the two option lists; part C closes the dialog. */
+#define AIRCRAFT_DIALOG_B "</select></label><label>Aircraft Type <select id='fatype'>"
+
+#define AIRCRAFT_DIALOG_C \
+    "</select></label>" \
     "<label>Notes <input type='text' id='fnotes' maxlength='96' placeholder='optional' autocomplete='off'></label>" \
     "<p id='dmsg' role='alert'></p>" \
     "<p><button type='button' onclick='dSave()'>Save</button> <button type='button' id='dedit' hidden onclick='dUseExisting()'>Edit existing entry</button> " \
     "<button type='button' onclick='dClose()'>Cancel</button></p></div></dialog>"
 
-#define PAGE_SCRIPT_EDITING \
-    "<script>" \
+#define SCRIPT_REG \
     "function editReg(b){var f=document.getElementById('regForm').elements;" \
     "f['prefix'].value=b.dataset.prefix;f['type'].value=b.dataset.type;" \
-    "f['atype'].value=b.dataset.atype;f['notes'].value=b.dataset.notes||'';f['prefix'].focus();}" \
+    "f['atype'].value=b.dataset.atype;f['notes'].value=b.dataset.notes||'';f['prefix'].focus();}"
+
+#define SCRIPT_OPS \
     "function editOp(b){var f=document.getElementById('opForm').elements;" \
     "f['code'].value=b.dataset.code;f['code'].readOnly=(b.dataset.builtin==='1');" \
     "f['opname'].value=b.dataset.name;f['type'].value=b.dataset.type;" \
@@ -160,7 +168,9 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "f['opname'].focus();window.scrollTo(0,document.getElementById('opForm').offsetTop-20);}" \
     "function clearOp(){var form=document.getElementById('opForm');form.reset();" \
     "form.elements['code'].readOnly=false;" \
-    "document.getElementById('opMode').textContent='Add operator';}" \
+    "document.getElementById('opMode').textContent='Add operator';}"
+
+#define SCRIPT_IMPORT \
     "async function importCsv(inputId,url){" \
     "const input=document.getElementById(inputId);" \
     "if(!input.files[0]){alert('Choose a file first');return;}" \
@@ -187,8 +197,6 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "var r=document.getElementsByName('k');" \
     "r[0].checked=(cur.hasreg==='1');r[1].checked=(cur.hasreg!=='1'&&cur.hasop==='1');" \
     "$('smsg').textContent='';$('s1').hidden=false;$('s2').hidden=true;" \
-    "if(!$('ftype').options.length){$('ftype').innerHTML=document.querySelector('#regForm select').innerHTML;}" \
-    "if(!$('fatype').options.length){$('fatype').innerHTML=document.querySelector('#regForm select[name=atype]').innerHTML;}" \
     "D.showModal();}" \
     "function dClose(){D.close();}" \
     "function dNext(){var k=document.querySelector('input[name=k]:checked');" \
@@ -220,7 +228,7 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "$('dmsg').textContent='Saving...';" \
     "try{var r=await fetch('/rules/save',{method:'POST',body:p});" \
     "var t=(await r.text()).split('\\n');" \
-    "if(r.ok){D.close();try{sessionStorage.setItem('msg',t[1]||'Saved.');}catch(e){}location.replace('/rules');return;}" \
+    "if(r.ok){D.close();try{sessionStorage.setItem('msg',t[1]||'Saved.');}catch(e){}location.replace(location.pathname);return;}" \
     "$('dmsg').textContent=t[1]||'Save failed.';" \
     "if(r.status===409){ex={key:t[2],name:t[3],type:t[4],atype:t[5],notes:t[6]};$('dedit').hidden=false;}" \
     "}catch(e){$('dmsg').textContent='Could not reach the device.';}}" \
@@ -263,8 +271,12 @@ typedef struct {
     char regNotes[MAX_RULE_NOTES + 1];
 } AircraftInfo;
 
+/* useRegistry/useOperators: false gives the effective view the radar uses with
+ * a Features switch OFF (that stage is skipped); true gives the configured view
+ * the Add/Edit dialog needs so "already configured" is right regardless. */
 static void BuildAircraftInfo(AircraftInfo *info, const char *callsign, const char *hex,
-                              const char *providerOp, AircraftType hint, bool hasHint)
+                              const char *providerOp, AircraftType hint, bool hasHint,
+                              bool useRegistry, bool useOperators)
 {
     memset(info, 0, sizeof(*info));
     TrimCopy(info->cs, sizeof(info->cs), callsign ? callsign : "");
@@ -273,14 +285,14 @@ static void BuildAircraftInfo(AircraftInfo *info, const char *callsign, const ch
 
     /* Same resolution the radar uses, provider hint included, so the Aircraft
      * Type shown here is the one actually drawn. */
-    info->resolved = ResolveAircraftWithHint(info->cs, info->hx, hint, hasHint);
+    info->resolved = ResolveAircraftWithHintOpts(info->cs, info->hx, hint, hasHint, useRegistry, useOperators);
     info->hasReg = (info->resolved.source == CRAFT_SRC_REGISTRY);
 
     if (info->resolved.source == CRAFT_SRC_OPERATOR)
         snprintf(info->icao, sizeof(info->icao), "%s", info->resolved.operatorCode);
     else
         Operators_CodeFromCallsign(info->cs, info->icao);
-    info->hasOp = info->icao[0] && Operators_Find(info->icao, &info->op);
+    info->hasOp = useOperators && info->icao[0] && Operators_Find(info->icao, &info->op);
 
     /* Registry prefill: the matched rule when editing, otherwise the call sign
      * (blank if it is not a valid registry pattern). */
@@ -335,9 +347,13 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
     snap.icao24[sizeof(snap.icao24) - 1] = '\0';
     snap.operatorName[sizeof(snap.operatorName) - 1] = '\0';
 
+    /* Display uses the effective classification (what the radar draws, with
+     * any Features switch honoured). The Add/Edit button needs the configured
+     * view, so it gets its own info only when a switch actually differs. */
+    bool regOn = Features_RegisteredEnabled(), opsOn = Features_OperatorsEnabled();
     AircraftInfo info;
     BuildAircraftInfo(&info, snap.callsign, snap.icao24, snap.operatorName,
-                      snap.providerTypeHint, snap.hasProviderTypeHint);
+                      snap.providerTypeHint, snap.hasProviderTypeHint, regOn, opsOn);
     const CraftResolution *res = &info.resolved;
 
     /* Decided by: craft type (color) and Aircraft Type (shape) can come from
@@ -407,33 +423,53 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
             eCraftBy, AircraftTypeSource_Name(res->aircraftTypeSource),
             eQuery, eQuery[0] ? "" : " disabled") != ESP_OK)
         return ESP_FAIL;
-    if (SendEditButton(req, &info, false) != ESP_OK)
-        return ESP_FAIL;
+    if (regOn && opsOn) {
+        if (SendEditButton(req, &info, false) != ESP_OK)
+            return ESP_FAIL;
+    } else {
+        AircraftInfo cfg;
+        BuildAircraftInfo(&cfg, snap.callsign, snap.icao24, snap.operatorName,
+                          snap.providerTypeHint, snap.hasProviderTypeHint, true, true);
+        if (SendEditButton(req, &cfg, false) != ESP_OK)
+            return ESP_FAIL;
+    }
     return SendChunk(req, "</td></tr>");
 }
 
-static esp_err_t RulesPage(httpd_req_t *req)
+/* ---- pages ----
+ * The old single /rules page is split into /registered, /operators and
+ * /current. They read and write the same stores as before (custom_rules.csv,
+ * operators.csv, gAircraft); only the routes and layout changed. */
+
+#define WIDE_CSS "body{max-width:1100px}table.ca{font-size:.9em}table.ca small{display:block}"
+
+static esp_err_t SendAircraftDialog(httpd_req_t *req)
 {
-    LogHttpdMemory("rules page start");
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    if (SendChunk(req, AIRCRAFT_DIALOG_A) != ESP_OK || SendTypeOptions(req) != ESP_OK ||
+        SendChunk(req, AIRCRAFT_DIALOG_B) != ESP_OK || SendAircraftTypeOptions(req) != ESP_OK ||
+        SendChunk(req, AIRCRAFT_DIALOG_C) != ESP_OK)
+        return ESP_FAIL;
+    return ESP_OK;
+}
+
+/* ---- Registered Aircraft ---- */
+
+static esp_err_t RegisteredPage(httpd_req_t *req)
+{
+    LogHttpdMemory("registered page start");
+    if (WebStyle_SendHead(req, "Registered Aircraft", WEBPAGE_REGISTERED, NULL) != ESP_OK ||
+        SendChunk(req,
+        "<h1>Registered Aircraft</h1><p id='banner' role='status' hidden></p>") != ESP_OK)
+        return ESP_FAIL;
+    if (!Features_RegisteredEnabled() &&
+        SendChunk(req,
+        "<p class='wn'>Registered Aircraft matching is <b>OFF</b> (Setup &rarr; Features). "
+        "Saved registrations are kept and can still be edited here, but the radar is not using them.</p>") != ESP_OK)
+        return ESP_FAIL;
     if (SendChunk(req,
-        "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Craft Type Configuration</title><style>body{font:16px sans-serif;max-width:1000px;margin:2em auto;padding:0 1em}"
-        "table{border-collapse:collapse;width:100%}td,th{padding:.4em;border:1px solid #ccc;text-align:left}"
-        "form.inline{display:inline}fieldset{margin:1em 0}small{color:#666}"
-        ".ati{background:#1b1b1b;border-radius:4px;vertical-align:middle;margin-right:4px}"
-        "table.ca{font-size:.9em}table.ca small{display:block}"
-        "button{margin:.15em}[hidden]{display:none!important}"
-        "dialog{max-width:26em;width:90%;border:1px solid #888;border-radius:6px}"
-        "dialog label{display:block;margin:.6em 0}"
-        "dialog input[type=text],dialog select{width:100%;box-sizing:border-box;padding:.3em}"
-        "#banner{background:#e6f4ea;border:1px solid #8c8;padding:.5em}"
-        "#dmsg,#smsg{color:#b00;min-height:1.2em}</style></head><body><p><a href='/'>Back to setup</a></p>"
-        "<h1>Craft Type Configuration</h1><p id='banner' role='status' hidden></p>"
         "<p>Each aircraft resolves to one craft type, which decides its marker and color. "
         "Order of lookup: <b>Registry</b> rule (exact aircraft) &rarr; built-in military/police/EMS prefixes "
         "&rarr; <b>Operator</b> (ICAO code) &rarr; Personal. Changes apply immediately and are saved.</p>"
-        "<h2>A. Registry numbers</h2>"
         "<p>Prefix matches ignore case and include any following flight number. "
         "Use ? for one unknown letter or digit (for example S?NFRD). The longest rule wins. "
         "Blank call signs are Personal.</p>"
@@ -450,7 +486,7 @@ static esp_err_t RulesPage(httpd_req_t *req)
         "<p><a href='/rules/export'>Download custom_rules.csv</a> &middot; "
         "<label style='display:inline'>Upload a replacement: <input type='file' id='importRulesFile' accept='.csv,text/csv'></label> "
         "<button type='button' onclick=\"importCsv('importRulesFile','/rules/import')\">Upload &amp; replace</button></p>"
-        "<table><tr><th>Registry / prefix</th><th>Craft Type</th><th>Aircraft Type</th><th>Notes</th><th>Action</th></tr>") != ESP_OK)
+        "<div class='w'><table><tr><th>Registry / prefix</th><th>Craft Type</th><th>Aircraft Type</th><th>Notes</th><th>Action</th></tr>") != ESP_OK)
         return ESP_FAIL;
 
     size_t count = CustomRules_Count();
@@ -472,10 +508,59 @@ static esp_err_t RulesPage(httpd_req_t *req)
                 prefix, CraftType_CsvName(rule.type), AircraftType_CsvName(rule.aircraftType), notes, prefix) != ESP_OK)
             return ESP_FAIL;
     }
+    LogHttpdMemory("registered page after rules");
 
-    LogHttpdMemory("rules page after section A (registry rules)");
+    if (SendChunk(req, "</table></div>") != ESP_OK || SendAircraftDialog(req) != ESP_OK)
+        return ESP_FAIL;
+
+    /* "?edit=<call sign>&hex=<icao24>" (linked from the Seen page, and from old
+     * /rules?edit= bookmarks via the /rules redirect) opens the Add/Edit dialog
+     * for that aircraft: a hidden button carrying the same data- attributes as a
+     * Current Aircraft row is clicked once the dialog script has loaded. The
+     * aircraft need not be in range now. */
+    char query[192];
+    char editCs[24] = "", editHex[16] = "";
+    bool autoOpen = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        bool haveCs = httpd_query_key_value(query, "edit", editCs, sizeof(editCs)) == ESP_OK;
+        bool haveHex = httpd_query_key_value(query, "hex", editHex, sizeof(editHex)) == ESP_OK;
+        WebUtil_UrlDecodeInPlace(editCs);
+        WebUtil_UrlDecodeInPlace(editHex);
+        autoOpen = haveCs || haveHex;
+    }
+    if (autoOpen) {
+        AircraftInfo info;
+        /* The provider's type hint is not known for a stored sighting. The
+         * configured view (switches ignored) is used so an existing registration
+         * is found even while Registered Aircraft matching is OFF. */
+        BuildAircraftInfo(&info, editCs, editHex, "", AIRCRAFT_FIXED_WING, false, true, true);
+        if (SendEditButton(req, &info, true) != ESP_OK)
+            return ESP_FAIL;
+    }
+
+    if (SendChunk(req, "<script>" SCRIPT_REG SCRIPT_IMPORT PAGE_SCRIPT_AIRCRAFT) != ESP_OK ||
+        (autoOpen && SendChunk(req, "var ao=document.getElementById('autoOpen');if(ao){ao.click();}") != ESP_OK) ||
+        SendChunk(req, "</script></body></html>") != ESP_OK)
+        return ESP_FAIL;
+    esp_err_t done = httpd_resp_send_chunk(req, NULL, 0);
+    LogHttpdMemory("registered page end");
+    return done;
+}
+
+/* ---- Operators ---- */
+
+static esp_err_t OperatorsPage(httpd_req_t *req)
+{
+    LogHttpdMemory("operators page start");
+    if (WebStyle_SendHead(req, "Operators", WEBPAGE_OPERATORS, NULL) != ESP_OK ||
+        SendChunk(req, "<h1>Operators</h1>") != ESP_OK)
+        return ESP_FAIL;
+    if (!Features_OperatorsEnabled() &&
+        SendChunk(req,
+        "<p class='wn'>Registered Operators matching is <b>OFF</b> (Setup &rarr; Features). "
+        "Saved operators are kept and can still be edited here, but the radar is not using them.</p>") != ESP_OK)
+        return ESP_FAIL;
     if (SendChunk(req,
-        "</table><h2>B. ICAO / operator configuration</h2>"
         "<p>The ICAO code (for example FDX in FDX1234) selects the craft type for every matching flight. "
         "Built-in operators can be edited and restored to their default; the ICAO code of a built-in cannot change. "
         "You can also add your own operators.</p>"
@@ -490,7 +575,7 @@ static esp_err_t RulesPage(httpd_req_t *req)
         "<p><a href='/operators/export'>Download operators.csv</a> (changes and custom operators only) &middot; "
         "<label style='display:inline'>Upload a replacement: <input type='file' id='importOperatorsFile' accept='.csv,text/csv'></label> "
         "<button type='button' onclick=\"importCsv('importOperatorsFile','/operators/import')\">Upload &amp; replace</button></p>"
-        "<table><tr><th>ICAO</th><th>Airline / Operator</th><th>Type</th><th>Action</th></tr>") != ESP_OK)
+        "<div class='w'><table><tr><th>ICAO</th><th>Airline / Operator</th><th>Type</th><th>Action</th></tr>") != ESP_OK)
         return ESP_FAIL;
 
     size_t operatorCount = Operators_Count();
@@ -527,18 +612,52 @@ static esp_err_t RulesPage(httpd_req_t *req)
         if (err != ESP_OK)
             return ESP_FAIL;
     }
+    LogHttpdMemory("operators page after list");
 
-    LogHttpdMemory("rules page after section B (operators)");
+    if (SendChunk(req, "</table></div><script>" SCRIPT_OPS SCRIPT_IMPORT "</script></body></html>") != ESP_OK)
+        return ESP_FAIL;
+    esp_err_t done = httpd_resp_send_chunk(req, NULL, 0);
+    LogHttpdMemory("operators page end");
+    return done;
+}
+
+/* ---- Current Aircraft ---- */
+
+static esp_err_t CurrentPage(httpd_req_t *req)
+{
+    LogHttpdMemory("current page start");
+    if (WebStyle_SendHead(req, "Current Aircraft", WEBPAGE_CURRENT, WIDE_CSS) != ESP_OK ||
+        SendChunk(req, "<h1>Current Aircraft</h1><p id='banner' role='status' hidden></p>") != ESP_OK)
+        return ESP_FAIL;
+
+    /* Switch OFF: no per-aircraft resolution and no table. The radar itself is
+     * unaffected (it never reads this page); gAircraft keeps updating. */
+    if (!Features_CurrentEnabled()) {
+        if (SendChunk(req,
+            "<p class='wn'>The Current Aircraft page is <b>OFF</b> (Setup &rarr; Features). "
+            "The radar keeps tracking and displaying aircraft; this page just isn't listing them.</p>"
+            "</body></html>") != ESP_OK)
+            return ESP_FAIL;
+        return httpd_resp_send_chunk(req, NULL, 0);
+    }
+
+    if (!Features_RegisteredEnabled() || !Features_OperatorsEnabled()) {
+        if (SendChunk(req,
+            "<p class='wn'>Registered Aircraft and/or Registered Operators matching is OFF "
+            "(Setup &rarr; Features): the classification shown is what the radar is using, "
+            "without those lookups.</p>") != ESP_OK)
+            return ESP_FAIL;
+    }
 
     char iconDefs[900];
     if (AircraftType_IconDefs(iconDefs, sizeof(iconDefs)) == 0)
         iconDefs[0] = '\0';
-    if (SendChunk(req, "</table><h2>Current aircraft</h2>"
-                       "<p><small>Lookup opens a web search for the call sign in this browser. "
-                       "Add / Edit changes the registry or operator lists above. "
-                       "<a href='/seen'>Seen Aircraft history</a></small></p>") != ESP_OK ||
+    if (SendChunk(req,
+            "<p><small>Lookup opens a web search for the call sign in this browser. "
+            "Add / Edit changes the registry or operator lists "
+            "(<a href='/registered'>Registered Aircraft</a>, <a href='/operators'>Operators</a>).</small></p>") != ESP_OK ||
         SendChunk(req, iconDefs) != ESP_OK ||
-        SendChunk(req, "<table class='ca'>"
+        SendChunk(req, "<div class='w'><table class='ca'>"
                        "<tr><th>Call Sign</th><th>ICAO24</th><th>Craft Type</th><th>Aircraft Type</th><th>Operator</th>"
                        "<th>Registry</th><th>Decided by</th><th>Actions</th></tr>") != ESP_OK)
         return ESP_FAIL;
@@ -551,41 +670,25 @@ static esp_err_t RulesPage(httpd_req_t *req)
         if (SendAircraftRow(req, i) != ESP_OK)
             return ESP_FAIL;
     }
-    if (SendChunk(req, "</table><p><a href='/'>Back to setup</a></p>") != ESP_OK ||
-        SendChunk(req, AIRCRAFT_DIALOG_HTML) != ESP_OK)
-        return ESP_FAIL;
-
-    /* "?edit=<call sign>&hex=<icao24>" (linked from the Seen Aircraft page)
-     * opens this page's existing Add/Edit dialog for that aircraft: a hidden
-     * button carrying the same data- attributes as a table row is clicked once
-     * the dialog script has loaded. The aircraft need not be in range now. */
-    char query[192];
-    char editCs[24] = "", editHex[16] = "";
-    bool autoOpen = false;
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        bool haveCs = httpd_query_key_value(query, "edit", editCs, sizeof(editCs)) == ESP_OK;
-        bool haveHex = httpd_query_key_value(query, "hex", editHex, sizeof(editHex)) == ESP_OK;
-        WebUtil_UrlDecodeInPlace(editCs);
-        WebUtil_UrlDecodeInPlace(editHex);
-        autoOpen = haveCs || haveHex;
-    }
-    if (autoOpen) {
-        AircraftInfo info;
-        /* The provider's type hint is not known for a stored sighting; use
-         * the last recorded type via the plain resolution (registry/default). */
-        BuildAircraftInfo(&info, editCs, editHex, "", AIRCRAFT_FIXED_WING, false);
-        if (SendEditButton(req, &info, true) != ESP_OK)
-            return ESP_FAIL;
-    }
-
-    if (SendChunk(req, PAGE_SCRIPT_EDITING) != ESP_OK ||
-        SendChunk(req, PAGE_SCRIPT_AIRCRAFT) != ESP_OK ||
-        (autoOpen && SendChunk(req, "var ao=document.getElementById('autoOpen');if(ao){ao.click();}") != ESP_OK) ||
-        SendChunk(req, "</script></body></html>") != ESP_OK)
+    if (SendChunk(req, "</table></div>") != ESP_OK || SendAircraftDialog(req) != ESP_OK ||
+        SendChunk(req, "<script>" PAGE_SCRIPT_AIRCRAFT "</script></body></html>") != ESP_OK)
         return ESP_FAIL;
     esp_err_t done = httpd_resp_send_chunk(req, NULL, 0);
-    LogHttpdMemory("rules page end");
+    LogHttpdMemory("current page end");
     return done;
+}
+
+/* Old bookmarks: /rules -> /registered, query string kept so an existing
+ * /rules?edit=<call sign>&hex=<icao24> link still opens the same aircraft. */
+static esp_err_t RulesRedirect(httpd_req_t *req)
+{
+    char query[192];
+    char location[224] = "/registered";
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK && query[0])
+        snprintf(location, sizeof(location), "/registered?%s", query);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    return httpd_resp_send(req, NULL, 0);
 }
 
 /* ---- form parsing ---- */
@@ -645,11 +748,12 @@ static bool FormValue(const char *body, const char *key, char *out, size_t size)
     return true;
 }
 
-static esp_err_t RedirectRules(httpd_req_t *req)
+/* After a form POST, return to the page the form lives on. */
+static esp_err_t RedirectTo(httpd_req_t *req, const char *location)
 {
     httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/rules");
-    return httpd_resp_sendstr(req, "Saved. Return to /rules.");
+    httpd_resp_set_hdr(req, "Location", location);
+    return httpd_resp_sendstr(req, "Saved.");
 }
 
 /* ---- CSV export / import ---- */
@@ -771,7 +875,7 @@ static esp_err_t AddRule(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "Could not save rule (storage error)");
     LogHttpdMemory("registry save");
-    return RedirectRules(req);
+    return RedirectTo(req, "/registered");
 }
 
 static esp_err_t DeleteRule(httpd_req_t *req)
@@ -781,7 +885,7 @@ static esp_err_t DeleteRule(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
     if (!CustomRules_Delete(prefix))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Rule not found or storage error");
-    return RedirectRules(req);
+    return RedirectTo(req, "/registered");
 }
 
 /* ---- operator handlers ---- */
@@ -807,7 +911,7 @@ static esp_err_t SaveOperator(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "Could not save operator (storage error)");
     LogHttpdMemory("operator save");
-    return RedirectRules(req);
+    return RedirectTo(req, "/operators");
 }
 
 static esp_err_t RestoreOperator(httpd_req_t *req)
@@ -817,7 +921,7 @@ static esp_err_t RestoreOperator(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
     if (!Operators_RestoreDefault(code))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a built-in operator or storage error");
-    return RedirectRules(req);
+    return RedirectTo(req, "/operators");
 }
 
 static esp_err_t DeleteOperator(httpd_req_t *req)
@@ -828,7 +932,7 @@ static esp_err_t DeleteOperator(httpd_req_t *req)
     if (!Operators_DeleteCustom(code))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                    "Not a custom operator (built-ins can only be restored) or storage error");
-    return RedirectRules(req);
+    return RedirectTo(req, "/operators");
 }
 
 /* ---- Add / Edit from the Current Aircraft dialog ---- */
@@ -927,7 +1031,10 @@ static esp_err_t SaveFromAircraft(httpd_req_t *req)
 
 esp_err_t WebRules_Register(httpd_handle_t server)
 {
-    const httpd_uri_t page = {.uri = "/rules", .method = HTTP_GET, .handler = RulesPage};
+    const httpd_uri_t page = {.uri = "/rules", .method = HTTP_GET, .handler = RulesRedirect};
+    const httpd_uri_t registered = {.uri = "/registered", .method = HTTP_GET, .handler = RegisteredPage};
+    const httpd_uri_t operators = {.uri = "/operators", .method = HTTP_GET, .handler = OperatorsPage};
+    const httpd_uri_t current = {.uri = "/current", .method = HTTP_GET, .handler = CurrentPage};
     const httpd_uri_t add = {.uri = "/add", .method = HTTP_POST, .handler = AddRule};
     const httpd_uri_t remove = {.uri = "/delete", .method = HTTP_POST, .handler = DeleteRule};
     const httpd_uri_t exportRules = {.uri = "/rules/export", .method = HTTP_GET, .handler = ExportRules};
@@ -949,5 +1056,8 @@ esp_err_t WebRules_Register(httpd_handle_t server)
     if (err == ESP_OK) err = httpd_register_uri_handler(server, &opExport);
     if (err == ESP_OK) err = httpd_register_uri_handler(server, &opImport);
     if (err == ESP_OK) err = httpd_register_uri_handler(server, &aircraftSave);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server, &registered);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server, &operators);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server, &current);
     return err;
 }

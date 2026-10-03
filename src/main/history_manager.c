@@ -42,7 +42,7 @@ typedef struct {
  * (every public function below guards on it) rather than crashing; the
  * radar and Hot Seen are unaffected either way. */
 static HmSlot *s_slots = NULL;
-static bool s_tfReady = false;
+static volatile bool s_tfReady = false; /* volatile: also toggled from the web task (diag pause/resume) */
 static uint32_t s_lastSyncMonotonicSec = 0;
 static bool s_haveLastSync = false;
 
@@ -248,6 +248,22 @@ bool HistoryManager_FlushIfDue(uint32_t nowMonotonicSec)
         }
     }
     return wroteAny;
+}
+
+void HistoryManager_TfPause(void)
+{
+    s_tfReady = false; /* Observe/Flush skip TF; dirty shadow slots are kept untouched */
+}
+
+void HistoryManager_TfResume(void)
+{
+    /* Ready again only if a TF (re)init really made history available. */
+    s_tfReady = (s_slots != NULL) && TfHistory_IsAvailable();
+}
+
+bool HistoryManager_IsTfReady(void)
+{
+    return s_tfReady;
 }
 
 void HistoryManager_GetStats(HistoryManagerStats *out)
