@@ -18,9 +18,11 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "adv_diag.h"
+#include "diag_telemetry.h"
 
 #include "main.h"
 #include "radar.h" // for selectedIcao24, so debug logging can target the selected aircraft
+#include "visibility_policy.h" // VisPolicy_Admit: the shared on-ground / visibility decision
 
 #define OPENSKY_NAMESPACE "opensky"
 #define RATE_LIMIT_KEY "rate_until"
@@ -172,6 +174,7 @@ static void LogOpenSkyStateFields(cJSON *state)
     ESP_LOGI(TAG_DBG, "-----------------------------------");
 }
 
+/* HOSTTEST:BEGIN parse (extracted verbatim by host_tests/visibility_test.c) */
 bool OpenSky_ParseAircraft(
     const char *json)
 {
@@ -227,9 +230,17 @@ bool OpenSky_ParseAircraft(
 
     gAircraftCount = 0; // the response is valid: replace the previous list
 
+    // Pass 0 admits airborne aircraft (the 0.0.25 list); pass 1 (only when a
+    // ground visibility/retention policy is enabled) adds on-ground aircraft
+    // into the remaining slots, so airborne aircraft always have priority.
+    const int passes = VisPolicy_Passes();
+    // Pass 1 keeps going when the list is full: those on-ground aircraft are
+    // parsed into a scratch slot only so the airport counts (Y) include them;
+    // VisPolicy_Admit never admits them.
+    for (int pass = 0; pass < passes; pass++)
     for (int i = 0;
          i < count &&
-         gAircraftCount < MAX_AIRCRAFT;
+         (gAircraftCount < MAX_AIRCRAFT || pass == 1);
          i++)
     {
         cJSON *state =
@@ -240,10 +251,13 @@ bool OpenSky_ParseAircraft(
         if (!cJSON_IsArray(state))
             continue;
 
-        rawCount++;
+        if (pass == 0)
+            rawCount++;
 
+        static Aircraft s_countOnlySlot; // list full (pass 1 only): counted, never admitted
         Aircraft *a =
-            &gAircraft[gAircraftCount];
+            gAircraftCount < MAX_AIRCRAFT ?
+            &gAircraft[gAircraftCount] : &s_countOnlySlot;
 
         memset(
             a,
@@ -288,7 +302,8 @@ bool OpenSky_ParseAircraft(
             !cJSON_IsNumber(lon) ||
             !Aircraft_IsValidPosition(lat->valuedouble, lon->valuedouble))
         {
-            rejectedCount++;
+            if (pass == 0)
+                rejectedCount++;
             continue;
         }
 
@@ -324,7 +339,22 @@ bool OpenSky_ParseAircraft(
             a->longitude = lon->valuedouble;
 
         if (cJSON_IsNumber(vel))
+        {
             a->velocity = vel->valuedouble;
+            a->dataFlags |= AIRCRAFT_DATA_VELOCITY;
+        }
+
+        // 0.0.30, display only (Selected Craft trend arrow): state vector
+        // index 11 is vertical_rate in m/s (null when unknown) -> ft/min.
+        cJSON *vrate =
+            cJSON_GetArrayItem(
+                state,
+                11);
+        if (cJSON_IsNumber(vrate))
+        {
+            a->verticalRateFpm = Aircraft_ClampFpm(vrate->valuedouble * 196.850394);
+            a->dataFlags |= AIRCRAFT_DATA_VRATE;
+        }
 
         if (cJSON_IsNumber(hdg))
             a->heading = hdg->valuedouble;
@@ -332,22 +362,19 @@ bool OpenSky_ParseAircraft(
         if (cJSON_IsNumber(alt))
             a->altitude = alt->valuedouble;
 
-        // Skip parked/taxiing aircraft and ground vehicles: OpenSky's
-        // on_ground flag when present, or (as a fallback for feeders that
-        // omit it) an aircraft reporting both near-zero altitude and a
-        // walking/taxi-speed ground velocity. A real airborne aircraft at
-        // low altitude still has substantial forward speed, so this
-        // combined check doesn't catch genuine low approaches.
+        // Parked/taxiing aircraft and ground vehicles: OpenSky's on_ground
+        // flag when present, or (as a fallback for feeders that omit it) an
+        // aircraft reporting both near-zero altitude and a walking/taxi-speed
+        // ground velocity. The decision itself (same rule and defaults as
+        // before, plus the optional ground visibility policy) is made in one
+        // place for every provider: VisPolicy_Admit.
         bool reportedOnGround =
             cJSON_IsBool(onGround) && cJSON_IsTrue(onGround);
 
-        bool looksParked =
-            (a->altitude <= GROUND_ALTITUDE_THRESHOLD_M) &&
-            (a->velocity <= GROUND_VELOCITY_THRESHOLD_MS);
-
-        if (reportedOnGround || looksParked)
+        if (!VisPolicy_Admit(a, reportedOnGround, pass))
         {
-            rejectedCount++;
+            if (pass == 0)
+                rejectedCount++;
             continue;
         }
 
@@ -401,6 +428,7 @@ bool OpenSky_ParseAircraft(
 
     return true;
 }
+/* HOSTTEST:END parse */
 
 static esp_err_t HttpEventHandler(esp_http_client_event_t *evt)
 {
@@ -477,7 +505,7 @@ static bool LoadCredentials(void)
         err2 == ESP_OK);
 }
 
-static bool RequestToken(void)
+static bool RequestTokenImpl(void)
 {
     LogHttpMemory("Before OAuth TLS");
     AdvDiag_HeapBaseline();
@@ -622,6 +650,16 @@ static bool RequestToken(void)
         "Token acquired");
 
     return true;
+}
+
+// Recurring-operation telemetry around the (unchanged) token request. The reason text is
+// fixed; nothing about the request, credentials or token is recorded.
+static bool RequestToken(void)
+{
+    uint32_t t0 = DiagTelemetry_NowMs();
+    bool ok = RequestTokenImpl();
+    DiagTelemetry_OpEnd(DT_OP_OPENSKY_TOKEN, t0, ok, "token request failed");
+    return ok;
 }
 
 static bool EnsureToken(void)

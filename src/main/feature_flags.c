@@ -10,12 +10,13 @@
 static const char *TAG = "Features";
 
 static const char *const kKeys[FEATURE_COUNT] = {
-    "feat_seen", "feat_current", "feat_reg", "feat_ops", "ui_dark"};
+    "feat_seen", "feat_current", "feat_reg", "feat_ops", "ui_dark", "ui_alttrend", "ui_speed"};
 static const char *const kNames[FEATURE_COUNT] = {
-    "Seen Logging", "Current Aircraft", "Registered Aircraft", "Registered Operators", "Dark Mode"};
+    "Seen Logging", "Current Aircraft", "Registered Aircraft", "Registered Operators", "Dark Mode",
+    "Selected Craft Altitude Trend", "Selected Craft Speed"};
 
 /* Defaults apply until Features_Init() runs and whenever a key is absent. */
-static volatile bool s_on[FEATURE_COUNT] = {true, true, true, true, false};
+static volatile bool s_on[FEATURE_COUNT] = {true, true, true, true, false, true, true};
 
 void Features_Init(void)
 {
@@ -28,9 +29,10 @@ void Features_Init(void)
             s_on[i] = (v != 0);
     }
     nvs_close(h);
-    ESP_LOGI(TAG, "seen=%d current=%d registered=%d operators=%d dark=%d",
+    ESP_LOGI(TAG, "seen=%d current=%d registered=%d operators=%d dark=%d alttrend=%d speed=%d",
              s_on[FEATURE_SEEN], s_on[FEATURE_CURRENT], s_on[FEATURE_REGISTERED],
-             s_on[FEATURE_OPERATORS], s_on[FEATURE_DARK_MODE]);
+             s_on[FEATURE_OPERATORS], s_on[FEATURE_DARK_MODE], s_on[FEATURE_PANEL_ALT_TREND],
+             s_on[FEATURE_PANEL_SPEED]);
 }
 
 bool Features_Get(FeatureId id)

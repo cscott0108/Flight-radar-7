@@ -1,4 +1,5 @@
 #include "seen_aircraft.h"
+#include "pattern_match.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "diag_telemetry.h"
 #include "time_util.h"
 
 static const char *TAG = "SeenAircraft";
@@ -39,6 +41,31 @@ static const char *tmpPath = SEEN_CSV_TMP_PATH;
  * negligible) so it needs no allocation and stays in lockstep with `records[]` by index -
  * indices are stable (see PickEvictionVictim's comment), so this is safe. */
 static bool recordDirty[SEEN_MAX_RECORDS];
+
+/* Eviction policy (see SeenEvictionPolicy). Plain int: written by the web task, read under seenLock. */
+static volatile int evictionPolicy = SEEN_EVICT_UNREGISTERED_PREFERRED;
+
+/* Lazy per-slot cache of "is this record registered/configured?" for the class-aware policies.
+ * 0 = not classified yet, 1 = registered, 2 = unregistered. Same index as records[]; 3 KB of static
+ * RAM, no duplicate dataset. Discarded wholesale when the rule sets change (CustomRules_Revision),
+ * per slot when the slot is reused or its call sign changes. Each record is classified at most once
+ * per rule revision, and only when an eviction actually needs it. */
+#define CLASS_UNKNOWN 0
+#define CLASS_REGISTERED 1
+#define CLASS_UNREGISTERED 2
+static uint8_t recordClass[SEEN_MAX_RECORDS];
+static uint32_t classRevision;
+static bool classRevisionValid;
+/* FIFO tie-break: equal first-seen values (same second, or unsynchronized = 0) are taken in slot
+ * order starting after the previous victim, so ties rotate instead of always hitting one slot. */
+static size_t fifoCursor;
+
+static void ResetClassCache(void)
+{
+    memset(recordClass, 0, sizeof(recordClass));
+    classRevisionValid = false;
+    fifoCursor = 0;
+}
 
 static void MarkRecordDirty(size_t idx)
 {
@@ -80,6 +107,7 @@ static bool ParseOperatorSource(const char *token, SeenOperatorSource *out)
 /* ICAO24 is 6 hex digits; ADSBExchange-style feeds may prefix "~" for
  * non-ICAO (TIS-B) addresses. Stored upper-case so one aircraft is one key
  * no matter which provider (or letter case) reported it. */
+/* HOSTTEST:BEGIN icaonorm (extracted verbatim by host_tests/registry_icao_test.c) */
 bool SeenAircraft_NormalizeIcao(const char *input, char out[SEEN_ICAO_MAX])
 {
     out[0] = '\0';
@@ -101,6 +129,7 @@ bool SeenAircraft_NormalizeIcao(const char *input, char out[SEEN_ICAO_MAX])
     out[used] = '\0';
     return used > 0;
 }
+/* HOSTTEST:END icaonorm */
 
 static void NormalizeCallsign(const char *input, char out[SEEN_CALLSIGN_MAX])
 {
@@ -164,20 +193,128 @@ static int FindIndex(const char *icao24)
     return -1;
 }
 
-/* Pruning policy: least-recently-seen. The victim is the record with the
- * oldest lastSeen; unsynchronized records (lastSeen 0) are therefore the
- * first to go, then ties fall to the lower Seen Count, then the earlier slot.
+const char *SeenEvictionPolicy_Name(SeenEvictionPolicy p)
+{
+    switch (p) {
+    case SEEN_EVICT_FIFO: return "FIFO";
+    case SEEN_EVICT_REGISTERED_PREFERRED: return "Registered Preferred";
+    default: return "Unregistered Preferred";
+    }
+}
+
+const char *SeenEvictionPolicy_Token(SeenEvictionPolicy p)
+{
+    switch (p) {
+    case SEEN_EVICT_FIFO: return "fifo";
+    case SEEN_EVICT_REGISTERED_PREFERRED: return "reg";
+    default: return "unreg";
+    }
+}
+
+bool SeenEvictionPolicy_Parse(const char *token, SeenEvictionPolicy *out)
+{
+    if (!token || !out)
+        return false;
+    for (int p = 0; p < SEEN_EVICT_COUNT; p++) {
+        if (strcmp(token, SeenEvictionPolicy_Token((SeenEvictionPolicy)p)) == 0) {
+            *out = (SeenEvictionPolicy)p;
+            return true;
+        }
+    }
+    return false;
+}
+
+void SeenAircraft_SetEvictionPolicy(SeenEvictionPolicy p)
+{
+    if ((int)p >= 0 && (int)p < SEEN_EVICT_COUNT)
+        evictionPolicy = (int)p;
+}
+
+SeenEvictionPolicy SeenAircraft_GetEvictionPolicy(void)
+{
+    return (SeenEvictionPolicy)evictionPolicy;
+}
+
+/* a is a better LRU victim than b: older lastSeen (unsynchronized, 0, goes first), then lower Seen
+ * Count, then (by scan order) the earlier slot. */
+static bool LruBefore(const SeenRecord *a, const SeenRecord *b)
+{
+    return a->lastSeen < b->lastSeen || (a->lastSeen == b->lastSeen && a->seenCount < b->seenCount);
+}
+
+/* Pure least-recently-seen: used while LOADING a file (the rule sets may not be ready, and a bulk
+ * load must not classify thousands of records) and as the within-group order of the class policies.
  * Replacing in place keeps every other record's index stable. */
-static size_t PickEvictionVictim(void)
+static size_t PickLruVictim(void)
 {
     size_t victim = 0;
-    for (size_t i = 1; i < recordCount; i++) {
-        const SeenRecord *a = &records[i];
-        const SeenRecord *b = &records[victim];
-        if (a->lastSeen < b->lastSeen || (a->lastSeen == b->lastSeen && a->seenCount < b->seenCount))
+    for (size_t i = 1; i < recordCount; i++)
+        if (LruBefore(&records[i], &records[victim]))
             victim = i;
-    }
     return victim;
+}
+
+static bool RecordIsRegistered(size_t i)
+{
+    if (recordClass[i] == CLASS_UNKNOWN) {
+        SeenConfigInfo info;
+        SeenAircraft_Describe(&records[i], &info);
+        recordClass[i] = info.configured ? CLASS_REGISTERED : CLASS_UNREGISTERED;
+    }
+    return recordClass[i] == CLASS_REGISTERED;
+}
+
+/* Class policies: LRU among the records of the class that is evicted first; if that class is empty,
+ * LRU over everything. Caller holds seenLock (Describe takes the rules lock - the rules code never
+ * calls back into this module, so the order seenLock -> rulesLock cannot deadlock). */
+static size_t PickClassVictim(bool evictRegisteredFirst)
+{
+    uint32_t rev = CustomRules_Revision(); /* sampled before any lookup */
+    if (!classRevisionValid || classRevision != rev) {
+        memset(recordClass, 0, sizeof(recordClass));
+        classRevision = rev;
+        classRevisionValid = true;
+    }
+    size_t victim = 0;
+    bool haveVictim = false;
+    for (size_t i = 0; i < recordCount; i++) {
+        if (RecordIsRegistered(i) != evictRegisteredFirst)
+            continue;
+        if (!haveVictim || LruBefore(&records[i], &records[victim])) {
+            victim = i;
+            haveVictim = true;
+        }
+    }
+    return haveVictim ? victim : PickLruVictim();
+}
+
+/* FIFO: the oldest firstSeen (0 = unsynchronized counts as oldest). */
+static size_t PickFifoVictim(void)
+{
+    uint32_t oldest = records[0].firstSeen;
+    for (size_t i = 1; i < recordCount; i++)
+        if (records[i].firstSeen < oldest)
+            oldest = records[i].firstSeen;
+    size_t start = fifoCursor < recordCount ? fifoCursor : 0;
+    size_t victim = 0;
+    for (size_t k = 0; k < recordCount; k++) {
+        size_t i = (start + k) % recordCount;
+        if (records[i].firstSeen == oldest) {
+            victim = i;
+            break;
+        }
+    }
+    fifoCursor = (victim + 1) % recordCount;
+    return victim;
+}
+
+static size_t PickEvictionVictim(void)
+{
+    switch ((SeenEvictionPolicy)evictionPolicy) {
+    case SEEN_EVICT_FIFO: return PickFifoVictim();
+    case SEEN_EVICT_REGISTERED_PREFERRED: return PickClassVictim(false);
+    default: return PickClassVictim(true);
+    }
 }
 
 /* Returns a slot for a NEW record (evicting if the table is full). */
@@ -186,10 +323,13 @@ static SeenRecord *AllocateSlot(void)
     if (recordCount < SEEN_MAX_RECORDS) {
         if (!EnsureCapacity(recordCount + 1))
             return NULL;
+        recordClass[recordCount] = CLASS_UNKNOWN;
         return &records[recordCount++];
     }
     size_t victim = PickEvictionVictim();
-    ESP_LOGD(TAG, "History full (%u): pruning least-recently-seen %s", (unsigned)SEEN_MAX_RECORDS, records[victim].icao24);
+    ESP_LOGD(TAG, "History full (%u): evicting %s (policy %s)", (unsigned)SEEN_MAX_RECORDS, records[victim].icao24,
+             SeenEvictionPolicy_Name((SeenEvictionPolicy)evictionPolicy));
+    recordClass[victim] = CLASS_UNKNOWN; /* the slot is about to hold a different aircraft */
     return &records[victim];
 }
 
@@ -232,8 +372,11 @@ void SeenAircraft_Observe(const SeenObservation *obs, int64_t nowUtc)
             if (now > r->lastSeen)
                 r->lastSeen = now;
         }
-        if (callsign[0])
+        if (callsign[0]) {
+            if (memcmp(r->callsign, callsign, sizeof(r->callsign)) != 0)
+                recordClass[idx] = CLASS_UNKNOWN; /* the operator is derived from the call sign */
             memcpy(r->callsign, callsign, sizeof(r->callsign));
+        }
         if (opName[0]) {
             memcpy(r->operatorName, opName, sizeof(r->operatorName));
             r->operatorSource = obs->operatorSource;
@@ -269,7 +412,9 @@ void SeenAircraft_ObservePoll(const Aircraft *list, int count, int64_t nowUtc)
         count = MAX_AIRCRAFT;
     for (int i = 0; i < count; i++) {
         const Aircraft *a = &list[i];
-        if (!a->valid || !a->icao24[0])
+        /* A stale entry (visibility retention: no longer reported by the
+         * provider) is not a sighting and must not extend Seen. */
+        if (!a->valid || !a->icao24[0] || a->visState == AIRCRAFT_VIS_STALE)
             continue;
 
         SeenObservation obs;
@@ -320,8 +465,9 @@ void SeenAircraft_Describe(const SeenRecord *record, SeenConfigInfo *out)
     if (res.source == CRAFT_SRC_REGISTRY) {
         out->configured = true;
         snprintf(out->registryPrefix, sizeof(out->registryPrefix), "%s", res.registryPrefix);
+        snprintf(out->registryIcao24, sizeof(out->registryIcao24), "%s", res.registryIcao24);
         CustomRule rule;
-        if (CustomRules_Find(res.registryPrefix, &rule))
+        if (CustomRules_FindEntry(res.registryIcao24, res.registryPrefix, &rule))
             snprintf(out->registryNote, sizeof(out->registryNote), "%s", rule.notes);
     }
     char code[MAX_OPERATOR_CODE + 1] = "";
@@ -426,11 +572,12 @@ static void MergeLoaded(const SeenRecord *in)
     }
     if (recordCount >= SEEN_MAX_RECORDS) {
         /* File holds more than we keep: keep the most recently seen. */
-        size_t victim = PickEvictionVictim();
+        size_t victim = PickLruVictim();
         const SeenRecord *v = &records[victim];
         if (in->lastSeen < v->lastSeen || (in->lastSeen == v->lastSeen && in->seenCount <= v->seenCount))
             return; /* the incoming record is the least recent: drop it */
         records[victim] = *in;
+        recordClass[victim] = CLASS_UNKNOWN;
         return;
     }
     if (EnsureCapacity(recordCount + 1))
@@ -748,8 +895,10 @@ bool SeenAircraft_Flush(void)
     if (!seenLock)
         return false;
     xSemaphoreTake(seenLock, portMAX_DELAY);
+    uint32_t t0 = DiagTelemetry_NowMs();
     bool ok = WriteBinaryLocked();
     xSemaphoreGive(seenLock);
+    DiagTelemetry_OpEnd(DT_OP_SEEN_FLUSH, t0, ok, "SPIFFS write failed"); /* after the lock: logging never runs under seenLock */
     return ok;
 }
 
@@ -767,12 +916,15 @@ bool SeenAircraft_FlushIfDue(uint32_t nowMonotonicSec)
         due = (nowMonotonicSec - dirtySinceSec) >= (uint32_t)SEEN_FLUSH_INTERVAL_SEC;
     }
     bool wrote = false;
+    uint32_t t0 = due ? DiagTelemetry_NowMs() : 0;
     if (due) {
         wrote = WriteBinaryLocked();
         if (!wrote)
             dirtySinceSec = nowMonotonicSec; /* retry after another full interval */
     }
     xSemaphoreGive(seenLock);
+    if (due)
+        DiagTelemetry_OpEnd(DT_OP_SEEN_FLUSH, t0, wrote, "SPIFFS write failed");
     return wrote;
 }
 
@@ -837,6 +989,7 @@ void SeenAircraft_Deinit(void)
     dirtySinceSet = false;
     dirtySinceSec = 0;
     memset(recordDirty, 0, sizeof(recordDirty));
+    ResetClassCache(); /* the eviction policy itself is a setting and is kept */
     /* The mutex handle is left allocated on purpose: on the target the module
      * is initialized once and never torn down. */
 }
@@ -895,6 +1048,7 @@ void SeenAircraft_Clear(void)
     dirty = false;
     dirtySinceSet = false;
     memset(recordDirty, 0, sizeof(recordDirty));
+    ResetClassCache();
     remove(csvPath);
     remove(tmpPath);
     remove(SEEN_BIN_PATH);
@@ -917,8 +1071,24 @@ static bool ContainsNoCase(const char *hay, const char *needle)
     return false;
 }
 
-static bool MatchesSearch(const SeenRecord *r, const char *search, bool haveInfo, const SeenConfigInfo *info)
+/* 0.0.27 (pattern_match.h): plain text with field "Either" keeps the
+ * original any-field substring search below. Wildcards, Pattern mode or a
+ * specific field match the identifiers only. Seen stores no registration, so
+ * "Registration" means the matching registry rule's key (the registration you
+ * configured) or the call sign (where registrations are flown, e.g. N-numbers).
+ * Returns false when the registry info is needed but not supplied yet; the
+ * caller retries with it. */
+static bool MatchesSearch(const SeenRecord *r, const char *search, bool haveInfo, const SeenConfigInfo *info,
+                          SearchField field, PatternMode mode)
 {
+    const bool literalEither = field == SEARCH_FIELD_EITHER && mode == PATTERN_MODE_NORMAL && !Pattern_HasWildcards(search);
+    if (!literalEither) {
+        if (Pattern_Match(r->callsign, search, mode))
+            return true; /* call sign: matched by Call sign, Registration (flown as call sign) and Either */
+        if (field == SEARCH_FIELD_CALLSIGN)
+            return false;
+        return haveInfo && info->registryPrefix[0] && Pattern_Match(info->registryPrefix, search, mode);
+    }
     if (ContainsNoCase(r->icao24, search) || ContainsNoCase(r->callsign, search) ||
         ContainsNoCase(r->operatorName, search))
         return true;
@@ -996,10 +1166,12 @@ size_t SeenAircraft_Query(const SeenQuery *query, size_t offset, size_t limit,
                 continue;
         }
         if (search[0]) {
-            bool hit = MatchesSearch(r, search, haveInfo, &info);
-            if (!hit && !haveInfo) {
+            const SearchField field = (SearchField)query->searchField;
+            const PatternMode mode = (PatternMode)query->searchMode;
+            bool hit = MatchesSearch(r, search, haveInfo, &info, field, mode);
+            if (!hit && !haveInfo && !(field == SEARCH_FIELD_CALLSIGN)) {
                 SeenAircraft_Describe(r, &info);
-                hit = MatchesSearch(r, search, true, &info);
+                hit = MatchesSearch(r, search, true, &info, field, mode);
             }
             if (!hit)
                 continue;

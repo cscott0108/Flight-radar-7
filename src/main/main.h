@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 void UpdateSelectedAircraftUI(void);
 
@@ -69,6 +70,14 @@ void SetRadarDayNightSchedule(
 // console on each poll. Toggleable from the web UI and persisted to NVS,
 // so it can be flipped on to inspect what OpenSky actually sends without
 // reflashing.
+/* Automatic closest-aircraft selection (persisted in NVS radar/"autosel"). Must be
+ * called from a task that is NOT holding the LVGL lock: it takes the lock itself. */
+void SetRadarAutoSelect(bool enabled);
+
+/* Hot Seen eviction policy (SeenEvictionPolicy in seen_aircraft.h, passed as int). Persisted in NVS
+ * radar/"seenpol", applied to later evictions only; an unknown value is ignored. */
+void SetSeenEvictionPolicy(int policy);
+
 bool GetRadarOpenSkyDebugEnabled(void);
 void SetRadarOpenSkyDebugEnabled(bool enabled);
 
@@ -101,3 +110,8 @@ void SetRadarIdleDimSettings(
     bool enabled,
     uint32_t minutes,
     uint32_t percent);
+
+// Wi-Fi profiles (wifi_profiles.h). Asks the radio to join saved slot `slot`; applied on the LVGL timer.
+void WifiRequestConnect(int slot);
+// Current connection state for the WebUI: SSID being used, saved-slot index (-1 if unsaved/unknown).
+bool WifiGetStatus(char *ssid, size_t cap, int *slotOut);

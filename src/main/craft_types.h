@@ -48,7 +48,7 @@ typedef enum {
  * are pixels and the marker does not scale with radar range). */
 #define HELI_MARKER_DIAMETER_PX 18
 #define HELI_RING_WIDTH_PX 3         /* band drawn inside the 18 px circle */
-#define HELI_RING_RGB 0x707070       /* gray band; sets helicopters apart from airport dots */
+#define HELI_RING_RGB 0x707070       /* gray band; sets helicopters apart from location dots */
 
 /* Other marker geometry. sizePx mirrors the standard filled-triangle marker's
  * vertex-distance scale (see CraftType_Appearance) so it reads as a similar

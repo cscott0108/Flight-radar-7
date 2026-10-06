@@ -22,12 +22,15 @@
 #include "main.h"
 #include "radar.h"
 #include "aircraft_provider.h"
+#include "opensky_client.h"
 #include "web_rules.h"
 #include "web_airports.h"
 #include "web_diag.h"
 #include "web_history.h"
 #include "web_seen.h"
+#include "web_wifi.h"
 #include "seen_aircraft.h"
+#include "reboot_flush.h"
 #include "time_util.h"
 #include <time.h>
 
@@ -35,36 +38,49 @@ static const char *TAG = "WEBSERVER";
 static httpd_handle_t server_handle = NULL;
 
 #define OPENSKY_NAMESPACE "opensky"
-#define WIFI_NAMESPACE "wifi"
 
-// Seen Aircraft changes are normally written to flash in batches (see
-// SEEN_FLUSH_INTERVAL_SEC); write any pending ones before a deliberate reboot
-// so a Wi-Fi or credentials change never costs the last few minutes of history.
+// Seen Aircraft and TF History changes are normally written in batches (600 s);
+// write any pending ones before a deliberate reboot so a credentials change never
+// costs the last few minutes of history. Bounded (reboot_flush.h): the restart
+// always proceeds.
 static void FlushHistoryBeforeRestart(void)
 {
-    if (SeenAircraft_IsDirty())
-        SeenAircraft_Flush();
+    RebootFlush_BeforeRestart(NULL);
 }
 
 // Sends a small self-contained HTML page that shows `message` and then
 // auto-navigates back to the setup home page after `delaySeconds`. The
 // <meta refresh> tag does the actual navigation (works even with
 // JavaScript disabled); the script just keeps a visible countdown current.
+/* HOSTTEST:BEGIN redirect (extracted verbatim by host_tests/redirect_page_test.c) */
 static void SendRedirectPage(
     httpd_req_t *req,
     const char *message,
     int delaySeconds)
 {
-    char html[896];
+    // 0.0.29: streamed in three parts (head, message, tail) instead of being
+    // copied into one fixed 896-byte buffer, which silently truncated the page
+    // (losing the end of the message, the countdown and the closing tags) when
+    // every Radar Settings option was enabled. Same HTML as before; the two
+    // small buffers below hold only the fixed parts.
+    char head[384];
+    char tail[512];
 
-    snprintf(
-        html,
-        sizeof(html),
+    int headLen = snprintf(
+        head,
+        sizeof(head),
         "<!DOCTYPE html><html%s><head>"
         "<meta http-equiv='refresh' content='%d;url=/'>"
         "<style>body{font-family:sans-serif;text-align:center;margin-top:3em;}" WEBSTYLE_MINI_CSS "</style>"
         "</head><body>"
-        "<p>%s</p>"
+        "<p>",
+        WebStyle_HtmlAttr(),
+        delaySeconds);
+
+    int tailLen = snprintf(
+        tail,
+        sizeof(tail),
+        "</p>"
         "<p id='countdown'>Returning to the home page in %d seconds&hellip;</p>"
         "<script>"
         "let s=%d;"
@@ -76,31 +92,21 @@ static void SendRedirectPage(
         "},1000);"
         "</script>"
         "</body></html>",
-        WebStyle_HtmlAttr(),
-        delaySeconds,
-        message,
         delaySeconds,
         delaySeconds);
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, html);
+    if (headLen <= 0 || headLen >= (int)sizeof(head) || tailLen <= 0 || tailLen >= (int)sizeof(tail))
+    {
+        httpd_resp_sendstr(req, message); // cannot happen with these fixed parts; never send a cut page
+        return;
+    }
+    if (httpd_resp_send_chunk(req, head, headLen) == ESP_OK &&
+        httpd_resp_send_chunk(req, message, HTTPD_RESP_USE_STRLEN) == ESP_OK &&
+        httpd_resp_send_chunk(req, tail, tailLen) == ESP_OK)
+        httpd_resp_send_chunk(req, NULL, 0);
 }
-
-static bool SaveWifiSetup(const char *ssid, const char *password)
-{
-    nvs_handle_t handle;
-    if (nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
-        return false;
-
-    esp_err_t err = nvs_set_str(handle, "ssid", ssid);
-    if (err == ESP_OK)
-        err = nvs_set_str(handle, "pass", password);
-    if (err == ESP_OK)
-        err = nvs_commit(handle);
-
-    nvs_close(handle);
-    return err == ESP_OK;
-}
+/* HOSTTEST:END redirect */
 
 static void UrlDecode(char *value)
 {
@@ -153,39 +159,6 @@ static bool FormValue(const char *body, const char *name, char *value, size_t va
     return true;
 }
 
-static esp_err_t WifiSetupHandler(httpd_req_t *req)
-{
-    if (req->content_len <= 0 || req->content_len > 256)
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
-
-    char body[257];
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0)
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed");
-    body[received] = '\0';
-
-    char ssid[33];
-    char password[65];
-    if (!FormValue(body, "ssid", ssid, sizeof(ssid)) ||
-        !FormValue(body, "password", password, sizeof(password)) ||
-        ssid[0] == '\0')
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID and password required");
-
-    if (!SaveWifiSetup(ssid, password))
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save Wi-Fi settings");
-
-    SendRedirectPage(
-        req,
-        "Wi-Fi saved. The device is restarting and will join the new network. "
-        "If it joins a different network than this page is on, this redirect "
-        "won't reach it &mdash; check your router or the device's screen for its new address.",
-        30);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    FlushHistoryBeforeRestart();
-    esp_restart();
-    return ESP_OK;
-}
-
 static esp_err_t RadarSetupHandler(httpd_req_t *req)
 {
     // 768 (was 384): a fully populated form with the provider, diagnostics and
@@ -229,21 +202,67 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
     if (!rangeOk)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Range must be 25, 50, 75 or 100 km");
 
-    // Refresh interval is optional so older bookmarked forms still post.
-    char refreshText[24];
-    uint32_t refreshSeconds = GetRadarRefreshSeconds();
+    // 0.0.28: aircraft data providers - each enabled independently, each with
+    // its own interval (OpenSky 10-600 s, adsb.lol 5-600 s). Everything is
+    // validated here, before any setting is applied. An older form (no
+    // prov_form field) still posts "provider" + "refresh": that selects one
+    // provider and sets its interval, as before.
+    static const char *const kProvField[AIRCRAFT_PROVIDER_COUNT] = { "p_osky", "p_adsb" };
+    static const char *const kProvIntField[AIRCRAFT_PROVIDER_COUNT] = { "int_osky", "int_adsb" };
+    char provFormText[8];
+    const bool newProviderForm = FormValue(body, "prov_form", provFormText, sizeof(provFormText));
+    uint8_t providerMask = AircraftProvider_EnabledMask();
+    uint32_t providerInterval[AIRCRAFT_PROVIDER_COUNT];
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        providerInterval[p] = AircraftProvider_GetIntervalSeconds((AircraftProviderType)p);
 
-    if (FormValue(body, "refresh", refreshText, sizeof(refreshText)) &&
-        refreshText[0] != '\0')
+    if (newProviderForm)
     {
-        end = NULL;
-        long parsed = strtol(refreshText, &end, 10);
+        providerMask = 0;
+        for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        {
+            char flagText[8];
+            if (FormValue(body, kProvField[p], flagText, sizeof(flagText)) && !strcmp(flagText, "on"))
+                providerMask |= (uint8_t)(1u << p);
 
-        if (end == refreshText || parsed < 10 || parsed > 600)
+            char intervalText[24];
+            if (FormValue(body, kProvIntField[p], intervalText, sizeof(intervalText)) && intervalText[0] != '\0')
+            {
+                end = NULL;
+                long parsed = strtol(intervalText, &end, 10);
+                long lo = (long)AircraftProvider_MinIntervalSecondsFor((AircraftProviderType)p);
+                if (end == intervalText || *end != '\0' || parsed < lo || parsed > (long)PROVIDER_INTERVAL_MAX_SEC)
+                    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                               p == AIRCRAFT_PROVIDER_ADSBLOL ?
+                                               "adsb.lol interval must be between 5 and 600 seconds" :
+                                               "OpenSky interval must be between 10 and 600 seconds");
+                providerInterval[p] = (uint32_t)parsed;
+            }
+        }
+        if (!providerMask)
             return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                       "Refresh must be between 10 and 600 seconds");
+                                       "Enable at least one aircraft data provider");
+    }
+    else
+    {
+        char providerText[24];
+        AircraftProviderType providerType = AircraftProvider_GetActive();
+        if (FormValue(body, "provider", providerText, sizeof(providerText)) &&
+            AircraftProviderType_Parse(providerText, &providerType))
+            providerMask = (uint8_t)(1u << providerType);
 
-        refreshSeconds = (uint32_t)parsed;
+        char refreshText[24];
+        if (FormValue(body, "refresh", refreshText, sizeof(refreshText)) &&
+            refreshText[0] != '\0')
+        {
+            end = NULL;
+            long parsed = strtol(refreshText, &end, 10);
+            long lo = (long)AircraftProvider_MinIntervalSecondsFor(providerType);
+            if (end == refreshText || parsed < lo || parsed > 600)
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                           "Refresh interval is outside the provider's range (OpenSky 10-600 s, adsb.lol 5-600 s)");
+            providerInterval[providerType] = (uint32_t)parsed;
+        }
     }
 
     // Low-traffic settings are also optional, for the same reason.
@@ -458,24 +477,13 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
         idleDimPercent = (uint32_t)parsed;
     }
 
-    char providerText[24];
-    AircraftProviderType providerType;
-    if (FormValue(body, "provider", providerText, sizeof(providerText)) &&
-        AircraftProviderType_Parse(providerText, &providerType))
-    {
-        AircraftProvider_SetActive(providerType);
-    }
-
-    char providerDebugText[24];
-    ProviderDebugLevel debugLevel;
-    if (FormValue(body, "provider_debug", providerDebugText, sizeof(providerDebugText)) &&
-        ProviderDebugLevel_Parse(providerDebugText, &debugLevel))
-    {
-        AircraftProvider_SetDebugLevel(debugLevel);
-    }
+    // Each provider's interval is written only when it changed (its own NVS
+    // key); a disabled provider keeps its interval for later.
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        (void)AircraftProvider_SetIntervalSeconds((AircraftProviderType)p, providerInterval[p]);
+    (void)AircraftProvider_SetEnabledMask(providerMask);
 
     SetRadarSettings(latitude, longitude, range);
-    SetRadarRefreshSeconds(refreshSeconds);
     SetRadarLowTrafficThreshold(lowThreshold);
     SetRadarLowTrafficIntervalSeconds(lowInterval);
     SetRadarTimeZone(
@@ -496,8 +504,15 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
         idleDimEnabled,
         idleDimMinutes,
         idleDimPercent);
-    Radar_SetAutoSelectClosest(strstr(body, "auto_closest=on") != NULL);
-    SetRadarOpenSkyDebugEnabled(strstr(body, "opensky_debug=on") != NULL);
+    SetRadarAutoSelect(strstr(body, "auto_closest=on") != NULL);
+
+    // Hot Seen eviction policy: applied only when recognized and different from the current one.
+    char seenPolicyText[16];
+    SeenEvictionPolicy seenPolicy;
+    if (FormValue(body, "seen_policy", seenPolicyText, sizeof(seenPolicyText)) &&
+        SeenEvictionPolicy_Parse(seenPolicyText, &seenPolicy) &&
+        seenPolicy != SeenAircraft_GetEvictionPolicy())
+        SetSeenEvictionPolicy((int)seenPolicy);
 
     char response[700];
     int len = 0;
@@ -520,11 +535,14 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
             (unsigned long)GetRadarDayEndHour(),
             (unsigned long)GetRadarNightIntervalSeconds());
     }
-    else
+
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
     {
-        len += snprintf(response + len, sizeof(response) - len,
-            "Refresh interval: %lus. ",
-            (unsigned long)GetRadarRefreshSeconds());
+        if (AircraftProvider_IsEnabled((AircraftProviderType)p))
+            len += snprintf(response + len, sizeof(response) - len,
+                "%s %lus. ",
+                AircraftProviderType_Name((AircraftProviderType)p),
+                (unsigned long)AircraftProvider_GetIntervalSeconds((AircraftProviderType)p));
     }
 
     if (GetRadarDayNightBrightnessEnabled())
@@ -558,11 +576,7 @@ static esp_err_t RadarSetupHandler(httpd_req_t *req)
             "Low-traffic slowdown disabled. ");
     }
 
-    if (GetRadarOpenSkyDebugEnabled())
-    {
-        snprintf(response + len, sizeof(response) - len,
-            "OpenSky field debug logging is ON &mdash; check the serial console.");
-    }
+    (void)len;
 
     SendRedirectPage(req, response, 10);
     return ESP_OK;
@@ -950,29 +964,29 @@ static esp_err_t RootHandler(
     const char htmlFormatA[] =
         "<h2>Flight Radar Setup</h2>"
         "<p><a href='#features'>Features &amp; appearance</a> &middot; "
-        "<a href='/airports'>Add or Edit Airports</a> &middot; "
-        "<a href='/diag'>Runtime Capacity Report</a></p>"
+        "<a href='/airports'>Airports and Special Air Traffic</a> &middot; "
+        "<a href='/diag'>Diagnostics</a></p>"
         "<h3>Wi-Fi</h3>"
-        "<form method='POST' action='/wifi'>"
-        "<label>Network name <input name='ssid' maxlength='32'></label>"
-        "<label>Password <input name='password' type='password' maxlength='64'></label>"
-        "<button type='submit'>Save Wi-Fi</button>"
-        "</form>"
+        "<p>%s &middot; <a href='/wifi'>Manage saved networks</a></p>"
         "<h3>Radar Settings</h3>"
         "<form method='POST' action='/radar'>"
         "<fieldset><legend>Location &amp; range</legend>"
         "<label>Latitude <input name='latitude' type='number' step='any' min='-90' max='90' value='%s'></label>"
         "<label>Longitude <input name='longitude' type='number' step='any' min='-180' max='180' value='%s'></label>"
         "<label>Range <select name='range'>%s</select> km</label>"
-        "<label>Aircraft data refresh interval <input name='refresh' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
-        "<small>10-600 s. Values below 25 s risk exceeding OpenSky's 4000 requests/day API limit; the active provider's own safe minimum is enforced automatically either way.</small>"
         "</fieldset>"
-        "<fieldset><legend>Aircraft data provider</legend>"
-        "<label>Provider <select name='provider'>"
-        "<option value='OPENSKY'%s>OpenSky Network</option>"
-        "<option value='ADSBLOL'%s>adsb.lol</option>"
-        "</select></label>"
-        "<small>OpenSky needs the client credentials configured above/below; adsb.lol is a free community API and needs no credentials. Switching providers takes effect on the next poll.</small>"
+        "<fieldset><legend>Aircraft data providers</legend>"
+        "<input type='hidden' name='prov_form' value='1'>"
+        "<label><input type='checkbox' name='p_osky' id='p_osky' onchange='pv()'%s> OpenSky Network</label>"
+        "<label id='l_osky'%s>OpenSky interval <input name='int_osky' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
+        "<label><input type='checkbox' name='p_adsb' id='p_adsb' onchange='pv()'%s> adsb.lol</label>"
+        "<label id='l_adsb'%s>adsb.lol interval <input name='int_adsb' type='number' min='5' max='600' step='1' value='%lu'> seconds</label>"
+        "<small>Use one provider or both. Each polls on its own interval and keeps it when switched off. OpenSky: 10-600 s "
+        "(below 25 s risks its 4000 requests/day limit) and needs the client credentials configured below; adsb.lol: 5-600 s, "
+        "no credentials. With both, an aircraft reported by both is one aircraft (matched by ICAO24), and a failing provider "
+        "never stops the other. The quiet-traffic and day/night settings below can only lengthen these intervals.</small>"
+        "<script>function pv(){['osky','adsb'].forEach(function(k){document.getElementById('l_'+k).style.display="
+        "document.getElementById('p_'+k).checked?'':'none';});}</script>"
         "</fieldset>";
 
     // Second half of the page, sent after the (separately generated) Time
@@ -984,7 +998,7 @@ static esp_err_t RootHandler(
         "<input name='low_threshold' type='number' min='0' max='500' step='1' value='%lu'> "
         "aircraft are in range</label>"
         "<label>Slow interval <input name='low_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
-        "<small>Set the threshold to 0 to disable this.</small>"
+        "<small>Set the threshold to 0 to disable this. Never makes a provider poll faster than its own interval.</small>"
         "</details>"
         "<details><summary>Day/night polling schedule</summary>"
         "<label><input name='daynight_enabled' type='checkbox'%s> Enable day/night schedule</label>"
@@ -992,7 +1006,7 @@ static esp_err_t RootHandler(
         "<label>Day ends at <input name='day_end' type='number' min='0' max='23' step='1' value='%lu'>:00 local</label>"
         "<label>Interval during the day <input name='day_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
         "<label>Interval overnight <input name='night_interval' type='number' min='10' max='600' step='1' value='%lu'> seconds</label>"
-        "<small>When enabled, this replaces the refresh interval above during those hours, in the time zone (and daylight saving setting) chosen above. Requires the device's clock to be synced over the network, which happens automatically once online; falls back to the day interval until then.</small>"
+        "<small>When enabled, each provider polls at its own interval or this one, whichever is longer, during those hours (it never makes a provider poll faster), in the time zone (and daylight saving setting) chosen above. Requires the device's clock to be synced over the network, which happens automatically once online; falls back to the day interval until then.</small>"
         "</details>"
         "<details><summary>Day/night brightness</summary>"
         "<label><input name='daynight_brightness_enabled' type='checkbox'%s> Enable day/night brightness</label>"
@@ -1008,17 +1022,15 @@ static esp_err_t RootHandler(
         "<small>Overrides the day/night brightness and the manual slider while idle; restores immediately once an aircraft reappears. 0%% turns the backlight fully off.</small>"
         "</details>"
         "<label><input name='auto_closest' type='checkbox'%s> Automatically select closest aircraft</label>"
-        "<details><summary>Debugging</summary>"
-        "<label><input name='opensky_debug' type='checkbox'%s> Log raw OpenSky fields for the selected aircraft</label>"
-        "<small>Dumps every field OpenSky's API returns (by index) for the Selected Craft aircraft to the serial console on each poll. Turn this on to see what's available before wiring a new field into the Selected Craft panel, then turn it back off &mdash; no reflash needed either way.</small>"
-        "<label>Provider diagnostics <select name='provider_debug'>"
-        "<option value='OFF'%s>Off</option>"
-        "<option value='NORMAL'%s>Normal</option>"
-        "<option value='VERBOSE'%s>Verbose</option>"
-        "<option value='RAW'%s>Raw</option>"
+        "<small>Chooses by importance first (Important, then Interesting, then the rest), then by how close to the "
+        "radar center. Equally ranked aircraft take turns every 10 seconds; Prev/Next holds your choice for 30 seconds.</small>"
+        "<label>Seen history, when full, drops <select name='seen_policy'>"
+        "<option value='unreg'%s>registered aircraft first (Unregistered Preferred)</option>"
+        "<option value='fifo'%s>the oldest entry first (FIFO)</option>"
+        "<option value='reg'%s>unregistered aircraft first (Registered Preferred)</option>"
         "</select></label>"
-        "<small>Off: nothing logged. Normal: request/response status and aircraft counts for the active provider. Verbose: adds per-aircraft Aircraft Type resolution (provider category, hint, registry override, final result). Raw: adds a bounded, credential-redacted preview of the raw response body. Applies to whichever provider is selected above.</small>"
-        "</details>"
+        "<small>Applies to later evictions only; nothing is purged now. Registered = covered by a Registered Aircraft "
+        "rule or an Operator.</small>"
         "<button type='submit'>Save settings</button>"
         "</form>"
         "<h2>Display</h2>"
@@ -1041,7 +1053,7 @@ static esp_err_t RootHandler(
         "}"
         "</script>"
         "<h2>OpenSky Credentials</h2>"
-        "<p>Select credentials.json</p>"
+        "<p>Status: %s. Select credentials.json</p>"
         "<form method='POST' "
         "action='/upload' "
         "enctype='application/octet-stream'>"
@@ -1128,27 +1140,34 @@ static esp_err_t RootHandler(
     }
 
     // Part A: up to and including the provider fieldset.
+    char wifiStatus[160 + 32 * 6];
+    WebWifi_StatusLine(wifiStatus, sizeof(wifiStatus));
+
     int lengthA = snprintf(
         html,
         8192,
         htmlFormatA,
+        wifiStatus,
         latStr,
         lonStr,
         rangeOpts,
-        (unsigned long)GetRadarRefreshSeconds(),
-        (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_OPENSKY) ? " selected" : "",
-        (AircraftProvider_GetActive() == AIRCRAFT_PROVIDER_ADSBLOL) ? " selected" : "");
+        AircraftProvider_IsEnabled(AIRCRAFT_PROVIDER_OPENSKY) ? " checked" : "",
+        AircraftProvider_IsEnabled(AIRCRAFT_PROVIDER_OPENSKY) ? "" : " style='display:none'",
+        (unsigned long)AircraftProvider_GetIntervalSeconds(AIRCRAFT_PROVIDER_OPENSKY),
+        AircraftProvider_IsEnabled(AIRCRAFT_PROVIDER_ADSBLOL) ? " checked" : "",
+        AircraftProvider_IsEnabled(AIRCRAFT_PROVIDER_ADSBLOL) ? "" : " style='display:none'",
+        (unsigned long)AircraftProvider_GetIntervalSeconds(AIRCRAFT_PROVIDER_ADSBLOL));
 
     esp_err_t err = ESP_FAIL;
 
     // Shared head (CSS variables, dark mode class, nav bar) is streamed from
     // constants; the page-specific rules below are the setup form's old layout.
     static const char setupCss[] =
-        "body{max-width:640px;margin:0 auto;padding:1em}h3{margin-top:0}"
-        "label{display:block;margin:0.6em 0}"
+        "body{max-width:720px;margin:.4em auto;padding:0 .8em}h2{margin-top:.4em}h3{margin:.8em 0 .3em}"
+        "label{display:block;margin:.35em 0}"
         "input[type=number],input[type=text],input[type=password]{width:130px}"
-        "small{display:block;margin:2px 0 10px 0}"
-        "button{margin:0.8em 0;padding:6px 16px}";
+        "small{display:block;margin:1px 0 6px 0}"
+        "button{margin:.5em 0;padding:4px 14px}";
 
     if (lengthA > 0 && lengthA < 8192 &&
         WebStyle_SendHead(req, "Flight Radar Setup", WEBPAGE_SETUP, setupCss) == ESP_OK &&
@@ -1174,13 +1193,12 @@ static esp_err_t RootHandler(
             (unsigned long)GetRadarIdleDimMinutes(),
             (unsigned long)GetRadarIdleDimPercent(),
             Radar_GetAutoSelectClosest() ? " checked" : "",
-            GetRadarOpenSkyDebugEnabled() ? " checked" : "",
-            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_OFF) ? " selected" : "",
-            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_NORMAL) ? " selected" : "",
-            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_VERBOSE) ? " selected" : "",
-            (AircraftProvider_GetDebugLevel() == PROVIDER_DEBUG_RAW) ? " selected" : "",
+            (SeenAircraft_GetEvictionPolicy() == SEEN_EVICT_UNREGISTERED_PREFERRED) ? " selected" : "",
+            (SeenAircraft_GetEvictionPolicy() == SEEN_EVICT_FIFO) ? " selected" : "",
+            (SeenAircraft_GetEvictionPolicy() == SEEN_EVICT_REGISTERED_PREFERRED) ? " selected" : "",
             (unsigned long)GetRadarBrightness(),
-            (unsigned long)GetRadarBrightness());
+            (unsigned long)GetRadarBrightness(),
+            OpenSky_HasCredentials() ? "Configured (the secret is never shown)" : "Not configured");
 
         if (lengthB > 0 && lengthB < 8192 &&
             httpd_resp_send_chunk(req, html, lengthB) == ESP_OK &&
@@ -1225,6 +1243,9 @@ esp_err_t StartWebServer(void)
     // entry of heap.
     // Now 30: the above plus /current, /registered, /operators (web_rules.c)
     // and POST /features (web_style.c). 36 leaves headroom.
+    // Wi-Fi profiles replaced the single POST /wifi with GET+POST /wifi (web_wifi.c): net +1.
+    // 0.0.25: POST /airports/override (web_airports.c): +1.
+    // 0.0.26: POST /airports/visibility (web_airports.c): +1 (34 of 36).
     config.max_uri_handlers = 36;
 
     if (httpd_start(
@@ -1257,13 +1278,6 @@ esp_err_t StartWebServer(void)
             .handler = UploadHandler,
             .user_ctx = NULL};
 
-    httpd_uri_t wifi_uri =
-        {
-            .uri = "/wifi",
-            .method = HTTP_POST,
-            .handler = WifiSetupHandler,
-            .user_ctx = NULL};
-
     httpd_uri_t radar_uri =
         {
             .uri = "/radar",
@@ -1293,7 +1307,6 @@ esp_err_t StartWebServer(void)
     // some routes silently missing.
     esp_err_t err = httpd_register_uri_handler(server_handle, &root_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &upload_uri);
-    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &wifi_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &radar_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &delete_credentials_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &brightness_uri);
@@ -1309,6 +1322,13 @@ esp_err_t StartWebServer(void)
     if (WebRules_Register(server_handle) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to register rules routes");
+        httpd_stop(server_handle);
+        server_handle = NULL;
+        return ESP_FAIL;
+    }
+    if (WebWifi_Register(server_handle) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register Wi-Fi routes");
         httpd_stop(server_handle);
         server_handle = NULL;
         return ESP_FAIL;

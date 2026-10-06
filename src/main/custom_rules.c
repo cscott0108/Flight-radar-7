@@ -11,6 +11,10 @@
 #include "esp_spiffs.h"
 #include "feature_flags.h"
 #include "esp_log.h"
+#include "seen_aircraft.h" /* SeenAircraft_NormalizeIcao: the one ICAO24 normalizer, reused */
+
+_Static_assert(SEEN_ICAO_MAX == MAX_RULE_ICAO24 + 1,
+               "registry ICAO24 width must match the shared Seen/History ICAO24 key");
 
 static const char *TAG = "CustomRules";
 
@@ -136,6 +140,15 @@ static size_t opCount = 0;
 static size_t opCapacity = 0;
 
 static SemaphoreHandle_t rulesLock;
+/* Bumped (under rulesLock, before any change is applied) by every operation that can alter the rule
+ * sets; read lock-free through CustomRules_Revision(). A reader samples it BEFORE it looks anything
+ * up, so a lookup can only ever be newer than the revision it is filed under. */
+static volatile uint32_t rulesRevision;
+
+uint32_t CustomRules_Revision(void)
+{
+    return rulesRevision;
+}
 static bool spiffsMounted = false;
 
 /* ---- helpers ---- */
@@ -160,6 +173,57 @@ bool CustomRules_NormalizePrefix(const char *input, char out[MAX_RULE_PREFIX + 1
     }
     out[length] = '\0';
     return true;
+}
+
+bool CustomRules_NormalizeIcao24(const char *input, char out[MAX_RULE_ICAO24 + 1])
+{
+    if (!out)
+        return false;
+    out[0] = '\0';
+    if (!input)
+        return true;
+    const char *p = input;
+    while (*p == ' ')
+        p++;
+    if (*p == '\0')
+        return true; /* optional field left blank */
+    /* Reject inner/trailing junk the shared normalizer would silently drop
+     * (it stops at the first space): "AB CD" must not become "AB". */
+    size_t n = strlen(p);
+    while (n > 0 && p[n - 1] == ' ')
+        n--;
+    for (size_t i = 0; i < n; i++)
+        if (p[i] == ' ')
+            return false;
+    return SeenAircraft_NormalizeIcao(p, out);
+}
+
+void CustomRules_EntryLabel(const char *icao24, const char *prefix, char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    const bool hasIcao = icao24 && icao24[0], hasPrefix = prefix && prefix[0];
+    if (hasIcao && hasPrefix)
+        snprintf(out, cap, "%s (ICAO24 %s)", prefix, icao24);
+    else if (hasIcao)
+        snprintf(out, cap, "ICAO24 %s", icao24);
+    else
+        snprintf(out, cap, "%s", hasPrefix ? prefix : "");
+}
+
+/* Normalizes an entry key. Each part is optional, but not both. */
+static bool NormalizeEntryKey(const char *icaoIn, const char *prefixIn,
+                              char icao[MAX_RULE_ICAO24 + 1], char prefix[MAX_RULE_PREFIX + 1])
+{
+    prefix[0] = '\0';
+    if (!CustomRules_NormalizeIcao24(icaoIn, icao))
+        return false;
+    const char *p = prefixIn ? prefixIn : "";
+    while (*p == ' ')
+        p++;
+    if (*p && !CustomRules_NormalizePrefix(p, prefix))
+        return false;
+    return icao[0] != '\0' || prefix[0] != '\0';
 }
 
 bool Operators_NormalizeCode(const char *input, char out[MAX_OPERATOR_CODE + 1])
@@ -313,23 +377,26 @@ static bool EnsureRulesCapacity(size_t needed)
     return true;
 }
 
-static int FindRule(const char *prefix)
+/* An entry is identified by its (icao24, prefix) pair; both already normalized. */
+static int FindRule(const char *icao24, const char *prefix)
 {
     for (size_t i = 0; i < rulesCount; i++)
-        if (!strcmp(rules[i].prefix, prefix))
+        if (!strcmp(rules[i].prefix, prefix) && !strcmp(rules[i].icao24, icao24))
             return (int)i;
     return -1;
 }
 
 /* In-memory upsert without saving. notes may be NULL (treated as empty). */
-static bool UpsertRule(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes)
+static bool UpsertRule(const char *icao24, const char *prefix, CraftType type, AircraftType aircraftType,
+                       const char *notes)
 {
-    int i = FindRule(prefix);
+    int i = FindRule(icao24, prefix);
     if (i < 0) {
         if (!EnsureRulesCapacity(rulesCount + 1))
             return false;
         i = (int)rulesCount++;
         strcpy(rules[i].prefix, prefix);
+        strcpy(rules[i].icao24, icao24);
     }
     rules[i].type = type;
     rules[i].aircraftType = aircraftType;
@@ -345,8 +412,8 @@ static bool UpsertRule(const char *prefix, CraftType type, AircraftType aircraft
 static void SeedMissingRegistryDefaults(void)
 {
     for (size_t i = 0; i < sizeof(seedRegistry) / sizeof(seedRegistry[0]); i++) {
-        if (FindRule(seedRegistry[i].prefix) < 0)
-            UpsertRule(seedRegistry[i].prefix, seedRegistry[i].type, AIRCRAFT_FIXED_WING,
+        if (FindRule("", seedRegistry[i].prefix) < 0)
+            UpsertRule("", seedRegistry[i].prefix, seedRegistry[i].type, AIRCRAFT_FIXED_WING,
                        seedRegistry[i].notes);
     }
 }
@@ -361,7 +428,9 @@ static bool SaveRulesToCsv(void)
 
     fprintf(f, "#FORMAT=%d\n", CUSTOM_RULES_FORMAT_VERSION);
     fprintf(f, "# Flight Radar registry rules (aircraft-specific craft types).\n");
-    fprintf(f, "# One rule per line: PREFIX,TYPE,AIRCRAFT,NOTES\n");
+    fprintf(f, "# One rule per line: PREFIX,TYPE,AIRCRAFT,NOTES,ICAO24\n");
+    fprintf(f, "# ICAO24 is optional (hex address, e.g. A1B2C3). PREFIX may be blank when ICAO24 is set.\n");
+    fprintf(f, "# ICAO24 only: matches that aircraft whatever its call sign. ICAO24 + PREFIX: both must match.\n");
     fprintf(f, "# TYPE is one of PERSONAL, PRIVATE, BUSINESS, COMMERCIAL, CARGO, MILITARY (MIL),\n");
     fprintf(f, "# POLICE (LEO), EMERGENCY (ES), INTERESTING (INT), IMPORTANT.\n");
     fprintf(f, "# AIRCRAFT is FIXED, HELI or OTHER (manual designation; optional, a missing value means FIXED).\n");
@@ -372,8 +441,8 @@ static bool SaveRulesToCsv(void)
     fprintf(f, "# where PRIVATE meant PERSONAL; a #FORMAT=2 file loads with every rule's notes empty.\n");
 
     for (size_t i = 0; i < rulesCount; i++)
-        fprintf(f, "%s,%s,%s,%s\n", rules[i].prefix, CraftType_CsvName(rules[i].type),
-                AircraftType_CsvName(rules[i].aircraftType), rules[i].notes);
+        fprintf(f, "%s,%s,%s,%s,%s\n", rules[i].prefix, CraftType_CsvName(rules[i].type),
+                AircraftType_CsvName(rules[i].aircraftType), rules[i].notes, rules[i].icao24);
 
     fclose(f);
     return true;
@@ -386,19 +455,29 @@ static bool SaveRulesToCsv(void)
  * already use post-format-2 semantics. */
 #define CUSTOM_RULES_LEGACY_PRIVATE_BEFORE_VERSION 2
 
+/* Seed defaults were backfilled into files older than format 3 (the format
+ * that introduced the VIP/special-mission rows). Also a fixed historical
+ * cutoff: the format-3 -> 4 (ICAO24 column) migration must not re-add seed
+ * rows a user has deliberately deleted. */
+#define CUSTOM_RULES_SEED_BACKFILL_BEFORE_VERSION 3
+
 /* Loads rules[] fresh. Malformed lines are skipped (not fatal). Returns true
  * if the file needs rewriting to the current format (older than it, in any
  * respect - not just the legacy-PRIVATE cutoff above). */
-static bool LoadRulesFromCsv(void)
+static bool LoadRulesFromCsv(int *versionOut)
 {
     rulesCount = 0;
+    *versionOut = CUSTOM_RULES_FORMAT_VERSION;
 
     FILE *f = fopen(CUSTOM_RULES_CSV_PATH, "r");
     if (!f)
         return false;
 
     int version = 1;
-    char line[128];
+    /* Longest valid row: 15 prefix + 11 type + 5 aircraft + 96 notes + 8 ICAO24
+     * + 4 commas = 139 characters (was 128, which could cut a maximal format-3
+     * row's notes). */
+    char line[192];
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
         char *trimmed = TrimInPlace(line);
@@ -418,10 +497,13 @@ static bool LoadRulesFromCsv(void)
          * Fixed-Wing (older files); an unrecognized value also falls back to
          * Fixed-Wing so a typo cannot delete the classification.
          * Optional fourth column (format 3+): free-text notes. A missing or
-         * invalid value falls back to empty rather than dropping the rule. */
+         * invalid value falls back to empty rather than dropping the rule.
+         * Optional fifth column (format 4+): ICAO24. An invalid value drops the
+         * row (keeping it as callsign-only would silently widen what it matches). */
         char *typeField = comma + 1;
         AircraftType aircraftType = AIRCRAFT_FIXED_WING;
         char notesField[MAX_RULE_NOTES + 1] = "";
+        char icaoField[MAX_RULE_ICAO24 + 1] = "";
         char *second = strchr(typeField, ',');
         if (second) {
             *second = '\0';
@@ -429,7 +511,16 @@ static bool LoadRulesFromCsv(void)
             char *third = strchr(aircraftField, ',');
             if (third) {
                 *third = '\0';
-                if (!CustomRules_NormalizeNotes(TrimInPlace(third + 1), notesField)) {
+                char *notesText = third + 1;
+                char *fourth = strchr(notesText, ',');
+                if (fourth) {
+                    *fourth = '\0';
+                    if (!CustomRules_NormalizeIcao24(TrimInPlace(fourth + 1), icaoField)) {
+                        ESP_LOGW(TAG, "Invalid ICAO24 on rule '%s'; skipping it", trimmed);
+                        continue;
+                    }
+                }
+                if (!CustomRules_NormalizeNotes(TrimInPlace(notesText), notesField)) {
                     notesField[0] = '\0';
                     ESP_LOGW(TAG, "Invalid notes on rule '%s'; leaving blank", trimmed);
                 }
@@ -441,15 +532,17 @@ static bool LoadRulesFromCsv(void)
         }
 
         char normalizedPrefix[MAX_RULE_PREFIX + 1];
+        char normalizedIcao[MAX_RULE_ICAO24 + 1];
         CraftType type;
-        if (!CustomRules_NormalizePrefix(TrimInPlace(trimmed), normalizedPrefix) ||
+        if (!NormalizeEntryKey(icaoField, TrimInPlace(trimmed), normalizedIcao, normalizedPrefix) ||
             !CraftType_Parse(TrimInPlace(typeField), version < CUSTOM_RULES_LEGACY_PRIVATE_BEFORE_VERSION, &type))
             continue;
 
-        if (!UpsertRule(normalizedPrefix, type, aircraftType, notesField))
+        if (!UpsertRule(normalizedIcao, normalizedPrefix, type, aircraftType, notesField))
             break;
     }
     fclose(f);
+    *versionOut = version;
     return version < CUSTOM_RULES_FORMAT_VERSION;
 }
 
@@ -605,19 +698,21 @@ static void ImportLegacyCommercialCodes(void)
 
 static void LoadAllLocked(bool isInit)
 {
+    int fileVersion = CUSTOM_RULES_FORMAT_VERSION;
+    rulesRevision++;
     /* Registry */
     if (!FileExists(CUSTOM_RULES_CSV_PATH)) {
         rulesCount = 0;
         SeedMissingRegistryDefaults();
         SaveRulesToCsv();
         ESP_LOGI(TAG, "No registry file; seeded %u default registry entries", (unsigned)rulesCount);
-    } else if (LoadRulesFromCsv()) {
+    } else if (LoadRulesFromCsv(&fileVersion)) {
         /* Legacy/older-format file. On the device's first boot with this
          * firmware, backfill any seed defaults still missing (this is the
          * same mechanism that has always (re-)added PFT144; it now also
          * covers the new VIP/special-mission prefixes) without touching
          * anything the user already has. */
-        if (isInit)
+        if (isInit && fileVersion < CUSTOM_RULES_SEED_BACKFILL_BEFORE_VERSION)
             SeedMissingRegistryDefaults();
         SaveRulesToCsv();
         ESP_LOGI(TAG, "Migrated registry file to format %d", CUSTOM_RULES_FORMAT_VERSION);
@@ -695,33 +790,59 @@ bool CustomRules_Get(size_t index, CustomRule *out)
 bool CustomRules_Find(const char *prefix, CustomRule *out)
 {
     char normalized[MAX_RULE_PREFIX + 1];
-    if (!rulesLock || !out || !CustomRules_NormalizePrefix(prefix, normalized))
+    if (!CustomRules_NormalizePrefix(prefix, normalized))
+        return false;
+    return CustomRules_FindEntry("", normalized, out);
+}
+
+bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes)
+{
+    char normalized[MAX_RULE_PREFIX + 1];
+    if (!CustomRules_NormalizePrefix(prefix, normalized))
+        return false;
+    return CustomRules_AddEntry("", normalized, type, aircraftType, notes);
+}
+
+bool CustomRules_Delete(const char *prefix)
+{
+    char normalized[MAX_RULE_PREFIX + 1];
+    if (!CustomRules_NormalizePrefix(prefix, normalized))
+        return false;
+    return CustomRules_DeleteEntry("", normalized);
+}
+
+bool CustomRules_FindEntry(const char *icao24, const char *prefix, CustomRule *out)
+{
+    char normalized[MAX_RULE_PREFIX + 1], icao[MAX_RULE_ICAO24 + 1];
+    if (!rulesLock || !out || !NormalizeEntryKey(icao24, prefix, icao, normalized))
         return false;
     xSemaphoreTake(rulesLock, portMAX_DELAY);
-    int i = FindRule(normalized);
+    int i = FindRule(icao, normalized);
     if (i >= 0)
         *out = rules[i];
     xSemaphoreGive(rulesLock);
     return i >= 0;
 }
 
-bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes)
+bool CustomRules_AddEntry(const char *icao24, const char *prefix, CraftType type,
+                          AircraftType aircraftType, const char *notes)
 {
-    char normalized[MAX_RULE_PREFIX + 1];
+    char normalized[MAX_RULE_PREFIX + 1], icao[MAX_RULE_ICAO24 + 1];
     char normalizedNotes[MAX_RULE_NOTES + 1];
-    if (!rulesLock || !CustomRules_NormalizePrefix(prefix, normalized) || !CraftType_IsValid((int)type) ||
+    if (!rulesLock || !NormalizeEntryKey(icao24, prefix, icao, normalized) || !CraftType_IsValid((int)type) ||
         !AircraftType_IsValid((int)aircraftType) || !CustomRules_NormalizeNotes(notes, normalizedNotes))
         return false;
 
     xSemaphoreTake(rulesLock, portMAX_DELAY);
+    rulesRevision++;
 
-    int i = FindRule(normalized);
+    int i = FindRule(icao, normalized);
     bool isNew = (i < 0);
     CustomRule previous = {0};
     if (!isNew)
         previous = rules[i];
 
-    if (!UpsertRule(normalized, type, aircraftType, normalizedNotes)) {
+    if (!UpsertRule(icao, normalized, type, aircraftType, normalizedNotes)) {
         xSemaphoreGive(rulesLock);
         return false;
     }
@@ -740,15 +861,16 @@ bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftTy
     return saved;
 }
 
-bool CustomRules_Delete(const char *prefix)
+bool CustomRules_DeleteEntry(const char *icao24, const char *prefix)
 {
-    char normalized[MAX_RULE_PREFIX + 1];
-    if (!rulesLock || !CustomRules_NormalizePrefix(prefix, normalized))
+    char normalized[MAX_RULE_PREFIX + 1], icao[MAX_RULE_ICAO24 + 1];
+    if (!rulesLock || !NormalizeEntryKey(icao24, prefix, icao, normalized))
         return false;
 
     xSemaphoreTake(rulesLock, portMAX_DELAY);
+    rulesRevision++;
 
-    int found = FindRule(normalized);
+    int found = FindRule(icao, normalized);
     if (found < 0) {
         xSemaphoreGive(rulesLock);
         return false;
@@ -881,6 +1003,7 @@ bool Operators_Set(const char *code, const char *name, CraftType type)
         return false;
 
     xSemaphoreTake(rulesLock, portMAX_DELAY);
+    rulesRevision++;
 
     int b = BuiltinFind(c);
     int r = FindRow(c);
@@ -925,6 +1048,7 @@ bool Operators_RestoreDefault(const char *code)
         return false;
 
     xSemaphoreTake(rulesLock, portMAX_DELAY);
+    rulesRevision++;
     int r = FindRow(c);
     if (r < 0) {
         xSemaphoreGive(rulesLock);
@@ -946,6 +1070,7 @@ bool Operators_DeleteCustom(const char *code)
         return false;
 
     xSemaphoreTake(rulesLock, portMAX_DELAY);
+    rulesRevision++;
     int r = FindRow(c);
     if (r < 0) {
         xSemaphoreGive(rulesLock);
@@ -1011,33 +1136,54 @@ const char *AircraftTypeSource_Name(AircraftTypeSource source)
  * next stage (ultimately Personal). Data is never touched. */
 CraftResolution ResolveAircraftOpts(const char *callsign, const char *hex, bool useRegistry, bool useOperators)
 {
-    (void)hex; /* Reserved for future ICAO address rules. */
     CraftResolution result = {.type = CRAFT_PERSONAL, .aircraftType = AIRCRAFT_FIXED_WING,
                               .aircraftTypeSource = ATYPE_SRC_DEFAULT,
-                              .source = CRAFT_SRC_FALLBACK, .operatorCode = "", .registryPrefix = ""};
+                              .source = CRAFT_SRC_FALLBACK, .operatorCode = "", .registryPrefix = "",
+                              .registryIcao24 = ""};
     if (!callsign)
         callsign = "";
     while (*callsign == ' ')
         callsign++;
 
-    /* 1. Registry: longest matching rule wins. */
+    /* 1. Registry. The aircraft's ICAO24 is used only as an identifier to
+     *    find a configured entry; the result always comes from that entry.
+     *    Tiers (most specific wins): 3 = ICAO24 + call sign, 2 = ICAO24 only,
+     *    1 = call sign only. Within a tier the longest call-sign pattern wins
+     *    (tier 1 is exactly the previous callsign-only behaviour). */
     size_t longest = 0;
+    int bestTier = 0;
     if (useRegistry && rulesLock) {
+        char icao[MAX_RULE_ICAO24 + 1] = "";
+        if (!SeenAircraft_NormalizeIcao(hex, icao))
+            icao[0] = '\0'; /* blank/invalid: ICAO24 entries cannot match */
         xSemaphoreTake(rulesLock, portMAX_DELAY);
         for (size_t i = 0; i < rulesCount; i++) {
-            size_t length = strlen(rules[i].prefix);
-            if (length > longest && MatchesRulePattern(callsign, rules[i].prefix)) {
-                result.type = rules[i].type;
-                result.aircraftType = rules[i].aircraftType;
-                result.aircraftTypeSource = ATYPE_SRC_REGISTRY;
-                result.source = CRAFT_SRC_REGISTRY;
-                strcpy(result.registryPrefix, rules[i].prefix);
-                longest = length;
+            const CustomRule *r = &rules[i];
+            int tier;
+            if (r->icao24[0]) {
+                if (!icao[0] || strcmp(r->icao24, icao) != 0)
+                    continue;
+                tier = r->prefix[0] ? 3 : 2;
+            } else {
+                tier = 1;
             }
+            size_t length = strlen(r->prefix);
+            if (length && !MatchesRulePattern(callsign, r->prefix))
+                continue;
+            if (tier < bestTier || (tier == bestTier && length <= longest))
+                continue;
+            result.type = r->type;
+            result.aircraftType = r->aircraftType;
+            result.aircraftTypeSource = ATYPE_SRC_REGISTRY;
+            result.source = CRAFT_SRC_REGISTRY;
+            strcpy(result.registryPrefix, r->prefix);
+            strcpy(result.registryIcao24, r->icao24);
+            bestTier = tier;
+            longest = length;
         }
         xSemaphoreGive(rulesLock);
     }
-    if (longest)
+    if (bestTier)
         return result;
 
     /* 2. Long-standing built-in military/police/EMS prefixes. */

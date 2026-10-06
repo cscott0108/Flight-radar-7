@@ -76,10 +76,12 @@
  * 937-1000/1000 in normal use; revisit with real week-long field data if
  * 7 days specifically still matters. */
 #define SEEN_MAX_RECORDS 3000
+#ifndef SEEN_CSV_PATH /* the SEEN_*_PATH macros are overridable so host tests can use a temp directory */
 #define SEEN_CSV_PATH "/spiffs/seen_aircraft.csv"       /* legacy format, read once for migration only */
 #define SEEN_CSV_TMP_PATH "/spiffs/seen_aircraft.tmp"   /* legacy temp-swap recovery path, same purpose */
 #define SEEN_BIN_PATH "/spiffs/seen_aircraft.dat"       /* current format: fixed-size header + slots */
 #define SEEN_BIN_TMP_PATH "/spiffs/seen_aircraft.dat.tmp" /* used only for the rare full rewrite */
+#endif
 #define SEEN_FORMAT_VERSION 1 /* legacy CSV format tag; kept only as documentation of the migrated-from format */
 #define SEEN_BIN_FORMAT_VERSION 1
 
@@ -140,7 +142,8 @@ typedef struct {
 typedef struct {
     bool configured; /* a registry rule OR an operator entry covers this aircraft */
     CraftSource source;
-    char registryPrefix[MAX_RULE_PREFIX + 1]; /* set when source == CRAFT_SRC_REGISTRY */
+    char registryPrefix[MAX_RULE_PREFIX + 1]; /* set when source == CRAFT_SRC_REGISTRY ("" for an ICAO24-only rule) */
+    char registryIcao24[MAX_RULE_ICAO24 + 1]; /* matched rule's ICAO24, "" for a callsign-only rule */
     char registryNote[MAX_RULE_NOTES + 1];
     char operatorCode[MAX_OPERATOR_CODE + 1]; /* ICAO code from the call sign, if it matches an entry */
     char configuredOperator[MAX_OPERATOR_NAME + 1];
@@ -164,11 +167,33 @@ typedef enum {
 } SeenFilter;
 
 typedef struct {
-    const char *search; /* case-insensitive substring; NULL/empty = no search */
+    const char *search; /* NULL/empty = no search; matching per pattern_match.h (0.0.27) */
+    uint8_t searchField; /* SearchField (pattern_match.h); 0 = Either */
+    uint8_t searchMode;  /* PatternMode; 0 = normal (literal, or ? / * wildcards) */
     SeenFilter filter;
     SeenSortKey sort;
     bool descending;
 } SeenQuery;
+
+/* Which record is dropped when the table is full and a NEW aircraft arrives (capacity stays
+ * SEEN_MAX_RECORDS; the existing table is never reorganized when the policy changes - it only
+ * decides later evictions). "Registered" = a registry rule or an operator entry covers the aircraft
+ * (SeenConfigInfo.configured), derived live from the current rules. Within the group that is
+ * evicted first, the least recently seen goes first. */
+typedef enum {
+    SEEN_EVICT_UNREGISTERED_PREFERRED = 0, /* default: keep unregistered aircraft, evict registered ones first */
+    SEEN_EVICT_FIFO,                       /* oldest first seen goes first, whatever its registration */
+    SEEN_EVICT_REGISTERED_PREFERRED,       /* inverse: keep registered aircraft, evict unregistered ones first */
+    SEEN_EVICT_COUNT
+} SeenEvictionPolicy;
+
+const char *SeenEvictionPolicy_Name(SeenEvictionPolicy p);  /* user-facing name */
+const char *SeenEvictionPolicy_Token(SeenEvictionPolicy p); /* "unreg" / "fifo" / "reg" (form value) */
+bool SeenEvictionPolicy_Parse(const char *token, SeenEvictionPolicy *out);
+/* Applies to evictions from now on; safe at any time (before or after init). The persisted copy
+ * lives in main.c (NVS radar/"seenpol"). */
+void SeenAircraft_SetEvictionPolicy(SeenEvictionPolicy p);
+SeenEvictionPolicy SeenAircraft_GetEvictionPolicy(void);
 
 /* Call after CustomRules_Init() (which mounts SPIFFS). Loads the CSV if any. */
 bool SeenAircraft_Init(void);

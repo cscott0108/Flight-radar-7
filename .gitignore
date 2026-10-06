@@ -1,6 +1,15 @@
 # Build output directory
 src/build/
 
+# Host Test directory
+host_tests
+
+# Tools directory
+tools
+
+#git directory
+.git
+
 # VS Code directory settings
 .vscode/
 src/.vscode/
@@ -8,6 +17,9 @@ src/.vscode/
 # VS Code workspace configuration
 *.code-workspace
 *.code-workspace.bak
+
+# backup files
+README.md.bak
 
 # Dependency lock files and backups
 dependencies.lock

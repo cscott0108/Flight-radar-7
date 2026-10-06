@@ -27,6 +27,12 @@ esp_err_t WebStyle_SendFeatureControls(httpd_req_t *req);
 /* Registers POST /features. */
 esp_err_t WebStyle_Register(httpd_handle_t server);
 
+/* Shared help popup (0.0.28): a link that opens the <dialog> with dialogId
+ * over the current page (no navigation; Close or Esc returns to the page as it
+ * was), and the dialog itself. bodyHtml is static, trusted page text. */
+esp_err_t WebStyle_SendHelpLink(httpd_req_t *req, const char *dialogId, const char *linkText);
+esp_err_t WebStyle_SendHelpDialog(httpd_req_t *req, const char *dialogId, const char *title, const char *bodyHtml);
+
 /* For the few small standalone pages built with snprintf (confirmation /
  * redirect pages): " class='dk'" when Dark Mode is on, else "". Pair with
  * WEBSTYLE_MINI_CSS inside their own <style>. */

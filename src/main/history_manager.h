@@ -34,6 +34,11 @@ bool HistoryManager_Init(void);
  * so classification is computed exactly once per aircraft per poll, not
  * twice. Cheap: normally RAM-only; performs at most one TF index lookup,
  * only the first time a given aircraft is seen since boot. */
+/* 0.0.27: records the provider-supplied registration (tail number) for an
+ * aircraft already observed this poll. Empty = unknown, ignored (a known
+ * registration is never erased). Only marks the record dirty when it changes. */
+void HistoryManager_ObserveRegistration(const char *icao24, const char *registration);
+
 void HistoryManager_Observe(
     const char *icao24,
     const char *callsign,
@@ -62,3 +67,23 @@ typedef struct {
 } HistoryManagerStats;
 
 void HistoryManager_GetStats(HistoryManagerStats *out);
+
+/* Manual flush (diagnostics). The web task must not touch the shadow table
+ * (the poll task owns it), so it posts a request and waits:
+ *   seq = HistoryManager_RequestFlush();
+ *   while (!HistoryManager_GetFlushResult(seq, &r)) { wait ... }
+ * The poll task serves the request from FlushIfDue on its next slice, outside
+ * the periodic interval gate (which is left undisturbed). GetFlushResult
+ * returns false until that pass has completed. Dirty slots that could not be
+ * written stay dirty (counted in `remaining`) and are retried by the normal
+ * periodic flush. */
+typedef struct {
+    bool ok;            /* pass completed with no failed writes and TF available */
+    bool tfUnavailable; /* TF not ready: nothing was attempted */
+    uint32_t written;
+    uint32_t failed;
+    uint32_t remaining; /* dirty slots still unwritten after this pass */
+} HistoryFlushResult;
+
+uint32_t HistoryManager_RequestFlush(void);
+bool HistoryManager_GetFlushResult(uint32_t seq, HistoryFlushResult *out);

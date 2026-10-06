@@ -12,6 +12,8 @@ void Radar_ReconcileSelection(void);
 
 void Radar_SetAutoSelectClosest(bool enabled);
 bool Radar_GetAutoSelectClosest(void);
+/* A manual Prev/Next choice: auto-select holds it for a while (auto_select.h). */
+void Radar_NoteManualSelection(void);
 
 void Radar_Init(void);
 
@@ -26,6 +28,13 @@ void Radar_AttachToObject(
     lv_obj_t *obj);
 
 void Radar_SweepTick(void);
+
+/* Zero-traffic display idle (see radar.c): main.c reports whether idle dim is active; the radar
+ * render is frozen only while that is true AND gAircraftCount == 0. */
+void Radar_SetIdleDimActive(bool active);
+bool Radar_IsDisplayIdle(void);
+/* Ask for one radar frame even while frozen (safe from any task). */
+void Radar_RequestRedraw(void);
 
 void Radar_PredictAircraft(void);
 extern bool showAircraftLabels;

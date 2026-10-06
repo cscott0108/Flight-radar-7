@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -21,6 +22,8 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
 static const char *TAG = "TfHistory";
 #else
 #include <time.h>
@@ -30,15 +33,27 @@ static const char *TAG = "TfHistory";
 #define TF_MOUNT_POINT "/sdcard"
 #endif
 #define TF_HISTORY_DIR TF_MOUNT_POINT "/history"
-#define TF_INDEX_PATH TF_HISTORY_DIR "/index.dat"
+/* Index files. Version 2 (current): indexv2.dat = 32-byte header + TF_INDEX_SLOTS
+ * slots, self-describing and committed with a single header write. The legacy
+ * 4096-slot index.dat (no header) is never modified or deleted: after the
+ * one-time migration it is left in place, read-only, as a fallback/evidence. */
+#define TF_INDEX_LEGACY_PATH TF_HISTORY_DIR "/index.dat"
+#define TF_INDEX_PATH TF_HISTORY_DIR "/indexv2.dat"
 
 /* Open-addressing hash index, fixed size, read/written a slot at a time -
- * never loaded into RAM as a whole (PROMPT.md section 22). 4096 slots
- * comfortably covers the existing 200-aircraft/1000-operator scale with a
- * long tail of history for aircraft no longer active, without the
- * over-engineering PROMPT.md section 42 warns against; revisit with real
- * multi-week occupancy data before growing it. */
-#define TF_INDEX_SLOTS 4096u
+ * never loaded into RAM as a whole (PROMPT.md section 22). 32768 slots (power
+ * of two: the hash is FNV-1a masked) = 672 KB on the card, zero RAM. The load
+ * limits protect probe length: WARN at 70%, and a hard cap at 90% above which
+ * NEW aircraft are not written to History at all (nothing is appended to a
+ * bucket, so nothing can become an unindexed orphan or be duplicated by a
+ * retry). The table can therefore never reach 100%. */
+#ifndef TF_INDEX_SLOTS /* host tests may override with a smaller power of two to exercise the caps quickly */
+#define TF_INDEX_SLOTS 32768u
+#endif
+#define TF_INDEX_LEGACY_SLOTS 4096u
+#define TF_INDEX_WARN_AT ((TF_INDEX_SLOTS * 70u) / 100u)
+#define TF_INDEX_HARD_CAP ((TF_INDEX_SLOTS * 90u) / 100u)
+_Static_assert((TF_INDEX_SLOTS & (TF_INDEX_SLOTS - 1)) == 0, "index slot count must be a power of two (hash mask)");
 
 typedef struct __attribute__((packed)) {
     char icao24[TF_ICAO_MAX]; /* icao24[0] == 0 means empty slot */
@@ -78,6 +93,16 @@ static TfInitInfo s_init;
 static TfReinitTrace s_trace;
 static TfSelfTestResult s_selftest;
 static char s_rtErr[48];
+
+/* A record whose index slot write failed (the only way a record can end up
+ * unindexed now): remembered so the retry rewrites THAT record instead of
+ * appending a duplicate. One entry; cleared on success and on re-init. */
+static struct {
+    bool valid;
+    char icao24[TF_ICAO_MAX];
+    uint32_t fp;
+    uint32_t offset;
+} s_pending;
 
 #define TF_LOCK_FOREVER UINT32_MAX
 #define TF_LOCK_DIAG_MS 3000u
@@ -152,8 +177,8 @@ static const char *Hint(int stage, int espErr, int err)
     (void)stage;
     (void)espErr;
 #endif
-    if (stage == TF_STAGE_INDEX_CREATE || stage == TF_STAGE_INDEX_REBUILD)
-        return "card mounts and reads but creating/writing index.dat failed: card may be read-only or defective "
+    if (stage == TF_STAGE_INDEX_WRITE || stage == TF_STAGE_INDEX_COMMIT)
+        return "card mounts and reads but writing the new index failed: card may be read-only or defective "
                "(a dead card once reported errno=ENOENT here); run the TF self-test";
     switch (err) {
     case 0: return "no errno captured";
@@ -207,7 +232,8 @@ static void NoteRuntimeFail(const char *op)
 const char *TfHistory_StageName(int stage)
 {
     static const char *const n[TF_STAGE_COUNT] = {"spi_bus_init", "sd_mount", "fs_info", "history_dir",
-                                                   "index_check", "index_create", "index_rebuild", "index_count"};
+                                                   "index_check", "index_scan", "index_write", "index_verify",
+                                                   "index_commit", "index_count"};
     return (stage >= 0 && stage < TF_STAGE_COUNT) ? n[stage] : "?";
 }
 
@@ -431,30 +457,24 @@ static void NormalizeIcao(const char *in, char out[TF_ICAO_MAX])
     out[n] = '\0';
 }
 
-/* ---- index ---- */
+/* ---- index (v2) ---- */
 
-static bool ReadIndexSlot(uint32_t slot, TfIndexSlot *out)
-{
-    FILE *f = fopen(TF_INDEX_PATH, "rb");
-    if (!f)
-        return false;
-    bool ok = fseek(f, (long)(slot * sizeof(TfIndexSlot)), SEEK_SET) == 0 &&
-              fread(out, sizeof(*out), 1, f) == 1;
-    fclose(f);
-    return ok;
-}
+#define TF_INDEX_MAGIC "FR7I"
+#define TF_INDEX_VERSION 2u
+#define TF_IDX_STATE_BUILDING 0x444C5542u  /* "BULD": being built, NOT usable */
+#define TF_IDX_STATE_COMMITTED 0x544D4F43u /* "COMT": verified and committed */
 
-static bool WriteIndexSlot(uint32_t slot, const TfIndexSlot *in)
-{
-    FILE *f = fopen(TF_INDEX_PATH, "r+b");
-    if (!f)
-        return false;
-    bool ok = fseek(f, (long)(slot * sizeof(TfIndexSlot)), SEEK_SET) == 0 &&
-              fwrite(in, sizeof(*in), 1, f) == 1;
-    fflush(f);
-    fclose(f);
-    return ok;
-}
+typedef struct __attribute__((packed)) {
+    char magic[4];
+    uint16_t version;
+    uint16_t slotSize;
+    uint32_t slotCount;
+    uint32_t state;
+    uint32_t reserved[3];
+    uint32_t headerCrc32; /* over the 28 bytes above */
+} TfIndexHeader;
+_Static_assert(sizeof(TfIndexHeader) == 32, "index header must be 32 bytes");
+#define TF_INDEX_FILE_BYTES (sizeof(TfIndexHeader) + (size_t)TF_INDEX_SLOTS * sizeof(TfIndexSlot))
 
 static uint32_t IndexSlotCrc(const TfIndexSlot *s)
 {
@@ -462,73 +482,167 @@ static uint32_t IndexSlotCrc(const TfIndexSlot *s)
     return Crc32(s, offsetof(TfIndexSlot, crc32));
 }
 
-/* Linear-probes from the natural hash slot. Bounded by TF_INDEX_SLOTS so a
- * pathologically full (or corrupt, ever-non-empty) table can never spin
- * forever. A slot whose stored crc is wrong is treated as empty (recovered
- * as "not found here"; a fresh insert will simply overwrite it in place,
- * self-healing - PROMPT.md section 24). */
-static bool IndexFind(const char *icao24, TfIndexSlot *outSlot, uint32_t *outIndex)
+static void IndexHeaderMake(TfIndexHeader *h, uint32_t state)
+{
+    memset(h, 0, sizeof(*h));
+    memcpy(h->magic, TF_INDEX_MAGIC, 4);
+    h->version = TF_INDEX_VERSION;
+    h->slotSize = (uint16_t)sizeof(TfIndexSlot);
+    h->slotCount = TF_INDEX_SLOTS;
+    h->state = state;
+    h->headerCrc32 = Crc32(h, offsetof(TfIndexHeader, headerCrc32));
+}
+
+static bool IndexHeaderValid(const TfIndexHeader *h, bool requireCommitted)
+{
+    if (memcmp(h->magic, TF_INDEX_MAGIC, 4) != 0 || h->version != TF_INDEX_VERSION ||
+        h->slotSize != sizeof(TfIndexSlot) || h->slotCount != TF_INDEX_SLOTS)
+        return false;
+    if (h->headerCrc32 != Crc32(h, offsetof(TfIndexHeader, headerCrc32)))
+        return false;
+    return requireCommitted ? h->state == TF_IDX_STATE_COMMITTED : true;
+}
+
+static void IdxMakeSlot(TfIndexSlot *s, const char *icao24, uint32_t fp, uint32_t off)
+{
+    memset(s, 0, sizeof(*s));
+    NormalizeIcao(icao24, s->icao24);
+    s->bucketFingerprint = fp;
+    s->recordOffset = off;
+    s->crc32 = IndexSlotCrc(s);
+}
+
+/* One index handle for the duration of ONE locked operation: opened once,
+ * used for every probe of that operation, closed before any other TF file
+ * is opened (so there is never more than one open file, same peak as the old
+ * per-slot open/close). Never kept across operations. */
+typedef struct {
+    FILE *f;
+} TfIdx;
+
+static bool IdxOpen(TfIdx *h, bool rw)
+{
+    h->f = fopen(TF_INDEX_PATH, rw ? "r+b" : "rb");
+    return h->f != NULL;
+}
+
+static void IdxClose(TfIdx *h)
+{
+    if (h->f) {
+        fclose(h->f);
+        h->f = NULL;
+    }
+}
+
+static long IdxSlotOffset(uint32_t idx)
+{
+    return (long)(sizeof(TfIndexHeader) + (size_t)idx * sizeof(TfIndexSlot));
+}
+
+static bool IdxReadSlot(TfIdx *h, uint32_t idx, TfIndexSlot *out)
+{
+    return fseek(h->f, IdxSlotOffset(idx), SEEK_SET) == 0 && fread(out, sizeof(*out), 1, h->f) == 1;
+}
+
+#ifndef ESP_PLATFORM
+static int s_hostFailSlotWrites = 0;
+void TfHistory_HostTestFailSlotWrites(int n) { s_hostFailSlotWrites = n; }
+#endif
+
+static bool IdxWriteSlot(TfIdx *h, uint32_t idx, const TfIndexSlot *in)
+{
+#ifndef ESP_PLATFORM
+    if (s_hostFailSlotWrites > 0) {
+        s_hostFailSlotWrites--;
+        return false;
+    }
+#endif
+    return fseek(h->f, IdxSlotOffset(idx), SEEK_SET) == 0 && fwrite(in, sizeof(*in), 1, h->f) == 1 &&
+           fflush(h->f) == 0;
+}
+
+typedef enum { IDXP_FOUND = 0, IDXP_ABSENT, IDXP_ERR } IdxProbeStatus;
+
+typedef struct {
+    uint32_t idx;     /* FOUND: slot index of the entry */
+    uint32_t freeIdx; /* ABSENT: where a new entry for this ICAO24 belongs (first corrupt-or-empty slot of its chain) */
+    uint32_t probes;  /* slots read */
+    TfIndexSlot slot; /* FOUND: the entry */
+} IdxProbeResult;
+
+/* Linear probe from the natural hash slot (same rules as before): the first
+ * empty slot ends the chain (no tombstones); a slot with a bad crc is skipped
+ * when searching, and is the preferred insertion point if the ICAO24 is not
+ * found (self-healing). Bounded by TF_INDEX_SLOTS. One pass therefore answers
+ * both "is it indexed?" and "which slot would a new entry take?". */
+static IdxProbeStatus IdxFindOrSlot(TfIdx *h, const char *icao24, IdxProbeResult *r)
 {
     uint32_t start = Fnv1a32(icao24) & (TF_INDEX_SLOTS - 1);
+    bool haveCorrupt = false;
+    uint32_t firstCorrupt = 0;
+    r->probes = 0;
     for (uint32_t i = 0; i < TF_INDEX_SLOTS; i++) {
         uint32_t idx = (start + i) & (TF_INDEX_SLOTS - 1);
         TfIndexSlot slot;
-        if (!ReadIndexSlot(idx, &slot))
-            return false;
-        if (slot.icao24[0] == '\0')
-            return false; /* open addressing, no tombstones: first empty slot ends the probe */
-        if (slot.crc32 != IndexSlotCrc(&slot))
-            continue; /* corrupt entry; skip past it rather than trusting it */
+        if (!IdxReadSlot(h, idx, &slot))
+            return IDXP_ERR;
+        r->probes++;
+        if (slot.icao24[0] == '\0') {
+            r->freeIdx = haveCorrupt ? firstCorrupt : idx;
+            return IDXP_ABSENT;
+        }
+        if (slot.crc32 != IndexSlotCrc(&slot)) {
+            if (!haveCorrupt) {
+                haveCorrupt = true;
+                firstCorrupt = idx;
+            }
+            continue;
+        }
         if (strncmp(slot.icao24, icao24, TF_ICAO_MAX) == 0) {
-            if (outSlot) *outSlot = slot;
-            if (outIndex) *outIndex = idx;
-            return true;
+            r->idx = idx;
+            r->slot = slot;
+            return IDXP_FOUND;
         }
     }
-    return false;
-}
-
-static bool IndexPlace(const char *icao24, uint32_t bucketFp, uint32_t offset, uint32_t *outIndex)
-{
-    uint32_t start = Fnv1a32(icao24) & (TF_INDEX_SLOTS - 1);
-    for (uint32_t i = 0; i < TF_INDEX_SLOTS; i++) {
-        uint32_t idx = (start + i) & (TF_INDEX_SLOTS - 1);
-        TfIndexSlot slot;
-        if (!ReadIndexSlot(idx, &slot))
-            return false;
-        if (slot.icao24[0] != '\0' && slot.crc32 == IndexSlotCrc(&slot) &&
-            strncmp(slot.icao24, icao24, TF_ICAO_MAX) != 0)
-            continue; /* occupied by someone else */
-        TfIndexSlot fresh;
-        memset(&fresh, 0, sizeof(fresh));
-        NormalizeIcao(icao24, fresh.icao24);
-        fresh.bucketFingerprint = bucketFp;
-        fresh.recordOffset = offset;
-        fresh.crc32 = IndexSlotCrc(&fresh);
-        if (!WriteIndexSlot(idx, &fresh))
-            return false;
-        if (outIndex) *outIndex = idx;
-        s_stats.indexSlotsUsed++;
-        return true;
+    if (haveCorrupt) {
+        r->freeIdx = firstCorrupt;
+        return IDXP_ABSENT;
     }
-    return false; /* index full - see PROMPT.md section 42, not expected at this scale */
+    return IDXP_ERR; /* table completely full of other aircraft: cannot happen below the hard cap */
 }
 
-static bool CreateEmptyIndexFile(void)
+static uint8_t IndexLoadFor(uint32_t used)
 {
-    FILE *f = fopen(TF_INDEX_PATH, "wb");
-    if (!f)
-        return false;
-    TfIndexSlot zero;
-    memset(&zero, 0, sizeof(zero));
-    bool ok = true;
-    for (uint32_t i = 0; i < TF_INDEX_SLOTS && ok; i++)
-        ok = fwrite(&zero, sizeof(zero), 1, f) == 1;
-    fclose(f);
-    return ok;
+    if (used >= TF_INDEX_HARD_CAP)
+        return TF_LOAD_CAP;
+    if (used >= TF_INDEX_WARN_AT)
+        return TF_LOAD_WARN;
+    return TF_LOAD_OK;
 }
 
-/* Counts occupied, CRC-valid slots of an existing index.dat with one
+static void IndexRefreshLoad(void)
+{
+    s_stats.indexLoadState = IndexLoadFor(s_stats.indexSlotsUsed);
+}
+
+/* Probe statistics for the radar write/lookup path only. */
+static void RecordProbe(bool hit, uint32_t probes)
+{
+    if (hit) {
+        s_stats.probeHitOps++;
+        s_stats.probeHitTotal += probes;
+    } else {
+        s_stats.probeMissOps++;
+        s_stats.probeMissTotal += probes;
+    }
+    s_stats.probeLast = probes;
+    if (probes > s_stats.probeMax)
+        s_stats.probeMax = probes;
+    int bin = probes <= 1 ? 0 : probes <= 3 ? 1 : probes <= 7 ? 2 : probes <= 15 ? 3 : probes <= 31 ? 4 : 5;
+    s_stats.probeHist[bin]++;
+}
+
+/* Counts occupied, CRC-valid slots of the committed index with one
  * sequential pass in small chunks (never loads the whole table). Read-only. */
 static bool CountIndexSlots(uint32_t *usedOut, int *errnoOut)
 {
@@ -538,15 +652,12 @@ static bool CountIndexSlots(uint32_t *usedOut, int *errnoOut)
         *errnoOut = errno;
         return false;
     }
-    TfIndexSlot chunk[32];
+    TfIndexSlot chunk[16];
     uint32_t used = 0, total = 0;
-    bool ok = true;
-    while (total < TF_INDEX_SLOTS) {
-        size_t want = TF_INDEX_SLOTS - total;
-        if (want > 32)
-            want = 32;
-        size_t got = fread(chunk, sizeof(TfIndexSlot), want, f);
-        if (got != want) {
+    bool ok = fseek(f, (long)sizeof(TfIndexHeader), SEEK_SET) == 0;
+    while (ok && total < TF_INDEX_SLOTS) {
+        size_t got = fread(chunk, sizeof(TfIndexSlot), 16, f);
+        if (got != 16) {
             ok = false;
             break;
         }
@@ -563,13 +674,10 @@ static bool CountIndexSlots(uint32_t *usedOut, int *errnoOut)
 
 /* ---- buckets ---- */
 
-static bool BucketExists(const char *path)
+static bool BucketHeaderOk(const TfBucketHeader *h)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return false;
-    fclose(f);
-    return true;
+    return memcmp(h->magic, TF_BUCKET_MAGIC, 4) == 0 &&
+           h->headerCrc32 == Crc32(h, offsetof(TfBucketHeader, headerCrc32));
 }
 
 static bool ReadBucketHeader(const char *path, TfBucketHeader *out)
@@ -581,8 +689,7 @@ static bool ReadBucketHeader(const char *path, TfBucketHeader *out)
     fclose(f);
     if (!ok)
         return false;
-    return memcmp(out->magic, TF_BUCKET_MAGIC, 4) == 0 &&
-           out->headerCrc32 == Crc32(out, offsetof(TfBucketHeader, headerCrc32));
+    return BucketHeaderOk(out);
 }
 
 static bool WriteBucketHeader(const char *path, TfBucketHeader *hdr)
@@ -602,21 +709,35 @@ static bool EnsureBucket(uint32_t fp, char pathOut[512], TfBucketHeader *hdrOut)
     BucketPath(fp, pathOut, 512);
     if (ReadBucketHeader(pathOut, hdrOut))
         return true;
-    /* Missing or corrupt header: (re)create a fresh, empty bucket. A
-     * corrupt-but-nonempty bucket file loses its unreadable header this
-     * way but TfHistory_RebuildIndex() (a full sequential record scan,
-     * not dependent on the header) is the recovery path for that case -
-     * this function's job is only to guarantee a bucket is writable. */
-    FILE *f = fopen(pathOut, "wb");
-    if (!f)
-        return false;
+
+    /* Missing header, or header that fails its CRC. If the file already holds
+     * bytes beyond a header, REPAIR the header in place from the file size
+     * (record count = whole records present) instead of truncating the file:
+     * the index rebuild may have indexed those records (each still passes its
+     * own CRC when read), and truncating would destroy them. Only a missing
+     * file, or one shorter than a header (nothing to lose), is created fresh. */
+    long size = -1;
+    FILE *probe = fopen(pathOut, "rb");
+    if (probe) {
+        if (fseek(probe, 0, SEEK_END) == 0)
+            size = ftell(probe);
+        fclose(probe);
+    }
+    uint32_t recovered = 0;
+    const bool repair = size >= (long)sizeof(TfBucketHeader);
+    if (repair)
+        recovered = (uint32_t)(((size_t)size - sizeof(TfBucketHeader)) / sizeof(TfOnDiskRecord));
+
     memset(hdrOut, 0, sizeof(*hdrOut));
     memcpy(hdrOut->magic, TF_BUCKET_MAGIC, 4);
     hdrOut->version = TF_BUCKET_VERSION;
     hdrOut->fingerprint = fp;
-    hdrOut->recordCount = 0;
+    hdrOut->recordCount = recovered;
     hdrOut->headerCrc32 = Crc32(hdrOut, offsetof(TfBucketHeader, headerCrc32));
-    bool ok = fwrite(hdrOut, sizeof(*hdrOut), 1, f) == 1;
+    FILE *f = fopen(pathOut, repair ? "r+b" : "wb");
+    if (!f)
+        return false;
+    bool ok = fseek(f, 0, SEEK_SET) == 0 && fwrite(hdrOut, sizeof(*hdrOut), 1, f) == 1 && fflush(f) == 0;
     fclose(f);
     return ok;
 }
@@ -658,6 +779,617 @@ static bool AppendRecord(const char *path, TfBucketHeader *hdr, const TfOnDiskRe
 
 /* ---- public API ---- */
 
+/* =====================================================================
+ * Index builder: first-boot migration from the legacy 4096-slot index.dat,
+ * rebuild after a missing/unfinished/invalid index, or fresh create.
+ *
+ * Principles:
+ *  - The index is DERIVED data; the bucket files are the source of truth.
+ *    The builder only READS bucket files and the legacy index.dat.
+ *  - The new index is built beside the legacy one (indexv2.dat), verified,
+ *    and only then committed by one header write (+fsync). A power cut at any
+ *    earlier point leaves state "building" (or a bad header CRC), which the
+ *    next boot simply rebuilds. indexv2.dat is the builder's own file; it is
+ *    the only file it ever truncates or rewrites.
+ *  - EVERY bucket file in the history folder is scanned (not just the two
+ *    special ones). Per ICAO24 the winner is the newest record: highest
+ *    lastSeen, then highest seenCount, then highest (fingerprint, offset) -
+ *    a total order, so the result does not depend on directory order.
+ *  - Records must pass their own CRC (and have an ICAO24) to be indexed. A
+ *    bucket with a bad header is still scanned (record count from the file
+ *    size) but each record is individually validated.
+ *  - Working memory: transient PSRAM staging of the whole table (28 B per
+ *    slot, ~0.9 MB) so duplicates can be resolved without disk reads and the
+ *    file is written sequentially. If that allocation fails the builder falls
+ *    back to building directly on disk (slower, same result). Nothing here is
+ *    retained after the build.
+ *  - Stack use is deliberately tiny (app_main has 3584 B): all buffers live
+ *    in the transient work block.
+ * ===================================================================== */
+
+typedef struct {
+    uint32_t fp;
+    uint32_t off;
+    uint32_t lastSeen;
+    uint32_t seenCount;
+    char icao24[12]; /* icao24[0] == 0: empty */
+} TfStageEntry;
+_Static_assert(TF_ICAO_MAX <= 12, "staging entry too small for an ICAO24");
+
+typedef struct {
+    TfOnDiskRecord raw[8];  /* 416 B: one scan chunk */
+    TfIndexSlot chunk[16];  /* 336 B: one file write/verify chunk */
+    struct {
+        char icao24[TF_ICAO_MAX];
+        uint32_t fp;
+        uint32_t off;
+    } sample[16];
+} TfBuildWork;
+
+typedef struct {
+    TfBuildWork *work;
+    TfStageEntry *stage; /* NULL = on-disk fallback */
+    TfIdx disk;          /* on-disk fallback: index handle held open for the scan */
+    TfIndexBuildReport *rep;
+    uint32_t used;
+    uint32_t yieldCtr;
+    bool ioError;
+} TfBuildCtx;
+
+static TfIndexBuildReport s_build;
+#ifndef ESP_PLATFORM
+static bool s_hostNoStaging = false;
+static int s_hostAbortPhase = 0;
+void TfHistory_HostTestNoStaging(bool force) { s_hostNoStaging = force; }
+void TfHistory_HostTestAbortBuild(int phase) { s_hostAbortPhase = phase; }
+#endif
+
+void TfHistory_GetIndexBuildReport(TfIndexBuildReport *out)
+{
+    if (out)
+        *out = s_build;
+}
+
+static void *BuildAlloc(size_t n)
+{
+#ifdef ESP_PLATFORM
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); /* CPU-only data: PSRAM, never internal/DMA RAM */
+    return p;
+#else
+    return malloc(n);
+#endif
+}
+
+static void BuildFree(void *p)
+{
+    free(p); /* heap_caps_free() == free() */
+}
+
+static void BuildYield(TfBuildCtx *c)
+{
+    /* The task watchdog watches the idle tasks: let them run now and then. */
+    if (++c->yieldCtr >= 256) {
+        c->yieldCtr = 0;
+#ifdef ESP_PLATFORM
+        vTaskDelay(1);
+#endif
+    }
+}
+
+/* a strictly newer than b? (total order) */
+static bool BuildBetter(uint32_t aLast, uint32_t aSeen, uint32_t aFp, uint32_t aOff,
+                        uint32_t bLast, uint32_t bSeen, uint32_t bFp, uint32_t bOff)
+{
+    if (aLast != bLast)
+        return aLast > bLast;
+    if (aSeen != bSeen)
+        return aSeen > bSeen;
+    if (aFp != bFp)
+        return aFp > bFp;
+    return aOff > bOff;
+}
+
+static void BuildInsert(TfBuildCtx *c, const TfOnDiskRecord *r, uint32_t fp, uint32_t off)
+{
+    char icao[TF_ICAO_MAX];
+    NormalizeIcao(r->pub.icao24, icao);
+    const uint32_t mask = TF_INDEX_SLOTS - 1;
+
+    if (c->stage) {
+        uint32_t i = Fnv1a32(icao) & mask;
+        for (uint32_t n = 0; n < TF_INDEX_SLOTS; n++, i = (i + 1) & mask) {
+            TfStageEntry *e = &c->stage[i];
+            if (e->icao24[0] == '\0') {
+                if (c->used >= TF_INDEX_HARD_CAP) {
+                    c->rep->rejectedAtCap++; /* never fill the table past the hard cap */
+                    return;
+                }
+                memset(e, 0, sizeof(*e));
+                memcpy(e->icao24, icao, TF_ICAO_MAX);
+                e->fp = fp;
+                e->off = off;
+                e->lastSeen = r->pub.lastSeen;
+                e->seenCount = r->pub.seenCount;
+                c->used++;
+                return;
+            }
+            if (strncmp(e->icao24, icao, TF_ICAO_MAX) == 0) {
+                c->rep->duplicatesResolved++;
+                if (BuildBetter(r->pub.lastSeen, r->pub.seenCount, fp, off, e->lastSeen, e->seenCount, e->fp, e->off)) {
+                    e->fp = fp;
+                    e->off = off;
+                    e->lastSeen = r->pub.lastSeen;
+                    e->seenCount = r->pub.seenCount;
+                }
+                return;
+            }
+        }
+        c->rep->rejectedAtCap++;
+        return;
+    }
+
+    /* On-disk fallback: same rules, the current winner's lastSeen/seenCount
+     * are read back from its bucket record (only needed on a duplicate). */
+    IdxProbeResult pr;
+    IdxProbeStatus st = IdxFindOrSlot(&c->disk, icao, &pr);
+    if (st == IDXP_ABSENT) {
+        if (c->used >= TF_INDEX_HARD_CAP) {
+            c->rep->rejectedAtCap++;
+            return;
+        }
+        TfIndexSlot slot;
+        IdxMakeSlot(&slot, icao, fp, off);
+        if (!IdxWriteSlot(&c->disk, pr.freeIdx, &slot))
+            c->ioError = true;
+        else
+            c->used++;
+    } else if (st == IDXP_FOUND) {
+        c->rep->duplicatesResolved++;
+        char path[96];
+        TfOnDiskRecord cur;
+        BucketPath(pr.slot.bucketFingerprint, path, sizeof(path));
+        bool curOk = ReadRecordAt(path, pr.slot.recordOffset, &cur) && cur.crc32 == Crc32(&cur.pub, sizeof(cur.pub));
+        if (!curOk || BuildBetter(r->pub.lastSeen, r->pub.seenCount, fp, off, cur.pub.lastSeen, cur.pub.seenCount,
+                                  pr.slot.bucketFingerprint, pr.slot.recordOffset)) {
+            TfIndexSlot slot;
+            IdxMakeSlot(&slot, icao, fp, off);
+            if (!IdxWriteSlot(&c->disk, pr.idx, &slot))
+                c->ioError = true;
+        }
+    } else {
+        c->ioError = true;
+    }
+}
+
+static bool ParseBucketName(const char *name, uint32_t *fpOut);
+
+static void BuildScanBucket(TfBuildCtx *c, uint32_t fp)
+{
+    char path[96];
+    BucketPath(fp, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        c->rep->bucketsUnreadable++;
+        return;
+    }
+    c->rep->buckets++;
+
+    TfBucketHeader hdr;
+    bool hdrOk = fread(&hdr, sizeof(hdr), 1, f) == 1 && BucketHeaderOk(&hdr);
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0)
+        size = ftell(f);
+    uint32_t physical = size >= (long)sizeof(TfBucketHeader)
+                            ? (uint32_t)(((size_t)size - sizeof(TfBucketHeader)) / sizeof(TfOnDiskRecord))
+                            : 0;
+    uint32_t count;
+    if (hdrOk) {
+        count = hdr.recordCount < physical ? hdr.recordCount : physical; /* never trust a count beyond the file */
+    } else {
+        count = physical; /* header unusable: count whole records present; each is still CRC-checked */
+        c->rep->headerFallbackBuckets++;
+    }
+    if (fseek(f, (long)sizeof(TfBucketHeader), SEEK_SET) != 0) {
+        c->rep->bucketsUnreadable++;
+        fclose(f);
+        return;
+    }
+
+    uint32_t idx = 0;
+    while (idx < count) {
+        size_t want = count - idx;
+        if (want > 8)
+            want = 8;
+        size_t got = fread(c->work->raw, sizeof(TfOnDiskRecord), want, f);
+        if (got == 0) {
+            c->rep->bucketsUnreadable++; /* count said more records than could be read */
+            break;
+        }
+        for (size_t i = 0; i < got; i++) {
+            const TfOnDiskRecord *r = &c->work->raw[i];
+            c->rep->recordsScanned++;
+            if (r->pub.icao24[0] == '\0' || r->crc32 != Crc32(&r->pub, sizeof(r->pub))) {
+                c->rep->recordsCorrupt++; /* unverifiable: never treated as valid History */
+                continue;
+            }
+            BuildInsert(c, r, fp, (uint32_t)((idx + i) * sizeof(TfOnDiskRecord)));
+        }
+        idx += (uint32_t)got;
+        BuildYield(c);
+    }
+    fclose(f);
+}
+
+/* One readdir pass over the history folder; every XXXXXXXX.DAT is a bucket. */
+static bool BuildScanAll(TfBuildCtx *c)
+{
+    DIR *d = opendir(TF_HISTORY_DIR);
+    if (!d)
+        return false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint32_t fp;
+        if (ParseBucketName(e->d_name, &fp))
+            BuildScanBucket(c, fp);
+    }
+    closedir(d);
+    return true;
+}
+
+static void BuildFail(TfBuildCtx *c, TfInitStage stage, int err, const char *msg, int64_t t0)
+{
+    snprintf(c->rep->error, sizeof(c->rep->error), "%s", msg);
+    StageSet(stage, TF_RES_FAIL, 0, err, 0, t0);
+}
+
+/* Creates indexv2.dat in state "building" with every slot empty. */
+static bool BuildCreateEmpty(TfBuildCtx *c, int *err)
+{
+    errno = 0;
+    FILE *f = fopen(TF_INDEX_PATH, "wb");
+    if (!f) {
+        *err = errno;
+        return false;
+    }
+    TfIndexHeader h;
+    IndexHeaderMake(&h, TF_IDX_STATE_BUILDING);
+    bool ok = fwrite(&h, sizeof(h), 1, f) == 1;
+    memset(c->work->chunk, 0, sizeof(c->work->chunk));
+    for (uint32_t base = 0; ok && base < TF_INDEX_SLOTS; base += 16) {
+        ok = fwrite(c->work->chunk, sizeof(TfIndexSlot), 16, f) == 16;
+        BuildYield(c);
+    }
+    if (ok)
+        ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    *err = ok ? 0 : (errno ? errno : EIO);
+    if (fclose(f) != 0)
+        ok = false;
+    return ok;
+}
+
+/* Staged mode: write the whole table sequentially in chunks. */
+static bool BuildWriteStaged(TfBuildCtx *c, int *err)
+{
+    errno = 0;
+    FILE *f = fopen(TF_INDEX_PATH, "wb");
+    if (!f) {
+        *err = errno;
+        return false;
+    }
+    TfIndexHeader h;
+    IndexHeaderMake(&h, TF_IDX_STATE_BUILDING);
+    bool ok = fwrite(&h, sizeof(h), 1, f) == 1;
+    for (uint32_t base = 0; ok && base < TF_INDEX_SLOTS; base += 16) {
+        for (uint32_t k = 0; k < 16; k++) {
+            const TfStageEntry *e = &c->stage[base + k];
+            if (e->icao24[0] != '\0')
+                IdxMakeSlot(&c->work->chunk[k], e->icao24, e->fp, e->off);
+            else
+                memset(&c->work->chunk[k], 0, sizeof(TfIndexSlot));
+        }
+        ok = fwrite(c->work->chunk, sizeof(TfIndexSlot), 16, f) == 16;
+        BuildYield(c);
+    }
+    if (ok)
+        ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    *err = ok ? 0 : (errno ? errno : EIO);
+    if (fclose(f) != 0)
+        ok = false;
+    return ok;
+}
+
+/* Report-only comparison of the legacy 4096-slot index with the new one. */
+static void BuildLegacyCrossCheck(TfBuildCtx *c)
+{
+    TfIndexBuildReport *rep = c->rep;
+    FILE *lf = fopen(TF_INDEX_LEGACY_PATH, "rb");
+    if (!lf)
+        return;
+    TfIdx n;
+    if (!IdxOpen(&n, false)) {
+        fclose(lf);
+        return;
+    }
+    rep->legacyChecked = true;
+    for (uint32_t base = 0; base < TF_INDEX_LEGACY_SLOTS; base += 16) {
+        if (fread(c->work->chunk, sizeof(TfIndexSlot), 16, lf) != 16)
+            break;
+        for (uint32_t k = 0; k < 16; k++) {
+            const TfIndexSlot *ls = &c->work->chunk[k];
+            if (ls->icao24[0] == '\0' || ls->crc32 != IndexSlotCrc(ls))
+                continue;
+            rep->legacyValid++;
+            IdxProbeResult pr;
+            char icao[TF_ICAO_MAX];
+            NormalizeIcao(ls->icao24, icao);
+            if (IdxFindOrSlot(&n, icao, &pr) != IDXP_FOUND)
+                rep->legacyMissing++;
+            else if (pr.slot.bucketFingerprint == ls->bucketFingerprint && pr.slot.recordOffset == ls->recordOffset)
+                rep->legacySame++;
+            else
+                rep->legacyNewer++; /* the new index chose a different (newer-or-equal by the winner rule) record */
+        }
+        BuildYield(c);
+    }
+    IdxClose(&n);
+    fclose(lf);
+}
+
+static bool BuildVerify(TfBuildCtx *c, int *err, const char **why)
+{
+    TfIndexBuildReport *rep = c->rep;
+    errno = 0;
+    FILE *f = fopen(TF_INDEX_PATH, "rb");
+    if (!f) {
+        *err = errno;
+        *why = "cannot reopen the new index for verification";
+        return false;
+    }
+    TfIndexHeader h;
+    long size = -1;
+    bool ok = fread(&h, sizeof(h), 1, f) == 1 && IndexHeaderValid(&h, false) && h.state == TF_IDX_STATE_BUILDING;
+    if (ok && fseek(f, 0, SEEK_END) == 0)
+        size = ftell(f);
+    if (!ok || size != (long)TF_INDEX_FILE_BYTES || fseek(f, (long)sizeof(h), SEEK_SET) != 0) {
+        fclose(f);
+        *why = "new index header or size is wrong";
+        return false;
+    }
+
+    uint32_t valid = 0, mismatch = 0, nSamples = 0, occIdx = 0;
+    const uint32_t step = c->used >= 16 ? c->used / 16 : 1;
+    bool readOk = true;
+    for (uint32_t base = 0; base < TF_INDEX_SLOTS; base += 16) {
+        if (fread(c->work->chunk, sizeof(TfIndexSlot), 16, f) != 16) {
+            readOk = false;
+            break;
+        }
+        for (uint32_t k = 0; k < 16; k++) {
+            const TfIndexSlot *sl = &c->work->chunk[k];
+            const bool occ = sl->icao24[0] != '\0';
+            const bool crcOk = sl->crc32 == IndexSlotCrc(sl);
+            if (c->stage) {
+                const TfStageEntry *e = &c->stage[base + k];
+                if ((e->icao24[0] != '\0') != occ)
+                    mismatch++;
+                else if (occ && (!crcOk || strncmp(sl->icao24, e->icao24, TF_ICAO_MAX) != 0 ||
+                                 sl->bucketFingerprint != e->fp || sl->recordOffset != e->off))
+                    mismatch++;
+                else if (occ)
+                    valid++;
+            } else if (occ) {
+                if (!crcOk)
+                    mismatch++;
+                else
+                    valid++;
+            }
+            if (occ && crcOk) {
+                if (nSamples < 16 && (occIdx % step) == 0) { /* up to 16 evenly spaced entries */
+                    memcpy(c->work->sample[nSamples].icao24, sl->icao24, TF_ICAO_MAX);
+                    c->work->sample[nSamples].fp = sl->bucketFingerprint;
+                    c->work->sample[nSamples].off = sl->recordOffset;
+                    nSamples++;
+                }
+                occIdx++;
+            }
+        }
+        BuildYield(c);
+    }
+    fclose(f);
+    rep->verifyMismatch = mismatch;
+    if (!readOk) {
+        *err = EIO;
+        *why = "new index could not be read back completely";
+        return false;
+    }
+    if (mismatch != 0) {
+        *why = "new index does not match what was written";
+        return false;
+    }
+    if (valid != c->used) {
+        *why = "new index slot count differs from the aircraft indexed";
+        return false;
+    }
+
+    /* Spot-check that sampled slots really point at a matching, CRC-valid record. */
+    for (uint32_t i = 0; i < nSamples; i++) {
+        char path[96];
+        TfOnDiskRecord r;
+        BucketPath(c->work->sample[i].fp, path, sizeof(path));
+        rep->verifySampled++;
+        if (!ReadRecordAt(path, c->work->sample[i].off, &r) || r.crc32 != Crc32(&r.pub, sizeof(r.pub)) ||
+            strncmp(r.pub.icao24, c->work->sample[i].icao24, TF_ICAO_MAX) != 0) {
+            rep->verifyMismatch++;
+            *why = "a sampled index entry does not point at its record";
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The commit point: ONE 32-byte header write + fsync flips building -> committed. */
+static bool BuildCommit(int *err, const char **why)
+{
+    errno = 0;
+    FILE *f = fopen(TF_INDEX_PATH, "r+b");
+    if (!f) {
+        *err = errno;
+        *why = "cannot reopen the new index to commit it";
+        return false;
+    }
+    TfIndexHeader h;
+    IndexHeaderMake(&h, TF_IDX_STATE_COMMITTED);
+    bool ok = fseek(f, 0, SEEK_SET) == 0 && fwrite(&h, sizeof(h), 1, f) == 1 && fflush(f) == 0 &&
+              fsync(fileno(f)) == 0;
+    *err = ok ? 0 : (errno ? errno : EIO);
+    if (fclose(f) != 0)
+        ok = false;
+    if (!ok) {
+        *why = "writing the commit header failed";
+        return false;
+    }
+    f = fopen(TF_INDEX_PATH, "rb");
+    TfIndexHeader back;
+    ok = f && fread(&back, sizeof(back), 1, f) == 1 && IndexHeaderValid(&back, true);
+    if (f)
+        fclose(f);
+    if (!ok)
+        *why = "the committed header did not read back";
+    return ok;
+}
+
+static bool BuildIndexV2(bool legacyUsable)
+{
+    TfIndexBuildReport *rep = &s_build;
+    memset(rep, 0, sizeof(*rep));
+    rep->ran = true;
+    rep->mode = legacyUsable ? TF_BUILD_MIGRATE : TF_BUILD_REBUILD;
+
+    const int64_t tAll = NowUs();
+    int64_t t0;
+    int err = 0;
+    const char *why = "";
+    bool ok = false;
+
+    TfBuildCtx c;
+    memset(&c, 0, sizeof(c));
+    c.rep = rep;
+    c.work = BuildAlloc(sizeof(TfBuildWork));
+    if (!c.work)
+        c.work = malloc(sizeof(TfBuildWork));
+    if (!c.work) {
+        BuildFail(&c, TF_STAGE_INDEX_SCAN, ENOMEM, "no memory for the index build work block", tAll);
+        goto out;
+    }
+    const size_t stageBytes = sizeof(TfStageEntry) * TF_INDEX_SLOTS;
+#ifndef ESP_PLATFORM
+    if (!s_hostNoStaging)
+#endif
+        c.stage = BuildAlloc(stageBytes);
+    if (c.stage) {
+        memset(c.stage, 0, stageBytes);
+        rep->usedStaging = true;
+        rep->stagingBytes = (uint32_t)stageBytes;
+    }
+
+    /* ---- scan every bucket ---- */
+    t0 = NowUs();
+    if (!c.stage) {
+        if (!BuildCreateEmpty(&c, &err) || !IdxOpen(&c.disk, true)) {
+            BuildFail(&c, TF_STAGE_INDEX_SCAN, err ? err : errno, "cannot create the new index file (disk fallback)", t0);
+            goto out;
+        }
+    }
+    bool scanned = BuildScanAll(&c);
+    if (!c.stage) {
+        if (c.disk.f && (fflush(c.disk.f) != 0 || fsync(fileno(c.disk.f)) != 0))
+            c.ioError = true;
+        IdxClose(&c.disk);
+    }
+    rep->scanUs = (uint32_t)(NowUs() - t0);
+    if (!scanned) {
+        BuildFail(&c, TF_STAGE_INDEX_SCAN, errno, "history folder could not be listed", t0);
+        goto out;
+    }
+    if (rep->bucketsUnreadable > 0) {
+        /* An incomplete scan would silently drop aircraft from the index: refuse to commit it. */
+        BuildFail(&c, TF_STAGE_INDEX_SCAN, EIO, "some bucket files could not be read; index NOT committed (data untouched)", t0);
+        goto out;
+    }
+    if (c.ioError) {
+        BuildFail(&c, TF_STAGE_INDEX_SCAN, errno ? errno : EIO, "index slot I/O failed while building", t0);
+        goto out;
+    }
+    StageSet(TF_STAGE_INDEX_SCAN, TF_RES_OK, 0, 0, 0, t0);
+    if (!legacyUsable)
+        rep->mode = rep->buckets > 0 ? TF_BUILD_REBUILD : TF_BUILD_FRESH;
+    rep->aircraftIndexed = c.used;
+
+    /* ---- write ---- */
+    t0 = NowUs();
+    if (c.stage && !BuildWriteStaged(&c, &err)) {
+        rep->writeUs = (uint32_t)(NowUs() - t0);
+        BuildFail(&c, TF_STAGE_INDEX_WRITE, err, "writing the new index failed (card full, read-only or removed?)", t0);
+        goto out;
+    }
+    rep->writeUs = (uint32_t)(NowUs() - t0);
+    StageSet(TF_STAGE_INDEX_WRITE, TF_RES_OK, 0, 0, 0, t0);
+#ifndef ESP_PLATFORM
+    if (s_hostAbortPhase == 1) {
+        snprintf(rep->error, sizeof(rep->error), "host test: simulated power loss after write");
+        goto out;
+    }
+#endif
+
+    /* ---- verify (and report-only comparison with the legacy index) ---- */
+    t0 = NowUs();
+    if (!BuildVerify(&c, &err, &why)) {
+        rep->verifyUs = (uint32_t)(NowUs() - t0);
+        BuildFail(&c, TF_STAGE_INDEX_VERIFY, err, why, t0);
+        goto out;
+    }
+    if (legacyUsable)
+        BuildLegacyCrossCheck(&c);
+    rep->verifyUs = (uint32_t)(NowUs() - t0);
+    StageSet(TF_STAGE_INDEX_VERIFY, TF_RES_OK, 0, 0, 0, t0);
+#ifndef ESP_PLATFORM
+    if (s_hostAbortPhase == 2) {
+        snprintf(rep->error, sizeof(rep->error), "host test: simulated power loss before commit");
+        goto out;
+    }
+#endif
+
+    /* ---- commit ---- */
+    t0 = NowUs();
+    if (!BuildCommit(&err, &why)) {
+        rep->commitUs = (uint32_t)(NowUs() - t0);
+        BuildFail(&c, TF_STAGE_INDEX_COMMIT, err, why, t0);
+        goto out;
+    }
+    rep->commitUs = (uint32_t)(NowUs() - t0);
+    StageSet(TF_STAGE_INDEX_COMMIT, TF_RES_OK, 0, 0, 0, t0);
+
+    s_stats.indexSlotsUsed = c.used;
+    IndexRefreshLoad();
+    s_stats.indexRebuilds++;
+    ok = true;
+
+out:
+    if (c.disk.f)
+        IdxClose(&c.disk);
+    if (c.stage)
+        BuildFree(c.stage);
+    if (c.work)
+        BuildFree(c.work);
+    rep->ok = ok;
+    rep->totalUs = (uint32_t)(NowUs() - tAll);
+    if (ok) {
+        UpdateTiming(&s_stats.lastIndexOpUs, &s_stats.bestIndexOpUs, &s_stats.worstIndexOpUs, rep->totalUs);
+        UpdateTiming(&s_stats.lastRecoveryUs, &s_stats.bestRecoveryUs, &s_stats.worstRecoveryUs, rep->totalUs);
+    }
+    return ok;
+}
+
 /* The existing init sequence, unchanged in behavior, with every stage
  * recorded. Caller holds the lock. resetStats=false (diagnostic reinit)
  * keeps the lifetime counters. */
@@ -667,7 +1399,12 @@ static bool InitInternal(bool resetStats)
         memset(&s_stats, 0, sizeof(s_stats));
     s_stats.indexSlotsTotal = TF_INDEX_SLOTS;
     s_stats.indexSlotsUsed = 0;
+    s_stats.indexWarnAt = TF_INDEX_WARN_AT;
+    s_stats.indexHardCap = TF_INDEX_HARD_CAP;
+    s_stats.indexLoadState = TF_LOAD_OK;
     SetAvailable(false);
+    s_pending.valid = false; /* a pending orphan refers to files of the previous mount */
+    memset(&s_build, 0, sizeof(s_build));
 
     uint32_t runs = s_init.runs + 1;
     memset(&s_init, 0, sizeof(s_init));
@@ -676,10 +1413,13 @@ static bool InitInternal(bool resetStats)
     s_init.firstFailedStage = -1;
     s_init.lastErrStage = -1;
     s_init.indexSizeBytes = -1;
-    s_init.indexSizeExpected = (uint32_t)(TF_INDEX_SLOTS * sizeof(TfIndexSlot));
+    s_init.legacyIndexSizeBytes = -1;
+    s_init.stackFreeMinBytes = -1;
+    s_init.indexSizeExpected = (uint32_t)TF_INDEX_FILE_BYTES;
     s_init.indexState = TF_INDEX_NOT_INIT;
     s_init.historyDir = TF_HISTORY_DIR;
     s_init.indexPath = TF_INDEX_PATH;
+    s_init.legacyIndexPath = TF_INDEX_LEGACY_PATH;
     s_init.scratchPath = TF_SELFTEST_PATH;
 
     if (!MountTfCard())
@@ -708,56 +1448,58 @@ static bool InitInternal(bool resetStats)
             StageSet(TF_STAGE_HIST_DIR, TF_RES_FAIL, 0, e, 0, t0);
     }
 
+    /* ---- index: use the committed indexv2.dat, or build it ---- */
     t0 = NowUs();
-    errno = 0;
-    FILE *idx = fopen(TF_INDEX_PATH, "rb");
-    int openErrno = errno;
-    bool indexOk = false;
-    if (idx) {
-        s_init.indexFileOpened = true;
-        fseek(idx, 0, SEEK_END);
-        long sz = ftell(idx);
-        fclose(idx);
-        s_init.indexSizeBytes = (int32_t)sz;
-        indexOk = (sz == (long)(TF_INDEX_SLOTS * sizeof(TfIndexSlot)));
-        s_init.indexSizeValid = indexOk;
-        StageSet(TF_STAGE_INDEX_CHECK, TF_RES_OK, 0, 0, 0, t0);
-    } else if (openErrno == ENOENT) {
-        StageSet(TF_STAGE_INDEX_CHECK, TF_RES_OK, 0, ENOENT, 0, t0); /* missing = normal on a fresh card */
-    } else {
-        StageSet(TF_STAGE_INDEX_CHECK, TF_RES_FAIL, 0, openErrno, 0, t0);
+    bool v2Ok = false;
+    {
+        errno = 0;
+        FILE *idx = fopen(TF_INDEX_PATH, "rb");
+        int openErrno = errno;
+        if (idx) {
+            s_init.indexFileOpened = true;
+            TfIndexHeader ih;
+            bool hdrOk = fread(&ih, sizeof(ih), 1, idx) == 1 && IndexHeaderValid(&ih, true);
+            long sz = -1;
+            if (fseek(idx, 0, SEEK_END) == 0)
+                sz = ftell(idx);
+            fclose(idx);
+            s_init.indexSizeBytes = (int32_t)sz;
+            v2Ok = hdrOk && sz == (long)TF_INDEX_FILE_BYTES;
+            s_init.indexSizeValid = v2Ok;
+            StageSet(TF_STAGE_INDEX_CHECK, TF_RES_OK, 0, 0, 0, t0);
+        } else if (openErrno == ENOENT) {
+            StageSet(TF_STAGE_INDEX_CHECK, TF_RES_OK, 0, ENOENT, 0, t0); /* missing: normal on a fresh card or first boot after upgrade */
+        } else {
+            StageSet(TF_STAGE_INDEX_CHECK, TF_RES_FAIL, 0, openErrno, 0, t0);
+        }
+    }
+    bool legacyUsable = false;
+    {
+        struct stat ls;
+        if (stat(TF_INDEX_LEGACY_PATH, &ls) == 0) {
+            s_init.legacyIndexSizeBytes = (int32_t)ls.st_size;
+            legacyUsable = ls.st_size == (off_t)(TF_INDEX_LEGACY_SLOTS * sizeof(TfIndexSlot));
+        }
     }
 
-    if (!indexOk) {
-        t0 = NowUs();
-        errno = 0;
-        bool created = CreateEmptyIndexFile();
-        int e = errno;
-        if (!created) {
-            StageSet(TF_STAGE_INDEX_CREATE, TF_RES_FAIL, 0, e, 0, t0);
+    if (!v2Ok) {
+        /* Migration (legacy 4096-slot index found), rebuild (index missing,
+         * unfinished or invalid) or fresh create. Builds beside the legacy
+         * index and commits only after verification; blocking, one-time. */
+        if (!BuildIndexV2(legacyUsable)) {
             s_init.indexState = TF_INDEX_FAILED;
-            return false; /* card present but not usable (full/read-only/etc) - stay degraded */
+            return false; /* card present but index not usable: stay degraded, data untouched */
         }
-        StageSet(TF_STAGE_INDEX_CREATE, TF_RES_OK, 0, 0, 0, t0);
-        /* If bucket files already exist from a previous session but the
-         * index was missing/corrupt, recover it rather than starting blind
-         * (PROMPT.md section 24). Harmless no-op on a fresh card. Its
-         * result was ignored before; it is now recorded (init still
-         * proceeds exactly as before). */
-        t0 = NowUs();
-        errno = 0;
-        bool rebuilt = TfHistory_RebuildIndex();
-        e = errno;
-        StageSet(TF_STAGE_INDEX_REBUILD, rebuilt ? TF_RES_OK : TF_RES_FAIL, 0, rebuilt ? 0 : e, 0, t0);
-        s_init.indexState = TF_INDEX_REBUILT;
+        s_init.indexState = s_build.mode == TF_BUILD_MIGRATE ? TF_INDEX_MIGRATED
+                          : s_build.mode == TF_BUILD_FRESH   ? TF_INDEX_FRESH
+                                                             : TF_INDEX_REBUILT;
     } else {
-        /* Existing valid index: previously indexSlotsUsed stayed 0 here.
-         * Count it (read-only) so 0 genuinely means empty. */
         uint32_t used = 0;
         int e = 0;
         t0 = NowUs();
         if (CountIndexSlots(&used, &e)) {
             s_stats.indexSlotsUsed = used;
+            IndexRefreshLoad();
             StageSet(TF_STAGE_INDEX_COUNT, TF_RES_OK, 0, 0, 0, t0);
         } else {
             StageSet(TF_STAGE_INDEX_COUNT, TF_RES_FAIL, 0, e, 0, t0);
@@ -765,6 +1507,9 @@ static bool InitInternal(bool resetStats)
         s_init.indexState = TF_INDEX_LOADED;
     }
 
+#ifdef ESP_PLATFORM
+    s_init.stackFreeMinBytes = (int32_t)uxTaskGetStackHighWaterMark(NULL); /* IDF reports bytes */
+#endif
     s_init.ok = true;
     SetAvailable(true);
     return true;
@@ -794,11 +1539,28 @@ static bool LookupLocked(const char *icao24, TfHistoryRecord *out, uint32_t *buc
     NormalizeIcao(icao24, normIcao);
 
     int64_t t0 = NowUs();
-    TfIndexSlot slot;
-    if (!IndexFind(normIcao, &slot, NULL)) {
+    TfIdx ih;
+    IdxProbeResult pr;
+    if (!IdxOpen(&ih, false)) {
+        NoteRuntimeFail("lookup_index_open");
+        s_stats.errors++;
         s_stats.lookupMisses++;
         return false;
     }
+    IdxProbeStatus ps = IdxFindOrSlot(&ih, normIcao, &pr);
+    IdxClose(&ih);
+    if (ps == IDXP_ERR) {
+        NoteRuntimeFail("lookup_index_read");
+        s_stats.errors++;
+        s_stats.lookupMisses++;
+        return false;
+    }
+    RecordProbe(ps == IDXP_FOUND, pr.probes);
+    if (ps != IDXP_FOUND) {
+        s_stats.lookupMisses++;
+        return false;
+    }
+    const TfIndexSlot slot = pr.slot;
 
     char path[512];
     BucketPath(slot.bucketFingerprint, path, sizeof(path));
@@ -828,6 +1590,40 @@ static bool UpsertLocked(uint32_t bucketFingerprint, const TfHistoryRecord *rec)
 
     int64_t t0 = NowUs();
 
+    char normIcao[TF_ICAO_MAX];
+    NormalizeIcao(rec->icao24, normIcao);
+
+    /* 1. Probe the index FIRST (one open, closed before any other file is
+     *    opened). One pass answers "indexed?" and, if not, which slot a new
+     *    entry takes, so no second probe is ever needed. */
+    TfIdx ih;
+    IdxProbeResult pr;
+    if (!IdxOpen(&ih, false)) {
+        NoteRuntimeFail("upsert_index_open");
+        s_stats.errors++;
+        return false;
+    }
+    IdxProbeStatus ps = IdxFindOrSlot(&ih, normIcao, &pr);
+    IdxClose(&ih);
+    if (ps == IDXP_ERR) {
+        NoteRuntimeFail("upsert_index_probe");
+        s_stats.errors++;
+        return false;
+    }
+    RecordProbe(ps == IDXP_FOUND, pr.probes);
+    const bool found = (ps == IDXP_FOUND);
+
+    /* 2. Hard cap: a NEW aircraft is refused BEFORE anything is written, so
+     *    no unindexed orphan record exists and a History Manager retry cannot
+     *    create duplicates. The aircraft stays in Hot Seen (not our concern).
+     *    Aircraft already in the index keep updating normally. */
+    if (!found && s_stats.indexSlotsUsed >= TF_INDEX_HARD_CAP) {
+        s_stats.indexInsertCapRejected++;
+        snprintf(s_rtErr, sizeof(s_rtErr), "index_cap used=%u/%u", (unsigned)s_stats.indexSlotsUsed, (unsigned)TF_INDEX_SLOTS);
+        return false;
+    }
+    const uint32_t slotIdx = found ? pr.idx : pr.freeIdx;
+
     char path[512];
     TfBucketHeader hdr;
     if (!EnsureBucket(bucketFingerprint, path, &hdr)) {
@@ -840,41 +1636,51 @@ static bool UpsertLocked(uint32_t bucketFingerprint, const TfHistoryRecord *rec)
     od.pub = *rec;
     od.crc32 = Crc32(&od.pub, sizeof(od.pub));
 
-    char normIcao[TF_ICAO_MAX];
-    NormalizeIcao(rec->icao24, normIcao);
-
-    TfIndexSlot existing;
-    uint32_t existingIdx = 0;
-    bool found = IndexFind(normIcao, &existing, &existingIdx);
-
     bool ok;
-    if (found && existing.bucketFingerprint == bucketFingerprint) {
-        ok = WriteRecordAt(path, existing.recordOffset, &od);
+    if (found && pr.slot.bucketFingerprint == bucketFingerprint) {
+        ok = WriteRecordAt(path, pr.slot.recordOffset, &od);
         if (ok) s_stats.updates++;
-    } else if (found) {
-        /* Aircraft's classification moved it to a different Universal
-         * Value bucket since the last write (e.g. an operator's numeric
-         * code churned and the aircraft now resolves elsewhere). Append
-         * into the new bucket and repoint the index; the old bucket's
-         * record for this aircraft is simply superseded, not deleted -
-         * harmless, bounded, and simpler than in-place bucket migration. */
+    } else {
+        /* New aircraft, or its classification moved it to a different Universal
+         * Value bucket: append (the old bucket's record is superseded, never
+         * deleted) and write the reserved/existing index slot. If this exact
+         * record was appended earlier but its slot write failed, rewrite that
+         * record in place instead of appending a duplicate. */
         uint32_t newOffset = 0;
-        ok = AppendRecord(path, &hdr, &od, &newOffset);
+        const bool adopt = s_pending.valid && s_pending.fp == bucketFingerprint &&
+                           strncmp(s_pending.icao24, normIcao, TF_ICAO_MAX) == 0 &&
+                           (uint64_t)s_pending.offset + sizeof(TfOnDiskRecord) <=
+                               (uint64_t)hdr.recordCount * sizeof(TfOnDiskRecord);
+        if (adopt) {
+            newOffset = s_pending.offset;
+            ok = WriteRecordAt(path, newOffset, &od);
+            if (ok) s_stats.orphanAdopted++;
+        } else {
+            ok = AppendRecord(path, &hdr, &od, &newOffset);
+        }
         if (ok) {
             TfIndexSlot fresh;
-            memset(&fresh, 0, sizeof(fresh));
-            NormalizeIcao(normIcao, fresh.icao24);
-            fresh.bucketFingerprint = bucketFingerprint;
-            fresh.recordOffset = newOffset;
-            fresh.crc32 = IndexSlotCrc(&fresh);
-            ok = WriteIndexSlot(existingIdx, &fresh);
-            if (ok) s_stats.updates++;
+            IdxMakeSlot(&fresh, normIcao, bucketFingerprint, newOffset);
+            const bool wrote = IdxOpen(&ih, true) && IdxWriteSlot(&ih, slotIdx, &fresh);
+            IdxClose(&ih);
+            if (wrote) {
+                s_pending.valid = false;
+                if (found) {
+                    s_stats.updates++;
+                } else {
+                    s_stats.indexSlotsUsed++;
+                    IndexRefreshLoad();
+                    s_stats.creates++;
+                }
+            } else {
+                s_pending.valid = true;
+                NormalizeIcao(normIcao, s_pending.icao24);
+                s_pending.fp = bucketFingerprint;
+                s_pending.offset = newOffset;
+                s_stats.indexInsertIoFail++;
+                ok = false;
+            }
         }
-    } else {
-        uint32_t offset = 0;
-        ok = AppendRecord(path, &hdr, &od, &offset);
-        if (ok) ok = IndexPlace(normIcao, bucketFingerprint, offset, NULL);
-        if (ok) s_stats.creates++;
     }
 
     if (!ok) {
@@ -885,55 +1691,6 @@ static bool UpsertLocked(uint32_t bucketFingerprint, const TfHistoryRecord *rec)
 
     s_stats.writes++;
     UpdateTiming(&s_stats.lastWriteUs, &s_stats.bestWriteUs, &s_stats.worstWriteUs,
-                 (uint32_t)(NowUs() - t0));
-    return true;
-}
-
-static bool RebuildIndexLocked(void)
-{
-    if (!CreateEmptyIndexFile())
-        return false;
-
-    int64_t t0 = NowUs();
-    s_stats.indexSlotsUsed = 0;
-
-    /* Scan the three fixed bucket names we know about (special buckets)
-     * plus every operator fingerprint currently known to the Universal
-     * Value table - a bounded set, not a directory-listing sweep, which
-     * keeps this portable across host/ESP-IDF without a readdir()
-     * dependency. A bucket that predates the current Universal Value table
-     * (e.g. an operator removed many sessions ago and never resynced) is
-     * intentionally out of scope for this lightweight recovery pass -
-     * documented as a limitation; its file is untouched on disk either
-     * way, only its index entries would need a manual rebuild if that
-     * specific case ever matters in practice (PROMPT.md section 42). */
-    uint32_t knownBuckets[2] = {TF_BUCKET_UNASSIGNED, TF_BUCKET_REGISTRY_DEFINED};
-    for (size_t b = 0; b < 2; b++) {
-        char path[512];
-        BucketPath(knownBuckets[b], path, sizeof(path));
-        if (!BucketExists(path))
-            continue;
-        TfBucketHeader hdr;
-        if (!ReadBucketHeader(path, &hdr))
-            continue;
-        for (uint32_t off = 0; off < hdr.recordCount * (uint32_t)sizeof(TfOnDiskRecord);
-             off += (uint32_t)sizeof(TfOnDiskRecord)) {
-            TfOnDiskRecord rec;
-            if (!ReadRecordAt(path, off, &rec)) break;
-            if (rec.crc32 != Crc32(&rec.pub, sizeof(rec.pub))) {
-                s_stats.recoveryOps++;
-                continue; /* corrupt slot: skip, keep scanning the rest of the bucket */
-            }
-            if (rec.pub.icao24[0] == '\0')
-                continue;
-            IndexPlace(rec.pub.icao24, knownBuckets[b], off, NULL);
-        }
-    }
-
-    s_stats.indexRebuilds++;
-    UpdateTiming(&s_stats.lastIndexOpUs, &s_stats.bestIndexOpUs, &s_stats.worstIndexOpUs,
-                 (uint32_t)(NowUs() - t0));
-    UpdateTiming(&s_stats.lastRecoveryUs, &s_stats.bestRecoveryUs, &s_stats.worstRecoveryUs,
                  (uint32_t)(NowUs() - t0));
     return true;
 }
@@ -964,7 +1721,17 @@ bool TfHistory_RebuildIndex(void)
 {
     if (!Lock(TF_LOCK_FOREVER))
         return false;
-    bool r = RebuildIndexLocked();
+    bool r = false;
+    if (s_stats.mounted) {
+        SetAvailable(false); /* the index is unusable while it is rebuilt */
+        r = BuildIndexV2(false);
+        if (r) {
+            s_init.indexState = TF_INDEX_REBUILT;
+            SetAvailable(true);
+        } else {
+            s_init.indexState = TF_INDEX_FAILED;
+        }
+    }
     Unlock();
     return r;
 }
@@ -986,6 +1753,7 @@ void TfHistory_GetInitInfo(TfInitInfo *out)
     *out = s_init; /* unlocked snapshot, same as TfHistory_GetStats */
     out->historyDir = TF_HISTORY_DIR;
     out->indexPath = TF_INDEX_PATH;
+    out->legacyIndexPath = TF_INDEX_LEGACY_PATH;
     out->scratchPath = TF_SELFTEST_PATH;
     snprintf(out->lastRuntimeError, sizeof(out->lastRuntimeError), "%s", s_rtErr);
 }
@@ -1359,46 +2127,22 @@ static bool ParseBucketName(const char *name, uint32_t *fpOut)
     return true;
 }
 
-/* Index probe with ONE open of index.dat for the whole call (the existing
- * IndexFind() re-opens the file for every slot; that is fine for the
- * single-lookup radar path but wasteful when classifying a page). Same
- * probe order and the same empty / corrupt-slot rules as IndexFind().
- * Returns 1 found, 0 not in index, -1 I/O error. */
-static int IndexProbeOpen(FILE *f, const char *icao24, TfIndexSlot *out)
+/* Classifies one record against the index using an already-open index
+ * handle (one open per browse call; same probe rules as the radar path, but
+ * browsing never touches the probe counters). NULL handle => unknown. */
+static uint8_t ClassifyOpen(TfIdx *ih, const char *icao24, uint32_t fp, uint32_t recordIdx)
 {
-    uint32_t start = Fnv1a32(icao24) & (TF_INDEX_SLOTS - 1);
-    for (uint32_t i = 0; i < TF_INDEX_SLOTS; i++) {
-        uint32_t idx = (start + i) & (TF_INDEX_SLOTS - 1);
-        TfIndexSlot slot;
-        if (fseek(f, (long)((size_t)idx * sizeof(TfIndexSlot)), SEEK_SET) != 0 ||
-            fread(&slot, sizeof(slot), 1, f) != 1)
-            return -1;
-        if (slot.icao24[0] == '\0')
-            return 0;
-        if (slot.crc32 != IndexSlotCrc(&slot))
-            continue;
-        if (strncmp(slot.icao24, icao24, TF_ICAO_MAX) == 0) {
-            if (out)
-                *out = slot;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static uint8_t ClassifyOpen(FILE *idxFile, const char *icao24, uint32_t fp, uint32_t recordIdx)
-{
-    if (!idxFile)
+    if (!ih || !ih->f)
         return TF_REC_INDEX_UNKNOWN;
     char norm[TF_ICAO_MAX];
     NormalizeIcao(icao24, norm);
-    TfIndexSlot slot;
-    int r = IndexProbeOpen(idxFile, norm, &slot);
-    if (r < 0)
+    IdxProbeResult pr;
+    IdxProbeStatus r = IdxFindOrSlot(ih, norm, &pr);
+    if (r == IDXP_ERR)
         return TF_REC_INDEX_UNKNOWN;
-    if (r == 0)
+    if (r == IDXP_ABSENT)
         return TF_REC_NOT_INDEXED;
-    return (slot.bucketFingerprint == fp && slot.recordOffset == recordIdx * (uint32_t)sizeof(TfOnDiskRecord))
+    return (pr.slot.bucketFingerprint == fp && pr.slot.recordOffset == recordIdx * (uint32_t)sizeof(TfOnDiskRecord))
                ? TF_REC_LIVE
                : TF_REC_SUPERSEDED;
 }
@@ -1484,8 +2228,89 @@ TfBrowseStatus TfHistory_BucketInfo(uint32_t fp, uint32_t *recordCountOut)
     return TF_BR_OK;
 }
 
+static TfBrowseStatus BrowseChunkImpl(uint32_t fp, uint32_t startIdx, size_t maxN,
+                                      TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut, bool classify);
+
+TfBrowseStatus TfHistory_ListBuckets(bool afterValid, uint32_t after, size_t maxN, uint32_t *fps,
+                                     size_t *gotN, uint32_t *totalOut, bool *moreOut)
+{
+    if (gotN)
+        *gotN = 0;
+    if (totalOut)
+        *totalOut = 0;
+    if (moreOut)
+        *moreOut = false;
+    if (!fps || maxN == 0)
+        return TF_BR_IO;
+    if (maxN > TF_LIST_MAX)
+        maxN = TF_LIST_MAX;
+    if (!BrowseEnter())
+        return TF_BR_UNAVAILABLE;
+    if (!Lock(TF_LOCK_BROWSE_MS))
+        return TF_BR_BUSY;
+    if (!s_available) {
+        Unlock();
+        return TF_BR_UNAVAILABLE;
+    }
+    DIR *d = opendir(TF_HISTORY_DIR);
+    if (!d) {
+        Unlock();
+        return TF_BR_IO;
+    }
+    /* One directory pass: keep the maxN smallest fingerprints > after, sorted
+     * (bounded insertion into the caller's array; nothing else is held). */
+    size_t n = 0;
+    uint32_t total = 0, beyond = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint32_t fp;
+        if (!ParseBucketName(e->d_name, &fp))
+            continue;
+        total++;
+        if (afterValid && fp <= after)
+            continue;
+        if (n == maxN && fp >= fps[n - 1]) {
+            beyond++;
+            continue;
+        }
+        size_t pos = n == maxN ? n - 1 : n;
+        if (n == maxN)
+            beyond++; /* the current last one drops out */
+        while (pos > 0 && fps[pos - 1] > fp) {
+            fps[pos] = fps[pos - 1];
+            pos--;
+        }
+        fps[pos] = fp;
+        if (n < maxN)
+            n++;
+    }
+    closedir(d);
+    Unlock();
+    if (gotN)
+        *gotN = n;
+    if (totalOut)
+        *totalOut = total;
+    if (moreOut)
+        *moreOut = beyond > 0;
+    return n ? TF_BR_OK : TF_BR_END;
+}
+
+TfBrowseStatus TfHistory_ScanChunk(uint32_t fp, uint32_t startIdx, size_t maxN,
+                                   TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut)
+{
+    return BrowseChunkImpl(fp, startIdx, maxN, out, gotN, recordCountOut, false);
+}
+
 TfBrowseStatus TfHistory_BrowseChunk(uint32_t fp, uint32_t startIdx, size_t maxN,
                                      TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut)
+{
+    return BrowseChunkImpl(fp, startIdx, maxN, out, gotN, recordCountOut, true);
+}
+
+/* classify == false (search scan): records are only CRC-checked; the index is
+ * not opened, so a scan step is one header read + one sequential record read. */
+static TfBrowseStatus BrowseChunkImpl(uint32_t fp, uint32_t startIdx, size_t maxN,
+                                      TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut, bool classify)
 {
     if (gotN)
         *gotN = 0;
@@ -1546,7 +2371,9 @@ TfBrowseStatus TfHistory_BrowseChunk(uint32_t fp, uint32_t startIdx, size_t maxN
     }
 
     {
-        FILE *idx = fopen(TF_INDEX_PATH, "rb"); /* NULL => rows come back INDEX_UNKNOWN, never guessed */
+        TfIdx idx; /* open failure => rows come back INDEX_UNKNOWN, never guessed */
+        if (classify)
+            (void)IdxOpen(&idx, false);
         for (size_t i = 0; i < n; i++) {
             out[i].state = TF_REC_CORRUPT;
             memset(&out[i].rec, 0, sizeof(out[i].rec));
@@ -1555,10 +2382,11 @@ TfBrowseStatus TfHistory_BrowseChunk(uint32_t fp, uint32_t startIdx, size_t maxN
             out[i].rec = raw[i].pub;
             out[i].rec.icao24[TF_ICAO_MAX - 1] = '\0';
             out[i].rec.callsign[sizeof(out[i].rec.callsign) - 1] = '\0';
-            out[i].state = ClassifyOpen(idx, out[i].rec.icao24, fp, startIdx + (uint32_t)i);
+            out[i].state = classify ? ClassifyOpen(&idx, out[i].rec.icao24, fp, startIdx + (uint32_t)i)
+                                    : (uint8_t)TF_REC_INDEX_UNKNOWN;
         }
-        if (idx)
-            fclose(idx);
+        if (classify)
+            IdxClose(&idx);
     }
 
 done:
@@ -1580,10 +2408,10 @@ TfBrowseStatus TfHistory_IsLive(const char *icao24, uint32_t fp, uint32_t record
         Unlock();
         return TF_BR_UNAVAILABLE;
     }
-    FILE *idx = fopen(TF_INDEX_PATH, "rb");
-    *stateOut = ClassifyOpen(idx, icao24, fp, recordIdx);
-    if (idx)
-        fclose(idx);
+    TfIdx idx;
+    (void)IdxOpen(&idx, false);
+    *stateOut = ClassifyOpen(&idx, icao24, fp, recordIdx);
+    IdxClose(&idx);
     Unlock();
     return TF_BR_OK;
 }
@@ -1604,17 +2432,18 @@ TfBrowseStatus TfHistory_FindForBrowse(const char *icao24, TfBrowseRecord *out, 
     TfBrowseStatus st = TF_BR_END;
     char norm[TF_ICAO_MAX];
     NormalizeIcao(icao24, norm);
-    FILE *idx = fopen(TF_INDEX_PATH, "rb");
-    if (!idx) {
+    TfIdx idx;
+    if (!IdxOpen(&idx, false)) {
         Unlock();
         return TF_BR_IO;
     }
-    TfIndexSlot slot;
-    int r = IndexProbeOpen(idx, norm, &slot);
-    fclose(idx);
-    if (r < 0) {
+    IdxProbeResult pr;
+    IdxProbeStatus r = IdxFindOrSlot(&idx, norm, &pr);
+    IdxClose(&idx);
+    const TfIndexSlot slot = pr.slot;
+    if (r == IDXP_ERR) {
         st = TF_BR_IO;
-    } else if (r == 1) {
+    } else if (r == IDXP_FOUND) {
         char path[512];
         TfOnDiskRecord rec;
         BucketPath(slot.bucketFingerprint, path, sizeof(path));

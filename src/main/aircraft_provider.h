@@ -41,11 +41,22 @@
 #define GROUND_ALTITUDE_THRESHOLD_M 15.0f  // ~49 ft
 #define GROUND_VELOCITY_THRESHOLD_MS 8.5f  // ~30.6 km/h
 
+/* Aircraft.visState (see visibility_policy.h) */
+#define AIRCRAFT_VIS_NORMAL 0 /* airborne by the inflight rule */
+#define AIRCRAFT_VIS_GROUND 1 /* on the ground, shown by an airport/retention policy */
+#define AIRCRAFT_VIS_STALE 2  /* retained, no longer reported: last reported position until the stale timeout */
+
 typedef struct
 {
     char icao24[12];
     char callsign[16];
-    char originCountry[64];
+    /* 0.0.27: 64 -> 52 bytes to make room for `registration` without growing
+     * the 200-entry list (the longest OpenSky country name is ~41 chars). */
+    char originCountry[52];
+    /* Registration (tail number) when the provider sends one (adsb.lol "r";
+     * OpenSky never does). Upper-case letters, digits and '-'; "" = unknown.
+     * Same width as the TF History record field it is written to. */
+    char registration[12];
 
     CraftType craftType; /* cached classification at last parse; not used for
                            * drawing (radar/preview re-resolve live), kept for
@@ -59,6 +70,15 @@ typedef struct
     float heading;
 
     bool valid;
+    /* AIRCRAFT_VIS_* (visibility_policy.h): why this aircraft is in the list.
+     * 0 = normal airborne aircraft (the only state with default settings).
+     * Sits in existing padding, so the struct size is unchanged. */
+    uint8_t visState;
+    /* 0.0.30: vertical rate in ft/min as reported by the provider (OpenSky
+     * vertical_rate, adsb.lol baro_rate / geom_rate), clamped to int16; valid
+     * only with AIRCRAFT_DATA_VRATE. Display only (Selected Craft trend arrow).
+     * Sits in existing padding: the struct size is unchanged. */
+    int16_t verticalRateFpm;
 
     float predictedLat;
     float predictedLon;
@@ -74,6 +94,10 @@ typedef struct
      * falls through to AIRCRAFT_FIXED_WING. */
     AircraftType providerTypeHint;
     bool hasProviderTypeHint;
+    /* 0.0.30: AIRCRAFT_DATA_* bits - which optional values the provider
+     * actually sent (a missing value is stored as 0 above, as before). Display
+     * only; filtering, ground detection and classification never read it. */
+    uint8_t dataFlags;
 
     /* Operator/owner name as supplied by the provider (empty when the
      * provider gives none - OpenSky never does). Plain printable ASCII with
@@ -115,6 +139,22 @@ static inline void AircraftText_Sanitize(char *dst, size_t cap, const char *src)
     dst[used] = '\0';
 }
 
+#define AIRCRAFT_DATA_VELOCITY 0x01 /* velocity was reported */
+#define AIRCRAFT_DATA_VRATE 0x02    /* verticalRateFpm was reported */
+_Static_assert(sizeof(Aircraft) == 180, "Aircraft must stay 180 bytes (200-entry list in internal RAM)");
+
+/* ft/min from a provider value, clamped to the int16 field. */
+static inline int16_t Aircraft_ClampFpm(double fpm)
+{
+    if (!(fpm == fpm))
+        return 0;
+    if (fpm > 32000.0)
+        return 32000;
+    if (fpm < -32000.0)
+        return -32000;
+    return (int16_t)(fpm < 0 ? fpm - 0.5 : fpm + 0.5);
+}
+
 extern Aircraft gAircraft[MAX_AIRCRAFT];
 extern int gAircraftCount;
 
@@ -143,8 +183,33 @@ typedef enum {
  * else here uses - no second settings store). */
 void AircraftProvider_Init(void);
 
+/* Legacy single selection: the first enabled provider (logs, older callers).
+ * SetActive enables exactly that one provider. */
 AircraftProviderType AircraftProvider_GetActive(void);
 void AircraftProvider_SetActive(AircraftProviderType type); /* persists to NVS */
+
+/* ---- independent providers (0.0.28) ----
+ *
+ * OpenSky and adsb.lol are enabled independently (one, the other or both) and
+ * each keeps its own poll interval. Stored in NVS "radar": "prov_mask"
+ * (enabled bits) and "int_osky" / "int_adsb" (seconds); changing one never
+ * writes the other. Disabled providers keep their interval for later. */
+#define AIRCRAFT_PROVIDER_ALL_MASK ((uint8_t)((1u << AIRCRAFT_PROVIDER_COUNT) - 1u))
+#define PROVIDER_INTERVAL_DEFAULT_SEC 25u
+#define PROVIDER_INTERVAL_MAX_SEC 600u
+uint8_t AircraftProvider_EnabledMask(void);
+bool AircraftProvider_IsEnabled(AircraftProviderType type);
+bool AircraftProvider_SetEnabledMask(uint8_t mask); /* false (nothing changed) when no provider is enabled */
+uint32_t AircraftProvider_MinIntervalSecondsFor(AircraftProviderType type); /* OpenSky 10, adsb.lol 5 */
+uint32_t AircraftProvider_GetIntervalSeconds(AircraftProviderType type);
+bool AircraftProvider_SetIntervalSeconds(AircraftProviderType type, uint32_t seconds); /* false if out of range */
+/* First boot after the upgrade: the provider in use stays the only enabled
+ * one and takes the old single refresh interval; the other gets the default. */
+void AircraftProvider_MigrateLegacyInterval(uint32_t legacySeconds);
+/* How old another provider's last list may be and still be merged in
+ * (the poll loop sets 2 x that provider's effective interval). */
+void AircraftProvider_SetMergeMaxAgeMs(AircraftProviderType type, uint32_t ms);
+uint32_t AircraftProvider_MergeMaxAgeMs(AircraftProviderType type);
 
 ProviderDebugLevel AircraftProvider_GetDebugLevel(void);
 void AircraftProvider_SetDebugLevel(ProviderDebugLevel level); /* persists to NVS */
@@ -158,8 +223,9 @@ bool ProviderDebugLevel_Parse(const char *token, ProviderDebugLevel *out);
 
 /* ---- dispatch to the active provider ---- */
 
-bool AircraftProvider_HasCredentials(void); /* adsb.lol: always true, no credentials needed */
-uint32_t AircraftProvider_GetRateLimitSeconds(void); /* remaining 429 backoff, 0 if none */
+bool AircraftProvider_HasCredentials(void); /* any enabled provider can poll (adsb.lol needs no credentials) */
+uint32_t AircraftProvider_GetRateLimitSeconds(void); /* longest remaining 429 backoff of the enabled providers, 0 if none */
+AircraftProviderType AircraftProvider_RateLimitedProvider(void); /* the provider that backoff belongs to */
 
 /* Reuses the existing radar center/range configuration - no separate
  * per-provider location setting. Internally builds whatever query shape the
@@ -172,6 +238,15 @@ bool AircraftProvider_GetAircraftJson(
     const char **json);
 
 bool AircraftProvider_ParseAircraft(const char *json);
+
+/* Per-provider forms (0.0.28). ParseAircraftFor parses one provider's
+ * response; with several providers enabled gAircraft is then the ICAO24
+ * merge of every provider's latest fresh list (provider_merge.h). */
+bool AircraftProvider_HasCredentialsFor(AircraftProviderType type);
+uint32_t AircraftProvider_GetRateLimitSecondsFor(AircraftProviderType type);
+bool AircraftProvider_GetAircraftJsonFor(AircraftProviderType type, float centerLat, float centerLon, float radiusKm,
+                                         const char **json);
+bool AircraftProvider_ParseAircraftFor(AircraftProviderType type, const char *json);
 
 /* The active provider's documented safe minimum poll interval; the poll loop
  * in main.c clamps the user-configured interval to this so the UI can't be

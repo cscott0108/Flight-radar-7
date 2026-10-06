@@ -1,5 +1,6 @@
 #include "history_manager.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -10,6 +11,7 @@
 #endif
 
 #include "aircraft_provider.h" /* MAX_AIRCRAFT */
+#include "diag_telemetry.h"
 #include "seen_aircraft.h"     /* SeenAircraft_NormalizeIcao, SEEN_VISIT_GAP_SEC - reused, not duplicated */
 #include "tf_history.h"
 #include "universal_value.h"
@@ -45,6 +47,15 @@ static HmSlot *s_slots = NULL;
 static volatile bool s_tfReady = false; /* volatile: also toggled from the web task (diag pause/resume) */
 static uint32_t s_lastSyncMonotonicSec = 0;
 static bool s_haveLastSync = false;
+
+/* Manual flush hand-off. The web task only bumps s_flushReq and waits; the
+ * poll task (sole owner of the shadow table) performs the pass from
+ * FlushIfDue and publishes the result BEFORE advancing s_flushServed
+ * (release/acquire), so a requester that sees its sequence served also sees
+ * that pass's result. Nothing here touches the periodic schedule. */
+static _Atomic uint32_t s_flushReq = 0;
+static _Atomic uint32_t s_flushServed = 0;
+static _Atomic uint32_t s_resOk = 0, s_resWritten = 0, s_resFailed = 0, s_resRemaining = 0, s_resReason = 0;
 
 bool HistoryManager_Init(void)
 {
@@ -149,6 +160,21 @@ static uint32_t DetermineBucket(CraftResolution resolution, uint16_t *uvCodeOut)
     return TF_BUCKET_UNASSIGNED;
 }
 
+void HistoryManager_ObserveRegistration(const char *icao24, const char *registration)
+{
+    if (!icao24 || !registration || !registration[0])
+        return;
+    char norm[TF_ICAO_MAX];
+    if (!SeenAircraft_NormalizeIcao(icao24, norm))
+        return;
+    HmSlot *s = FindSlot(norm);
+    if (!s || strncmp(s->rec.registry, registration, TF_REGISTRY_MAX - 1) == 0)
+        return;
+    memset(s->rec.registry, 0, sizeof(s->rec.registry));
+    strncpy(s->rec.registry, registration, TF_REGISTRY_MAX - 1);
+    s->dirty = true;
+}
+
 void HistoryManager_Observe(
     const char *icao24,
     const char *callsign,
@@ -220,21 +246,12 @@ void HistoryManager_Observe(
     s->dirty = true;
 }
 
-bool HistoryManager_FlushIfDue(uint32_t nowMonotonicSec)
+/* One write pass over the dirty shadow slots (poll task only). */
+static bool FlushDirtySlots(uint32_t *written, uint32_t *failed, uint32_t *remaining)
 {
-    if (s_haveLastSync && (nowMonotonicSec - s_lastSyncMonotonicSec) < HM_SYNC_INTERVAL_SEC)
-        return false;
-    s_lastSyncMonotonicSec = nowMonotonicSec;
-    s_haveLastSync = true;
-
-    /* Keep Universal Values current against operators.csv before writing,
-     * so web_rules.c needs no changes of its own (PROMPT.md section 7/8). */
-    UniversalValue_Sync();
-
-    if (!s_slots || !s_tfReady || !TfHistory_IsAvailable())
-        return false;
-
     bool wroteAny = false;
+    uint32_t t0 = DiagTelemetry_NowMs();
+    *written = *failed = *remaining = 0;
     for (size_t i = 0; i < HM_CAP; i++) {
         HmSlot *s = &s_slots[i];
         if (!s->used || !s->dirty)
@@ -245,9 +262,89 @@ bool HistoryManager_FlushIfDue(uint32_t nowMonotonicSec)
             s->dirty = false;
             s->haveTf = true;
             wroteAny = true;
+            (*written)++;
+        } else {
+            (*failed)++;
+            (*remaining)++;
         }
     }
+    /* Only passes that actually had dirty entries count as a run (idle passes would drown the numbers). */
+    if (*written + *failed > 0)
+        DiagTelemetry_OpEnd(DT_OP_TF_FLUSH, t0, *failed == 0, "TF write failed");
     return wroteAny;
+}
+
+static bool AnyDirty(void)
+{
+    for (size_t i = 0; s_slots && i < HM_CAP; i++)
+        if (s_slots[i].used && s_slots[i].dirty)
+            return true;
+    return false;
+}
+
+static void ServeManualFlush(void)
+{
+    uint32_t req = atomic_load_explicit(&s_flushReq, memory_order_acquire);
+    if (req == atomic_load_explicit(&s_flushServed, memory_order_relaxed))
+        return;
+    uint32_t w = 0, f = 0, rem = 0, reason = 0;
+    if (!s_slots || !s_tfReady || !TfHistory_IsAvailable()) {
+        reason = 1; /* TF unavailable: nothing could be written */
+        if (AnyDirty())
+            DiagTelemetry_OpDone(DT_OP_TF_FLUSH, DT_RES_SKIPPED, 0, NULL);
+    }
+    else
+        FlushDirtySlots(&w, &f, &rem);
+    atomic_store_explicit(&s_resWritten, w, memory_order_relaxed);
+    atomic_store_explicit(&s_resFailed, f, memory_order_relaxed);
+    atomic_store_explicit(&s_resRemaining, rem, memory_order_relaxed);
+    atomic_store_explicit(&s_resReason, reason, memory_order_relaxed);
+    atomic_store_explicit(&s_resOk, (reason == 0 && f == 0) ? 1u : 0u, memory_order_relaxed);
+    atomic_store_explicit(&s_flushServed, req, memory_order_release);
+}
+
+bool HistoryManager_FlushIfDue(uint32_t nowMonotonicSec)
+{
+    ServeManualFlush(); /* honoured every slice, independent of the interval gate */
+
+    if (s_haveLastSync && (nowMonotonicSec - s_lastSyncMonotonicSec) < HM_SYNC_INTERVAL_SEC)
+        return false;
+    s_lastSyncMonotonicSec = nowMonotonicSec;
+    s_haveLastSync = true;
+
+    /* Keep Universal Values current against operators.csv before writing,
+     * so web_rules.c needs no changes of its own (PROMPT.md section 7/8). */
+    UniversalValue_Sync();
+
+    if (!s_slots || !s_tfReady || !TfHistory_IsAvailable()) {
+        if (AnyDirty())
+            DiagTelemetry_OpDone(DT_OP_TF_FLUSH, DT_RES_SKIPPED, 0, NULL); /* due, but TF is unavailable */
+        return false;
+    }
+
+    uint32_t w, f, rem;
+    return FlushDirtySlots(&w, &f, &rem);
+}
+
+uint32_t HistoryManager_RequestFlush(void)
+{
+    return atomic_fetch_add_explicit(&s_flushReq, 1u, memory_order_acq_rel) + 1u;
+}
+
+bool HistoryManager_GetFlushResult(uint32_t seq, HistoryFlushResult *out)
+{
+    /* Wrap-safe "served >= seq". */
+    uint32_t served = atomic_load_explicit(&s_flushServed, memory_order_acquire);
+    if ((int32_t)(served - seq) < 0)
+        return false;
+    if (out) {
+        out->ok = atomic_load_explicit(&s_resOk, memory_order_relaxed) != 0;
+        out->written = atomic_load_explicit(&s_resWritten, memory_order_relaxed);
+        out->failed = atomic_load_explicit(&s_resFailed, memory_order_relaxed);
+        out->remaining = atomic_load_explicit(&s_resRemaining, memory_order_relaxed);
+        out->tfUnavailable = atomic_load_explicit(&s_resReason, memory_order_relaxed) != 0;
+    }
+    return true;
 }
 
 void HistoryManager_TfPause(void)

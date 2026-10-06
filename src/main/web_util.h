@@ -19,3 +19,11 @@ void WebUtil_UrlDecodeInPlace(char *s);
  * Always NUL-terminates; truncates on a whole-character boundary. Returns the
  * length written. */
 size_t WebUtil_UrlEncode(char *dst, size_t cap, const char *src);
+
+/* Web search text for the Lookup button (0.0.28): always names the subject as
+ * an aircraft so a call sign that resembles a part number or product code
+ * still finds aircraft. Both known: "aircraft ICAO24 a1b2c3 callsign N12345";
+ * one known: "aircraft ICAO24 a1b2c3" / "aircraft callsign N12345"; neither:
+ * "" (the button is disabled). Leading/trailing spaces of the inputs are
+ * ignored. Returns the length written (always NUL-terminated). */
+size_t WebUtil_BuildLookupQuery(char *dst, size_t cap, const char *icao24, const char *callsign);

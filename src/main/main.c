@@ -22,6 +22,7 @@
 #include <math.h>
 #include <time.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 #include "esp_sntp.h"
 
@@ -29,6 +30,7 @@
 #include "opensky_client.h"
 #include "adsblol_client.h"
 #include "aircraft_provider.h"
+#include "visibility_policy.h" // 0.0.29: boot-time lock/settings init (app_main)
 #include "webserver.h"
 #include "radar.h"
 #include "custom_rules.h"
@@ -36,10 +38,14 @@
 #include "airports.h"
 #include "seen_aircraft.h"
 #include "history_manager.h"
+#include "wifi_profiles.h"
 #include "adv_diag.h"
 #include "boot_warmup.h"
+#include "diag_telemetry.h"
 #include "expert_debug.h"
 #include "fr_lv_pool.h"
+#include "idle_maint.h"
+#include "esp_timer.h"
 
 // Build-time A/B switch: flip to 0 and reflash to test whether TF/SD mount
 // is contributing to internal-heap fragmentation behind the
@@ -164,6 +170,9 @@ volatile bool wifiConnectedEvent = false;
 bool wifiConnectedState = false;
 static uint32_t lastApiUpdateMs = 0;
 static lv_obj_t *rateLimitUiLabel = NULL;
+static lv_obj_t *idleStatusLabel = NULL; // zero-aircraft status, a child of the radar image
+// Idle-maintenance phase for the display (IdleMaintPhase), written by RadarTask only, read by the UI.
+static volatile uint8_t idleMaintPhase = IDLE_MAINT_PHASE_NONE;
 
 static void radar_sweep_timer_cb(
     lv_timer_t *t)
@@ -183,7 +192,11 @@ static WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS];
 static uint16_t wifiNetworkCount = 0;
 
 char bootSSID[33] = {0};
-char bootPass[65] = {0};
+
+// SSID of the network the radio is currently trying/using (display only). Written by the task that starts a connection.
+static char currentSSID[33] = "";
+// Web "Connect" request (slot to join), applied on the LVGL timer so Wi-Fi calls never run on the httpd task.
+static volatile int pendingWifiSlot = -1;
 
 esp_err_t http_event_handler(
     esp_http_client_event_t *evt)
@@ -239,28 +252,167 @@ void SaveRadarSettings(
     }
 }
 
+/* 0.0.30 Selected Craft: the Note / Airline row (created at runtime under the
+ * Heading card, styled like it) and the Speed card that can be hidden. */
+static lv_obj_t *selInfoCard = NULL, *selInfoTitle = NULL, *selInfoValue = NULL;
+#define uic_ContainerCardSpeed ui_ContainerCard6
+#define SEL_CATEGORY_DEFAULT_RGB 0x00A4F9 /* the Craft Type value's color in the screen design */
+
+/* HOSTTEST:BEGIN selui (extracted verbatim by host_tests/display_idle_test.c) */
+/* ---- 0.0.30 Selected Craft additions (presentation only) ----
+ *
+ * Altitude trend: from the climb rate the provider reports (Aircraft.verticalRateFpm,
+ * AIRCRAFT_DATA_VRATE), never from a single altitude sample and never from
+ * altitudes of different providers (OpenSky geometric vs adsb.lol barometric).
+ * An arrow appears only after two consecutive provider reports agree (>= 400
+ * ft/min up or down) and stays until a report drops below 200 ft/min
+ * (hysteresis), so small variations never make it flicker. State is for the
+ * selected aircraft only and resets when the selection changes. */
+#define SEL_TREND_ON_FPM 400
+#define SEL_TREND_OFF_FPM 200
+
+static int SelectedAltitudeTrend(const Aircraft *a)
+{
+    static char icao[sizeof(a->icao24)];
+    static uint32_t seenPollMs;
+    static bool havePoll;
+    static int shown, pending;
+    if (strcmp(icao, a->icao24) != 0)
+    {
+        snprintf(icao, sizeof(icao), "%s", a->icao24);
+        havePoll = false;
+        shown = pending = 0;
+    }
+    if (havePoll && seenPollMs == lastApiUpdateMs)
+        return shown; /* no new provider report since the last evaluation */
+    havePoll = true;
+    seenPollMs = lastApiUpdateMs;
+
+    int dir = 0;
+    if (a->dataFlags & AIRCRAFT_DATA_VRATE)
+    {
+        const int rate = a->verticalRateFpm;
+        if (shown > 0 && rate >= SEL_TREND_OFF_FPM)
+            dir = 1;
+        else if (shown < 0 && rate <= -SEL_TREND_OFF_FPM)
+            dir = -1;
+        else if (rate >= SEL_TREND_ON_FPM)
+            dir = 1;
+        else if (rate <= -SEL_TREND_ON_FPM)
+            dir = -1;
+    }
+    if (dir == 0)
+    {
+        shown = pending = 0; /* level, or the rate is not reported */
+    }
+    else if (dir == shown)
+    {
+        pending = dir;
+    }
+    else if (dir == pending)
+    {
+        shown = dir; /* second consecutive report in this direction */
+    }
+    else
+    {
+        pending = dir; /* first report only: no arrow yet */
+        shown = 0;
+    }
+    return shown;
+}
+
+/* The row under Heading: the matched Registered Aircraft rule's Note when it
+ * has one, otherwise the airline (configured operator from the call sign, else
+ * the operator the provider supplied), otherwise nothing (row hidden). Reuses
+ * the registry and operator stores; honours the Registered Aircraft /
+ * Operators switches like the radar does. */
+static const char *SelectedInfoRow(const Aircraft *a, const CraftResolution *res, char *value, size_t cap)
+{
+    value[0] = '\0';
+    if (res->source == CRAFT_SRC_REGISTRY)
+    {
+        CustomRule rule;
+        if (CustomRules_FindEntry(res->registryIcao24, res->registryPrefix, &rule) && rule.notes[0])
+        {
+            snprintf(value, cap, "%s", rule.notes);
+            return "Note";
+        }
+    }
+    if (Features_OperatorsEnabled())
+    {
+        char code[MAX_OPERATOR_CODE + 1];
+        OperatorInfo op;
+        if (Operators_CodeFromCallsign(a->callsign, code) && Operators_Find(code, &op) && op.name[0])
+        {
+            snprintf(value, cap, "%s", op.name);
+            return "Airline";
+        }
+    }
+    if (a->operatorName[0])
+    {
+        snprintf(value, cap, "%s", a->operatorName);
+        return "Airline";
+    }
+    return NULL;
+}
+
+static void ShowObject(lv_obj_t *o, bool show)
+{
+    if (!o)
+        return;
+    if (show)
+        lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Callers hold the LVGL lock. lv_label_set_text re-allocates and invalidates even for identical text,
+ * so the count is only rewritten when it changes and the empty panel is painted once per empty period
+ * (keyed on the label object, so a recreated screen is always repainted). A real aircraft always
+ * repaints, as before. */
 void UpdateSelectedAircraftUI(void)
 {
+    static int shownCount = -1;
+    static lv_obj_t *blankPaintedOn = NULL; /* non-NULL: the panel currently shows "---" */
+    static lv_obj_t *countPaintedOn = NULL;
+
     Aircraft *a =
         Radar_GetSelectedAircraft();
 
-    lv_label_set_text_fmt(
-        uic_LabelPlaneCount,
-        "%d",
-        gAircraftCount);
+    if (gAircraftCount != shownCount || countPaintedOn != uic_LabelPlaneCount)
+    {
+        lv_label_set_text_fmt(
+            uic_LabelPlaneCount,
+            "%d",
+            gAircraftCount);
+        shownCount = gAircraftCount;
+        countPaintedOn = uic_LabelPlaneCount;
+    }
+
+    // 0.0.30: the Speed row is optional (Setup > Features & appearance); a
+    // hidden row collapses in the panel's column layout. Flag changes only
+    // invalidate when the state actually changes.
+    ShowObject(uic_ContainerCardSpeed, Features_PanelSpeed());
 
     if (!a)
     {
         // No aircraft in range: blank the panel instead of leaving
-        // the last aircraft's details on screen.
+        // the last aircraft's details on screen (once per empty period).
+        if (blankPaintedOn == uic_LabelCraftName)
+            return;
         lv_label_set_text(uic_LabelCraftName, "---");
         lv_label_set_text(uic_LabelCraftOrigin, "---");
         lv_label_set_text(uic_LabelCraftSpeed, "---");
         lv_label_set_text(uic_LabelCraftAlt, "---");
         lv_label_set_text(uic_LabelCraftHeading, "---");
         lv_label_set_text(uic_LabelCraftCategory, "---");
+        lv_obj_set_style_text_color(uic_LabelCraftCategory, lv_color_hex(SEL_CATEGORY_DEFAULT_RGB), LV_PART_MAIN);
+        ShowObject(selInfoCard, false);
+        blankPaintedOn = uic_LabelCraftName;
         return;
     }
+
+    blankPaintedOn = NULL;
 
     lv_label_set_text(
         uic_LabelCraftName,
@@ -272,21 +424,31 @@ void UpdateSelectedAircraftUI(void)
 
     char buf[64];
 
+    // Speed: unchanged format; a speed the provider did not send shows the
+    // panel's "---" instead of 0.
+    if (a->dataFlags & AIRCRAFT_DATA_VELOCITY)
+    {
+        snprintf(
+            buf,
+            sizeof(buf),
+            "%.0f km/h",
+            a->velocity * 3.6f);
+        lv_label_set_text(
+            uic_LabelCraftSpeed,
+            buf);
+    }
+    else
+    {
+        lv_label_set_text(uic_LabelCraftSpeed, "---");
+    }
+
+    const int trend = Features_PanelAltTrend() ? SelectedAltitudeTrend(a) : 0;
     snprintf(
         buf,
         sizeof(buf),
-        "%.0f km/h",
-        a->velocity * 3.6f);
-
-    lv_label_set_text(
-        uic_LabelCraftSpeed,
-        buf);
-
-    snprintf(
-        buf,
-        sizeof(buf),
-        "%.0f ft",
-        a->altitude * 3.28084f);
+        "%.0f ft%s",
+        a->altitude * 3.28084f,
+        trend > 0 ? " " LV_SYMBOL_UP : trend < 0 ? " " LV_SYMBOL_DOWN : "");
 
     lv_label_set_text(
         uic_LabelCraftAlt,
@@ -302,10 +464,109 @@ void UpdateSelectedAircraftUI(void)
         uic_LabelCraftHeading,
         buf);
 
+    // One resolution (the same one the radar uses for this aircraft's color):
+    // the Craft Type value carries its classification color.
+    const CraftResolution res = ResolveAircraft(a->callsign, a->icao24);
     lv_label_set_text(
         uic_LabelCraftCategory,
-        CraftType_Name(evaluateAircraftType(a->callsign, a->icao24)));
+        CraftType_Name(res.type));
+    lv_obj_set_style_text_color(uic_LabelCraftCategory, lv_color_hex(CraftType_ColorRgb(res.type)), LV_PART_MAIN);
+
+    // Note / Airline row under Heading (hidden when neither is known).
+    if (selInfoCard)
+    {
+        char value[MAX_RULE_NOTES + 1];
+        const char *title = SelectedInfoRow(a, &res, value, sizeof(value));
+        if (title)
+        {
+            lv_label_set_text(selInfoTitle, title);
+            lv_label_set_text(selInfoValue, value);
+        }
+        ShowObject(selInfoCard, title != NULL);
+    }
 }
+/* HOSTTEST:END selui */
+
+/* 0.0.30: one more card in the Selected Craft column, directly under Heading,
+ * built exactly like the Heading card (ui_Screen1.c ContainerCard10): 50 px,
+ * card background, 12 px gray title at (10,2), 16 px value centered. The
+ * column (ui_PanelRight, flex) has room for one more card below Heading. A
+ * long value ends in "..." within the card. Hidden until there is something
+ * to show. Called once, with the LVGL lock held, after ui_init(). */
+static void CreateSelectedInfoRow(void)
+{
+    if (!ui_PanelRight || selInfoCard)
+        return;
+    selInfoCard = lv_obj_create(ui_PanelRight);
+    lv_obj_remove_style_all(selInfoCard);
+    lv_obj_set_height(selInfoCard, 50);
+    lv_obj_set_width(selInfoCard, lv_pct(100));
+    lv_obj_clear_flag(selInfoCard, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    ui_object_set_themeable_style_property(selInfoCard, LV_PART_MAIN | LV_STATE_DEFAULT, LV_STYLE_BG_COLOR,
+                                           _ui_theme_color_CardBG);
+    ui_object_set_themeable_style_property(selInfoCard, LV_PART_MAIN | LV_STATE_DEFAULT, LV_STYLE_BG_OPA,
+                                           _ui_theme_alpha_CardBG);
+
+    selInfoTitle = lv_label_create(selInfoCard);
+    lv_obj_set_width(selInfoTitle, LV_SIZE_CONTENT);
+    lv_obj_set_height(selInfoTitle, LV_SIZE_CONTENT);
+    lv_obj_set_x(selInfoTitle, 10);
+    lv_obj_set_y(selInfoTitle, 2);
+    lv_label_set_text(selInfoTitle, "Airline");
+    ui_object_set_themeable_style_property(selInfoTitle, LV_PART_MAIN | LV_STATE_DEFAULT, LV_STYLE_TEXT_COLOR,
+                                           _ui_theme_color_Gray);
+    ui_object_set_themeable_style_property(selInfoTitle, LV_PART_MAIN | LV_STATE_DEFAULT, LV_STYLE_TEXT_OPA,
+                                           _ui_theme_alpha_Gray);
+    lv_obj_set_style_text_font(selInfoTitle, &lv_font_montserrat_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    selInfoValue = lv_label_create(selInfoCard);
+    lv_obj_set_width(selInfoValue, 176); /* card is 190 px wide: keeps a long note inside it */
+    lv_obj_set_height(selInfoValue, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(selInfoValue, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(selInfoValue, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_x(selInfoValue, 0);
+    lv_obj_set_y(selInfoValue, 5);
+    lv_obj_set_align(selInfoValue, LV_ALIGN_CENTER);
+    lv_label_set_text(selInfoValue, "");
+    lv_obj_set_style_text_color(selInfoValue, lv_color_hex(0x00A4F9), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_opa(selInfoValue, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(selInfoValue, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_add_flag(selInfoCard, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* HOSTTEST:BEGIN idleui (extracted verbatim by host_tests/display_idle_test.c) */
+// Callers hold the LVGL lock. Static on-radar status for zero-aircraft periods (no timer, no animation):
+// the text/colour/visibility are touched only when the selected status changes, so a static radar stays
+// static - the label's own area is the only thing LVGL repaints, once per change.
+static void UpdateIdleStatusUI(void)
+{
+    static IdleStatus shown = IDLE_STATUS_NONE; // the label is created hidden
+
+    if (!idleStatusLabel)
+        return;
+
+    IdleStatus s = IdleStatus_Select(gAircraftCount, Radar_IsDisplayIdle(), (IdleMaintPhase)idleMaintPhase);
+    if (s == shown)
+        return;
+
+    if (s == IDLE_STATUS_NONE)
+    {
+        lv_obj_add_flag(idleStatusLabel, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_label_set_text_static(idleStatusLabel, IdleStatus_Text(s));
+        // Warnings in amber (non-alarming), everything else in the radar's own green.
+        lv_obj_set_style_text_color(idleStatusLabel,
+                                    s == IDLE_STATUS_MAINT_WARN ? lv_color_hex(0xFFB000) : lv_palette_main(LV_PALETTE_GREEN),
+                                    LV_PART_MAIN);
+        if (shown == IDLE_STATUS_NONE)
+            lv_obj_clear_flag(idleStatusLabel, LV_OBJ_FLAG_HIDDEN);
+    }
+    shown = s;
+}
+/* HOSTTEST:END idleui */
 
 void setUICoords()
 {
@@ -531,6 +792,7 @@ static void ApplyBacklightDuty(
     ledc_update_duty(BACKLIGHT_LEDC_MODE, BACKLIGHT_LEDC_CHANNEL);
 }
 
+/* HOSTTEST:BEGIN cfgio (extracted verbatim by host_tests/seen_policy_test.c) */
 // Shared helper: NVS get/set for a single u32 setting under RADAR_NAMESPACE.
 static bool LoadRadarU32Setting(
     const char *key,
@@ -594,6 +856,8 @@ static void SaveRadarU32Setting(
         nvs_close(handle);
     }
 }
+
+/* HOSTTEST:END cfgio */
 
 // String setting under RADAR_NAMESPACE (used for the IANA time zone id).
 static bool LoadRadarStringSetting(
@@ -872,6 +1136,37 @@ void SetRadarDayNightSchedule(
     SaveRadarU32Setting("nightint", radarNightIntervalSec);
 }
 
+/* HOSTTEST:BEGIN seenpol */
+void SetSeenEvictionPolicy(int policy)
+{
+    if (policy < 0 || policy >= SEEN_EVICT_COUNT)
+        return;
+    SeenAircraft_SetEvictionPolicy((SeenEvictionPolicy)policy);
+    SaveRadarU32Setting("seenpol", (uint32_t)policy);
+    DiagTelemetry_Event("Seen eviction policy set to %s", SeenEvictionPolicy_Name((SeenEvictionPolicy)policy));
+}
+
+static void LoadSeenEvictionPolicy(void)
+{
+    uint32_t stored = 0;
+    if (LoadRadarU32Setting("seenpol", &stored) && stored < SEEN_EVICT_COUNT)
+        SeenAircraft_SetEvictionPolicy((SeenEvictionPolicy)stored);
+}
+/* HOSTTEST:END seenpol */
+
+void SetRadarAutoSelect(bool enabled)
+{
+    SaveRadarU32Setting("autosel", enabled ? 1 : 0);
+
+    if (lvgl_port_lock(-1))
+    {
+        Radar_SetAutoSelectClosest(enabled);
+        UpdateSelectedAircraftUI();
+        Radar_Refresh();
+        lvgl_port_unlock();
+    }
+}
+
 bool GetRadarOpenSkyDebugEnabled(void)
 {
     return radarOpenSkyDebugEnabled;
@@ -1031,6 +1326,7 @@ static bool IsCurrentlyDaytime(
 // a sentinel on the timestamp) since 0 is a legitimately reachable tick
 // count - overloading it could make a streak that happens to start at
 // tick 0 perpetually re-anchor to "now" and never actually accumulate.
+/* HOSTTEST:BEGIN bright (extracted verbatim by host_tests/display_idle_test.c) */
 static bool zeroAircraftStreakActive = false;
 static uint32_t zeroAircraftSinceMs = 0;
 
@@ -1075,7 +1371,13 @@ static void UpdateDayNightBrightness(void)
 {
     uint32_t desiredPercent;
 
-    if (IsIdleDimActive())
+    bool idleDim = IsIdleDimActive();
+
+    // Tell the radar renderer; it freezes only while this is true AND there
+    // are zero aircraft (radar.c). Plain flag store, no LVGL call.
+    Radar_SetIdleDimActive(idleDim);
+
+    if (idleDim)
     {
         desiredPercent = radarIdleDimPercent;
     }
@@ -1114,59 +1416,44 @@ static void UpdateDayNightBrightness(void)
         lastAppliedPercent = desiredPercent;
     }
 }
+/* HOSTTEST:END bright */
 
-// Effective poll interval for the CURRENT cycle. Day/night scheduling (if
-// enabled) picks the base interval; the low-traffic threshold can then
-// stretch that base out further when few aircraft were seen on the last
-// poll, but never shortens it.
-static uint32_t GetEffectivePollIntervalSeconds(void)
+/* HOSTTEST:BEGIN provint (extracted verbatim by host_tests/provider_sched_test.c) */
+// Effective poll interval of one provider for the CURRENT cycle (0.0.28).
+// Each provider has its own configured interval. The day/night schedule and
+// the quiet-traffic slowdown are slowdown policies: they can only lengthen it,
+// never shorten it, and never change the stored provider intervals:
+//   effective = MAX(provider interval, schedule interval, quiet-traffic interval)
+// e.g. OpenSky 20 s / adsb.lol 5 s with a 10 s schedule -> 20 s / 10 s.
+static uint32_t GetEffectivePollIntervalSecondsFor(AircraftProviderType provider)
 {
-    uint32_t baseInterval = radarRefreshSec;
-
-    uint32_t providerMin = AircraftProvider_MinPollIntervalSeconds();
-    if (baseInterval < providerMin)
-    {
-        static uint32_t lastWarnedInterval = 0;
-        if (baseInterval != lastWarnedInterval)
-        {
-            ESP_LOGW("AircraftProvider",
-                     "Configured refresh interval (%us) is below the active provider's safe "
-                     "minimum (%us); using %us instead",
-                     (unsigned)baseInterval, (unsigned)providerMin, (unsigned)providerMin);
-            lastWarnedInterval = baseInterval;
-        }
-        baseInterval = providerMin;
-    }
+    uint32_t interval = AircraftProvider_GetIntervalSeconds(provider);
+    uint32_t providerMin = AircraftProvider_MinIntervalSecondsFor(provider);
+    if (interval < providerMin)
+        interval = providerMin;
 
     if (radarDayNightEnabled)
     {
         time_t now = time(NULL);
-
-        if (IsSystemTimeValid(now))
-        {
-            baseInterval = IsCurrentlyDaytime(now) ?
-                radarDayIntervalSec : radarNightIntervalSec;
-        }
-        else
-        {
-            // Time not synced yet: default to the more frequent option so
-            // no traffic is missed during the startup window.
-            baseInterval = radarDayIntervalSec;
-        }
+        // Time not synced yet: the day interval (the more frequent option, so
+        // no traffic is missed during the startup window).
+        uint32_t scheduled = (IsSystemTimeValid(now) && !IsCurrentlyDaytime(now)) ?
+            radarNightIntervalSec : radarDayIntervalSec;
+        if (scheduled > interval)
+            interval = scheduled;
     }
 
     uint32_t threshold = radarLowTrafficThreshold;
-
     if (threshold > 0 &&
-        (uint32_t)gAircraftCount < threshold)
+        (uint32_t)gAircraftCount < threshold &&
+        radarLowTrafficIntervalSec > interval)
     {
-        uint32_t lowInterval = radarLowTrafficIntervalSec;
-
-        return (lowInterval > baseInterval) ? lowInterval : baseInterval;
+        interval = radarLowTrafficIntervalSec;
     }
 
-    return baseInterval;
+    return interval;
 }
+/* HOSTTEST:END provint */
 
 float GetRadarLat(void)
 {
@@ -1205,63 +1492,7 @@ void SetRadarSettings(
     setUICoords();
 }
 
-void SaveWifiCredentials(
-    const char *ssid,
-    const char *password)
-{
-    nvs_handle_t handle;
-
-    if (nvs_open(
-            WIFI_NAMESPACE,
-            NVS_READWRITE,
-            &handle) == ESP_OK)
-    {
-        nvs_set_str(handle, "ssid", ssid);
-        nvs_set_str(handle, "pass", password);
-
-        nvs_commit(handle);
-        nvs_close(handle);
-
-        ESP_LOGI("WIFI", "Credentials saved");
-    }
-}
-
-bool LoadWifiCredentials(
-    char *ssid,
-    size_t ssidLen,
-    char *password,
-    size_t passLen)
-{
-    nvs_handle_t handle;
-
-    if (nvs_open(
-            WIFI_NAMESPACE,
-            NVS_READONLY,
-            &handle) != ESP_OK)
-    {
-        return false;
-    }
-
-    esp_err_t err1 =
-        nvs_get_str(
-            handle,
-            "ssid",
-            ssid,
-            &ssidLen);
-
-    esp_err_t err2 =
-        nvs_get_str(
-            handle,
-            "pass",
-            password,
-            &passLen);
-
-    nvs_close(handle);
-
-    return (err1 == ESP_OK &&
-            err2 == ESP_OK);
-}
-
+/* HOSTTEST:BEGIN wificonn (extracted verbatim by host_tests/wifi_retry_test.c) */
 void ConnectToWifi(
     const char *ssid,
     const char *password)
@@ -1290,11 +1521,90 @@ void ConnectToWifi(
     ESP_ERROR_CHECK(
         esp_wifi_connect());
 
+    strlcpy(currentSSID, ssid, sizeof(currentSSID));
+
     ESP_LOGI(
         "WIFI",
         "Connecting to %s",
         ssid);
 }
+/* HOSTTEST:END wificonn */
+
+/* HOSTTEST:BEGIN wifisw (extracted verbatim by host_tests/wifi_retry_test.c) */
+static void WifiRetryCancel(void);
+
+// Non-fatal variant used for profile failover and web "Connect": a bad profile must never abort().
+// Radio calls are best-effort; the disconnect handler keeps retrying / rotating.
+static bool WifiSwitchToSlot(int slot)
+{
+    char ssid[WIFI_SSID_MAX + 1];
+    char pass[WIFI_PASS_MAX + 1];
+    if (!WifiProfiles_Get(slot, ssid, sizeof(ssid), pass, sizeof(pass)))
+        return false;
+
+    wifi_config_t cfg = {0};
+    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+    strncpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password));
+    memset(pass, 0, sizeof(pass));
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    memset(&cfg, 0, sizeof(cfg));
+    if (err != ESP_OK)
+    {
+        ESP_LOGW("WIFI", "set_config for slot %d failed: %s", slot, esp_err_to_name(err));
+        return false;
+    }
+    strlcpy(currentSSID, ssid, sizeof(currentSSID));
+    ESP_LOGI("WIFI", "Switching to saved network %d (%s)", slot + 1, ssid);
+    (void)esp_wifi_connect();
+    return true;
+}
+
+void WifiRequestConnect(int slot)
+{
+    pendingWifiSlot = slot;
+}
+
+bool WifiGetStatus(char *ssid, size_t cap, int *slotOut)
+{
+    if (ssid && cap)
+        strlcpy(ssid, currentSSID, cap);
+    if (slotOut)
+        *slotOut = wifiConnectedState ? WifiProfiles_TrySlot() : -1;
+    return wifiConnectedState;
+}
+
+// Runs on the LVGL timer (ui_status_timer_cb).
+static void ApplyPendingWifiSwitch(void)
+{
+    int slot = pendingWifiSlot;
+    if (slot < 0)
+        return;
+    pendingWifiSlot = -1;
+    if (!WifiProfiles_SlotUsed(slot))
+        return;
+    WifiProfiles_SetTrySlot(slot);
+    // New credentials first, then drop the current association; the disconnect handler (or the
+    // explicit connect below) joins with the new config.
+    char ssid[WIFI_SSID_MAX + 1];
+    char pass[WIFI_PASS_MAX + 1];
+    if (!WifiProfiles_Get(slot, ssid, sizeof(ssid), pass, sizeof(pass)))
+        return;
+    wifi_config_t cfg = {0};
+    strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+    strncpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password));
+    memset(pass, 0, sizeof(pass));
+    if (esp_wifi_set_config(WIFI_IF_STA, &cfg) == ESP_OK)
+    {
+        strlcpy(currentSSID, ssid, sizeof(currentSSID));
+        ESP_LOGI("WIFI", "Joining saved network %d (%s)", slot + 1, ssid);
+        WifiRetryCancel(); // an explicit join replaces any deferred retry
+        (void)esp_wifi_disconnect();
+        (void)esp_wifi_connect();
+    }
+    memset(&cfg, 0, sizeof(cfg));
+}
+/* HOSTTEST:END wifisw */
 
 void InitTime(void)
 {
@@ -1309,6 +1619,98 @@ void InitTime(void)
     esp_sntp_init();
 
     AdvDiag_HeapCheckpoint("CP2 after esp_sntp_init");
+}
+
+/* HOSTTEST:BEGIN wifiretry (extracted verbatim by host_tests/wifi_retry_test.c) */
+// STA retry backoff. The setup AP shares the radio with the STA (APSTA, AP fixed on channel 1), and a
+// STA retrying an unavailable SSID with no delay scans every channel back to back, so the AP almost
+// never beacons. After WIFI_FAILS_BEFORE_SWITCH failures with no other usable profile the retry is
+// deferred by one-shot esp_timer (no task, no blocking in the event handler). At most one is pending.
+#define WIFI_STA_BACKOFF_US (30LL * 1000000LL)
+static esp_timer_handle_t wifiRetryTimer;
+static atomic_bool wifiRetryPending;
+
+// Invalidates a pending retry (STA connected, or an explicit join replaced it). Safe from any task:
+// whoever clears the pending flag first wins, so the timer callback either runs once or not at all.
+static void WifiRetryCancel(void)
+{
+    if (atomic_exchange(&wifiRetryPending, false) && wifiRetryTimer)
+        (void)esp_timer_stop(wifiRetryTimer);
+}
+
+static void WifiRetryTimerCb(void *arg)
+{
+    (void)arg;
+    if (!atomic_exchange(&wifiRetryPending, false))
+        return; // cancelled
+    if (wifiConnectedState)
+        return; // already connected: nothing to retry
+    WifiProfiles_OnBackoffRetry();
+    ESP_LOGI("WIFI", "WiFi STA backoff finished; retrying saved network");
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK)
+        ESP_LOGW("WIFI", "WiFi STA retry: esp_wifi_connect failed: %s", esp_err_to_name(err));
+}
+
+static void WifiRetryInit(void)
+{
+    const esp_timer_create_args_t args = {.callback = WifiRetryTimerCb, .name = "wifi_retry"};
+    esp_err_t err = esp_timer_create(&args, &wifiRetryTimer);
+    if (err != ESP_OK)
+    {
+        wifiRetryTimer = NULL; // retries then fall back to the previous immediate behaviour
+        ESP_LOGW("WIFI", "WiFi STA retry timer unavailable: %s", esp_err_to_name(err));
+    }
+}
+
+static void WifiRetryBackoff(void)
+{
+    if (atomic_exchange(&wifiRetryPending, true))
+        return; // one deferred retry at most
+    ESP_LOGW("WIFI", "WiFi STA profile exhausted retries; retrying in %d seconds", (int)(WIFI_STA_BACKOFF_US / 1000000));
+    if (!wifiRetryTimer || esp_timer_start_once(wifiRetryTimer, WIFI_STA_BACKOFF_US) != ESP_OK)
+    {
+        atomic_store(&wifiRetryPending, false);
+        ESP_LOGW("WIFI", "WiFi STA backoff could not be scheduled; retrying now");
+        (void)esp_wifi_connect();
+    }
+}
+
+// Event-loop task, on every STA_DISCONNECTED.
+static void WifiStaDisconnectedPolicy(void)
+{
+    if (atomic_load(&wifiRetryPending))
+        return; // a deferred retry is already scheduled; this event is not a new attempt
+    int next = -1;
+    switch (WifiProfiles_OnDisconnectAction(&next))
+    {
+    case WIFI_RETRY_SWITCH:
+        if (!WifiSwitchToSlot(next))
+            (void)esp_wifi_connect();
+        break;
+    case WIFI_RETRY_BACKOFF:
+        WifiRetryBackoff();
+        break;
+    default:
+        (void)esp_wifi_connect();
+        break;
+    }
+}
+/* HOSTTEST:END wifiretry */
+
+static void LogApStarted(void)
+{
+    static wifi_config_t apCfg; // static: the event task stack is small
+    if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK)
+        ESP_LOGI("WIFI", "WiFi AP started: %.*s (channel %u)", (int)apCfg.ap.ssid_len, (const char *)apCfg.ap.ssid, (unsigned)apCfg.ap.channel);
+    else
+        ESP_LOGI("WIFI", "WiFi AP started");
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    esp_netif_ip_info_t ip;
+    if (ap && esp_netif_get_ip_info(ap, &ip) == ESP_OK)
+        ESP_LOGI("WIFI", "WiFi AP IP: " IPSTR, IP2STR(&ip.ip));
+    else
+        ESP_LOGW("WIFI", "WiFi AP IP unavailable");
 }
 
 static void wifi_event_handler(
@@ -1329,6 +1731,8 @@ static void wifi_event_handler(
     {
         ESP_LOGI("WIFI", "Connected");
 
+        WifiRetryCancel();
+        WifiProfiles_ResetFailures();
         wifiConnectedEvent = true;
         wifiConnectedState = true;
     }
@@ -1336,11 +1740,47 @@ static void wifi_event_handler(
     if (event_base == WIFI_EVENT &&
         event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        ESP_LOGI("WIFI", "Disconnected");
+        const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGI("WIFI", "Disconnected (reason %d)", d ? (int)d->reason : -1);
         wifiConnectedEvent = true;
         wifiConnectedState = false;
 
-        esp_wifi_connect();
+        // After WIFI_FAILS_BEFORE_SWITCH consecutive failures move on to the next saved network
+        // (RAM-only decision); with no other usable profile the retry is deferred (30 s, one-shot
+        // timer) so the setup AP keeps its beacons; below the threshold retry the same one at once.
+        WifiStaDisconnectedPolicy();
+    }
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_AP_START)
+    {
+        LogApStarted();
+    }
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_AP_STOP)
+    {
+        ESP_LOGW("WIFI", "WiFi AP stopped");
+    }
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_AP_STACONNECTED)
+    {
+        const wifi_event_ap_staconnected_t *c = (const wifi_event_ap_staconnected_t *)event_data;
+        ESP_LOGI("WIFI", "WiFi AP client connected (aid %d)", c ? (int)c->aid : -1);
+    }
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    {
+        const wifi_event_ap_stadisconnected_t *c = (const wifi_event_ap_stadisconnected_t *)event_data;
+        ESP_LOGI("WIFI", "WiFi AP client disconnected (aid %d)", c ? (int)c->aid : -1);
+    }
+
+    if (event_base == IP_EVENT &&
+        event_id == IP_EVENT_ASSIGNED_IP_TO_CLIENT)
+    {
+        ESP_LOGI("WIFI", "WiFi AP client received an IP address");
     }
 
     if (event_base == IP_EVENT &&
@@ -1434,6 +1874,16 @@ void ScanWifiNetworks(void)
     esp_netif_create_default_wifi_sta();
     esp_netif_create_default_wifi_ap();
 
+    WifiRetryInit();
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_instance_register(
+            IP_EVENT,
+            IP_EVENT_ASSIGNED_IP_TO_CLIENT,
+            &wifi_event_handler,
+            NULL,
+            NULL));
+
     ESP_ERROR_CHECK(
         esp_event_handler_instance_register(
             IP_EVENT,
@@ -1470,20 +1920,24 @@ void ScanWifiNetworks(void)
     ESP_ERROR_CHECK(
         esp_wifi_start());
 
-    if (LoadWifiCredentials(
-            bootSSID,
-            sizeof(bootSSID),
-            bootPass,
-            sizeof(bootPass)))
+    WifiProfiles_Init();
+    int firstSlot = WifiProfiles_FirstSlotToTry();
+    char bootPass[WIFI_PASS_MAX + 1];
+
+    if (firstSlot >= 0 &&
+        WifiProfiles_Get(firstSlot, bootSSID, sizeof(bootSSID), bootPass, sizeof(bootPass)))
     {
         ESP_LOGI(
             "WIFI",
-            "Found saved network: %s",
+            "Found saved network %d: %s",
+            firstSlot + 1,
             bootSSID);
 
+        WifiProfiles_SetTrySlot(firstSlot);
         ConnectToWifi(
             bootSSID,
             bootPass);
+        memset(bootPass, 0, sizeof(bootPass));
 
         lv_scr_load_anim(
             ui_Screen1,
@@ -1591,10 +2045,12 @@ void wifi_connect_btn_cb(
         lv_textarea_get_text(
             uic_wifiPassword);
 
-    strcpy(
+    strlcpy(
         savedPassword,
-        password);
+        password,
+        sizeof(savedPassword));
 
+    WifiProfiles_SetTrySlot(-1); // manual: never rotates away until it has connected and been saved
     ConnectToWifi(
         selectedSSID,
         savedPassword);
@@ -1625,6 +2081,8 @@ void i2c_master_init()
 
 static void ui_status_timer_cb(lv_timer_t *t)
 {
+    ApplyPendingWifiSwitch();
+
     if (wifiConnectedEvent)
     {
         wifiConnectedEvent = false;
@@ -1634,9 +2092,15 @@ static void ui_status_timer_cb(lv_timer_t *t)
 
             if (lv_scr_act() == ui_Screen2)
             {
-                SaveWifiCredentials(
-                    selectedSSID,
-                    savedPassword);
+                int savedSlot = -1;
+                WifiProfileResult saveResult =
+                    WifiProfiles_Upsert(selectedSSID, savedPassword, &savedSlot);
+                memset(savedPassword, 0, sizeof(savedPassword));
+                if (saveResult == WP_OK)
+                    WifiProfiles_SetTrySlot(savedSlot);
+                else
+                    ESP_LOGW("WIFI", "Connected, but could not save the network: %s",
+                             WifiProfiles_ResultText(saveResult));
 
                 lv_scr_load_anim(
                     ui_Screen1,
@@ -1666,7 +2130,7 @@ static void ui_status_timer_cb(lv_timer_t *t)
 
                 lv_label_set_text(
                     uic_LabelWifiName,
-                    bootSSID);
+                    currentSSID);
 
                 lv_label_set_text(
                     uic_LabelConnection,
@@ -1674,6 +2138,8 @@ static void ui_status_timer_cb(lv_timer_t *t)
 
                 lv_obj_set_style_text_color(uic_LabelConnection, lv_color_hex(0x00FF00), 0);
             }
+
+            WifiProfiles_OnConnected(); // remembers the last good slot (written only when it changed)
 
             ESP_LOGI(
                 "AircraftProvider",
@@ -1707,126 +2173,217 @@ static void ui_status_timer_cb(lv_timer_t *t)
 // tracking task - see web_diag.c for where this is read.
 static int maxAircraftCountSinceBoot = 0;
 
+// Zero-aircraft idle maintenance (idle_maint.h): RadarTask only. Zero-initialized = HOLDOFF.
+static IdleMaint idleMaint;
+
+// Local calendar date (YYYYMMDD) from the central time layer, or 0 while SNTP has not synchronized.
+static int32_t LocalDayKeyNow(void)
+{
+    int64_t now = (int64_t)time(NULL);
+    TimeLocal local;
+    if (!TimeUtil_IsSynced(now) || !TimeUtil_ToLocal(now, &local))
+        return 0;
+    return (int32_t)(local.year * 10000 + local.month * 100 + local.day);
+}
+
 int GetMaxAircraftCountSinceBoot(void)
 {
     return maxAircraftCountSinceBoot;
 }
 
+// Everything that follows a successful poll of any provider: Seen, History,
+// idle maintenance and the display. Runs once per successful poll on the one
+// (merged) aircraft list, so no subsystem sees a provider-specific list.
+static void OnSuccessfulPoll(AircraftProviderType provider)
+{
+    ESP_LOGI("AircraftProvider", "%s poll: %d aircraft in the list", AircraftProviderType_Name(provider), gAircraftCount);
+    if (gAircraftCount > maxAircraftCountSinceBoot)
+        maxAircraftCountSinceBoot = gAircraftCount;
+    lastApiUpdateMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    // Provider-independent history: RAM only here; the CSV is
+    // written in batches by SeenAircraft_FlushIfDue below.
+    // Seen Logging switch (WebUI Setup > Features). OFF skips only
+    // new Seen records; existing records stay and tracking continues.
+    if (Features_SeenEnabled())
+        SeenAircraft_ObservePoll(gAircraft, gAircraftCount, (int64_t)time(NULL));
+
+    // Persistent (TF) history: one classification resolve per
+    // aircraft per poll (the radar/preview paths already re-resolve
+    // live and uncached every sweep tick - see PROJECT_STATE.md - so
+    // one more resolve here, at poll cadence rather than 30 ms sweep
+    // cadence, is negligible). RAM-only unless this is an aircraft
+    // first sighting this session; TF writes are coalesced separately
+    // by HistoryManager_FlushIfDue below.
+#if TF_HISTORY_ENABLED
+    {
+        int64_t nowUtc = (int64_t)time(NULL);
+        for (int hi = 0; hi < gAircraftCount; hi++) {
+            // Stale entries (visibility retention, no longer reported)
+            // are not sightings: never let them extend History.
+            if (!gAircraft[hi].valid || gAircraft[hi].visState == AIRCRAFT_VIS_STALE)
+                continue;
+            CraftResolution hres = ResolveAircraftWithHint(
+                gAircraft[hi].callsign,
+                gAircraft[hi].icao24,
+                gAircraft[hi].providerTypeHint,
+                gAircraft[hi].hasProviderTypeHint);
+            HistoryManager_Observe(gAircraft[hi].icao24, gAircraft[hi].callsign, hres, nowUtc);
+            // 0.0.27: registration from the provider (adsb.lol "r") into the
+            // existing, previously unused TF registry field.
+            HistoryManager_ObserveRegistration(gAircraft[hi].icao24, gAircraft[hi].registration);
+        }
+    }
+#endif
+
+    // Successful poll only (a failed/malformed response never gets
+    // here): after the 300 s boot holdoff, two consecutive zero polls
+    // and at most once per local calendar day, one bounded Seen +
+    // History drain per zero period. The History request is served
+    // below by HistoryManager_FlushIfDue; the result is collected by
+    // IdleMaint_PollResult in the same slice loop.
+    bool startDrain = IdleMaint_OnSuccessfulPoll(&idleMaint, esp_timer_get_time(),
+                                                 gAircraftCount, LocalDayKeyNow());
+    idleMaintPhase = (uint8_t)IdleMaint_Phase(&idleMaint);
+
+    // Aircraft back: selection, panel, a forced full radar redraw and
+    // the cleared status all happen here, at once (not on the next
+    // sweep tick or backlight pass). Zero + maintenance starting: the
+    // status shows "performing maintenance" before the flush runs.
+    if (lvgl_port_lock(0))
+    {
+        Radar_ReconcileSelection();
+        UpdateSelectedAircraftUI();
+        Radar_Refresh();
+        UpdateIdleStatusUI();
+        lvgl_port_unlock();
+    }
+
+    if (startDrain)
+    {
+        IdleMaint_Drain(&idleMaint, TF_HISTORY_ENABLED != 0, esp_timer_get_time());
+        idleMaintPhase = (uint8_t)IdleMaint_Phase(&idleMaint);
+    }
+}
+
+/* HOSTTEST:BEGIN provsched (extracted verbatim by host_tests/provider_sched_test.c) */
+// 0.0.28: independent provider scheduling in this one task (no new task, no
+// concurrent TLS sessions: the OpenSky TLS memory fix switches a global
+// allocation setting during its request). Each enabled provider is polled
+// when its own effective interval has elapsed since its previous poll ENDED
+// (as before 0.0.28: the interval is the pause between polls, so a provider's
+// request rate - e.g. OpenSky's daily budget - is unchanged), independently of
+// the other provider, so a 5 s provider keeps its cadence next to a 20 s one. Requests are
+// sequential: a slow or hanging request (HTTP timeout 30 s) can delay the
+// other provider's next poll by at most that long, never stop it. A failed
+// poll of one provider (HTTP, TLS, malformed data, rate limit) only affects
+// that provider; the other keeps polling and its list keeps the radar current.
+static void PollProviderIfDue(AircraftProviderType provider, uint32_t nowMs)
+{
+    static bool everPolled[AIRCRAFT_PROVIDER_COUNT];
+    static uint32_t lastEndMs[AIRCRAFT_PROVIDER_COUNT];
+    static bool wasEnabled[AIRCRAFT_PROVIDER_COUNT];
+
+    const bool enabled = AircraftProvider_IsEnabled(provider);
+    if (!enabled)
+    {
+        wasEnabled[provider] = false;
+        return;
+    }
+    if (!wasEnabled[provider])
+    {
+        wasEnabled[provider] = true;
+        everPolled[provider] = false; // newly enabled: poll at once
+    }
+
+    const uint32_t intervalMs = GetEffectivePollIntervalSecondsFor(provider) * 1000u;
+    // Another provider's list is merged in while it is at most two of its own
+    // intervals old; older means that provider is failing, and its aircraft
+    // leave the radar instead of freezing there.
+    AircraftProvider_SetMergeMaxAgeMs(provider, 2u * intervalMs);
+
+    if (everPolled[provider] && (uint32_t)(nowMs - lastEndMs[provider]) < intervalMs)
+        return;
+    if (!wifiConnectedState ||
+        !AircraftProvider_HasCredentialsFor(provider) ||
+        AircraftProvider_GetRateLimitSecondsFor(provider) != 0)
+        return; // checked again on the next 250 ms slice
+
+    everPolled[provider] = true;
+    lastEndMs[provider] = nowMs;
+
+    // One-time, in RadarTask's own context (this function runs in the
+    // RadarTask task body - see xTaskCreate in app_main), before its
+    // first network call: create this task's lwIP per-thread
+    // semaphore now, while nothing transient sits in front of it,
+    // instead of inside the first OAuth request. See boot_warmup.h.
+    // wifiConnectedState implies esp_netif_init() (lwIP) has run.
+    static bool firstFetchDone = false;
+    if (!firstFetchDone)
+    {
+        firstFetchDone = true;
+        BootWarmup_NetCurrentTask();
+        AdvDiag_HeapCheckpoint("CP3 RadarTask first fetch, before GetAircraftJson");
+    }
+
+    const char *json = NULL;
+    if (AircraftProvider_GetAircraftJsonFor(provider, radarLat, radarLon, radarRangeKm, &json))
+    {
+        if (AircraftProvider_ParseAircraftFor(provider, json))
+            OnSuccessfulPoll(provider);
+        else
+            ESP_LOGE("AircraftProvider", "%s aircraft JSON parse failed", AircraftProviderType_Name(provider));
+    }
+    lastEndMs[provider] = xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+/* HOSTTEST:END provsched */
+
 static void radar_update_timer_cb(void *pvParameters)
 {
     while (1)
     {
-        if (wifiConnectedState &&
-            AircraftProvider_HasCredentials() &&
-            AircraftProvider_GetRateLimitSeconds() == 0)
-        {
-            const char *json = NULL;
-            // One-time, in RadarTask's own context (this function IS the
-            // RadarTask task body - see xTaskCreate in app_main), before its
-            // first network call: create this task's lwIP per-thread
-            // semaphore now, while nothing transient sits in front of it,
-            // instead of inside the first OAuth request. See boot_warmup.h.
-            // wifiConnectedState implies esp_netif_init() (lwIP) has run.
-            static bool firstFetchDone = false;
-            if (!firstFetchDone)
-            {
-                firstFetchDone = true;
-                BootWarmup_NetCurrentTask();
-                AdvDiag_HeapCheckpoint("CP3 RadarTask first fetch, before GetAircraftJson");
-            }
-            if (AircraftProvider_GetAircraftJson(
-                    radarLat,
-                    radarLon,
-                    radarRangeKm,
-                    &json))
-            {
-                if (AircraftProvider_ParseAircraft(json))
-                {
-                    ESP_LOGI("AircraftProvider", "Aircraft in response: %d", gAircraftCount);
-                    if (gAircraftCount > maxAircraftCountSinceBoot)
-                        maxAircraftCountSinceBoot = gAircraftCount;
-                    lastApiUpdateMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+            PollProviderIfDue((AircraftProviderType)p, xTaskGetTickCount() * portTICK_PERIOD_MS);
 
-                    // Provider-independent history: RAM only here; the CSV is
-                    // written in batches by SeenAircraft_FlushIfDue below.
-                    // Seen Logging switch (WebUI Setup > Features). OFF skips only
-                    // new Seen records; existing records stay and tracking continues.
-                    if (Features_SeenEnabled())
-                        SeenAircraft_ObservePoll(gAircraft, gAircraftCount, (int64_t)time(NULL));
+        // One 250 ms slice; interval changes from the web UI take effect on
+        // the next slice.
+        vTaskDelay(pdMS_TO_TICKS(250));
 
-                    // Persistent (TF) history: one classification resolve per
-                    // aircraft per poll (the radar/preview paths already re-resolve
-                    // live and uncached every sweep tick - see PROJECT_STATE.md - so
-                    // one more resolve here, at poll cadence rather than 30 ms sweep
-                    // cadence, is negligible). RAM-only unless this is an aircraft
-                    // first sighting this session; TF writes are coalesced separately
-                    // by HistoryManager_FlushIfDue below.
+        // Min-ever heap/stack samples (stamped when a lower value first appears), the
+        // 5-minute clock marker and the SNTP-sync announcement (events are silent unless
+        // Advanced/Expert logging is on). Fixed-size, no allocation.
+        DiagTelemetry_Tick();
+        DiagTelemetry_SampleThisTaskStack("RadarTask");
+
+        // Cheap check: writes flash at most once per
+        // SEEN_FLUSH_INTERVAL_SEC, and only if something changed.
+        SeenAircraft_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
+
+        // Same coalescing pattern for TF-backed persistent history -
+        // cheap, writes at most once per HM_SYNC_INTERVAL_SEC, and only
+        // the aircraft that actually changed (history_manager.c). A
+        // missing/unavailable TF card makes this a no-op every time.
 #if TF_HISTORY_ENABLED
-                    {
-                        int64_t nowUtc = (int64_t)time(NULL);
-                        for (int hi = 0; hi < gAircraftCount; hi++) {
-                            if (!gAircraft[hi].valid)
-                                continue;
-                            CraftResolution hres = ResolveAircraftWithHint(
-                                gAircraft[hi].callsign,
-                                gAircraft[hi].icao24,
-                                gAircraft[hi].providerTypeHint,
-                                gAircraft[hi].hasProviderTypeHint);
-                            HistoryManager_Observe(gAircraft[hi].icao24, gAircraft[hi].callsign, hres, nowUtc);
-                        }
-                    }
+        HistoryManager_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
 #endif
 
-                    if (lvgl_port_lock(0))
-                    {
-                        Radar_ReconcileSelection();
-                        UpdateSelectedAircraftUI();
-                        Radar_Refresh();
-                        lvgl_port_unlock();
-                    }
-                }
-                else
-                {
-                    ESP_LOGE("AircraftProvider", "Aircraft JSON parse failed");
-                }
-            }
-        }
-
-        // Sleep in slices so a refresh interval changed from the web UI
-        // takes effect without waiting out the previous interval. The
-        // interval itself is stretched out when few aircraft were seen,
-        // to cut down on API calls during quiet periods.
-        uint32_t waitedMs = 0;
-        uint32_t effectiveIntervalSec = GetEffectivePollIntervalSeconds();
-
-        while (waitedMs < (effectiveIntervalSec * 1000))
-        {
-            vTaskDelay(pdMS_TO_TICKS(250));
-            waitedMs += 250;
-
-            // Cheap check: writes flash at most once per
-            // SEEN_FLUSH_INTERVAL_SEC, and only if something changed.
-            SeenAircraft_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
-
-            // Same coalescing pattern for TF-backed persistent history -
-            // cheap, writes at most once per HM_SYNC_INTERVAL_SEC, and only
-            // the aircraft that actually changed (history_manager.c). A
-            // missing/unavailable TF card makes this a no-op every time.
-#if TF_HISTORY_ENABLED
-            HistoryManager_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
-#endif
-        }
+        // Completes a pending idle-maintenance attempt from its real History
+        // result (served just above). Only a flag test when nothing is pending.
+        if (idleMaint.resultPending && IdleMaint_PollResult(&idleMaint, esp_timer_get_time()))
+            idleMaintPhase = (uint8_t)IdleMaint_Phase(&idleMaint);
     }
 }
 
-static void RadarPredictTask(
-    void *pvParameters)
+/* HOSTTEST:BEGIN predtick (extracted verbatim by host_tests/display_idle_test.c) */
+// One 250 ms pass of RadarPredictTask.
+static void RadarPredictTick(void)
 {
-    uint32_t selectedUiElapsedMs = 0;
+    static uint32_t selectedUiElapsedMs = 0;
+    static uint32_t shownAgeSec = UINT32_MAX;
 
-    while (1)
     {
         Radar_PredictAircraft();
+        DiagTelemetry_SampleThisTaskStack("RadarPredict");
 
         uint32_t now =
             xTaskGetTickCount() *
@@ -1837,15 +2394,31 @@ static void RadarPredictTask(
 
         selectedUiElapsedMs += 250;
 
+        // With automatic selection on, re-evaluate once a second so a closer / more important
+        // aircraft (or the dwell rotation) is picked up promptly; Radar_ReconcileSelection repaints
+        // the Selected Craft panel itself when the identity changes. Otherwise the 5 s cadence stays.
+        static uint32_t autoSelectElapsedMs = 0;
+        autoSelectElapsedMs += 250;
         bool refreshSelected =
-            (selectedUiElapsedMs >= SELECTED_UI_REFRESH_MS);
+            (selectedUiElapsedMs >= SELECTED_UI_REFRESH_MS) ||
+            (Radar_GetAutoSelectClosest() && autoSelectElapsedMs >= 1000);
+        if (autoSelectElapsedMs >= 1000)
+            autoSelectElapsedMs = 0;
 
-        if (refreshSelected)
+        if (selectedUiElapsedMs >= SELECTED_UI_REFRESH_MS)
         {
             selectedUiElapsedMs = 0;
         }
 
         UpdateDayNightBrightness();
+
+        // Zero aircraft AND idle dim active: nothing on the radar or the
+        // Selected Craft panel can change (the selection was already cleared
+        // and the panel blanked when the count reached zero), so skip the
+        // repaint work. Brightness and the rate-limit banner keep running.
+        // When aircraft return, RadarTask's poll path reconciles, repaints the
+        // panel and refreshes the radar immediately; this resumes next pass.
+        bool displayIdle = Radar_IsDisplayIdle();
 
         if (lvgl_port_lock(-1))
         {
@@ -1855,33 +2428,56 @@ static void RadarPredictTask(
                     lv_obj_clear_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
                     uint32_t minutes = (cooldownSeconds + 59) / 60;
                     static uint32_t shownMinutes = UINT32_MAX;
-                    if (minutes != shownMinutes) {
+                    static int shownProvider = -1;
+                    const AircraftProviderType limited = AircraftProvider_RateLimitedProvider();
+                    if (minutes != shownMinutes || (int)limited != shownProvider) {
                         lv_label_set_text_fmt(rateLimitUiLabel,
                             "%s API call limit exceeded\nRetry in %lu min",
-                            AircraftProviderType_Name(AircraftProvider_GetActive()),
+                            AircraftProviderType_Name(limited),
                             (unsigned long)minutes);
                         shownMinutes = minutes;
+                        shownProvider = (int)limited;
                     }
                 } else {
                     lv_obj_add_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
                 }
             }
-            if (refreshSelected)
-            {
-                // Cached-data refresh: no API call, just re-run the
-                // selection against gAircraft[] and repaint the panel.
-                Radar_ReconcileSelection();
-                UpdateSelectedAircraftUI();
-            }
+            UpdateIdleStatusUI(); // compare-only unless the status changed
 
-            Radar_Refresh();
-            lv_label_set_text_fmt(
-                uic_LabelAPIRefresh,
-                "%lus ago",
-                ageSec);
+            if (!displayIdle)
+            {
+                if (refreshSelected)
+                {
+                    // Cached-data refresh: no API call, just re-run the
+                    // selection against gAircraft[] and repaint the panel.
+                    Radar_ReconcileSelection();
+                    UpdateSelectedAircraftUI();
+                }
+
+                Radar_Refresh();
+
+                // Only when the shown value changes (once a second, not 4x).
+                if (ageSec != shownAgeSec)
+                {
+                    lv_label_set_text_fmt(
+                        uic_LabelAPIRefresh,
+                        "%lus ago",
+                        ageSec);
+                    shownAgeSec = ageSec;
+                }
+            }
             lvgl_port_unlock();
         }
+    }
+}
+/* HOSTTEST:END predtick */
 
+static void RadarPredictTask(
+    void *pvParameters)
+{
+    while (1)
+    {
+        RadarPredictTick();
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
@@ -1946,7 +2542,8 @@ void app_main()
     if (!CustomRules_Init())
         ESP_LOGW("CRAFT_RULES", "Could not load one or more saved craft lists; built-in classification remains active");
     if (!Airports_Init())
-        ESP_LOGW("AIRPORTS", "Could not load saved airport dots");
+        ESP_LOGW("AIRPORTS", "Could not load saved locations (airports and special air traffic)");
+    { VisSettings visBoot; VisPolicy_GetSettings(&visBoot); } // 0.0.29: create the visibility-settings lock (and load its settings) once, before any task can race to create it lazily
 
     // Seen Aircraft history: needs SPIFFS, which CustomRules_Init mounted.
     if (!SeenAircraft_Init())
@@ -1994,6 +2591,8 @@ void app_main()
         Radar_AttachToObject(
             uic_Imageradar);
 
+        CreateSelectedInfoRow(); // 0.0.30: Note / Airline row under Heading
+
         rateLimitUiLabel = lv_label_create(uic_PanelRadar);
         lv_obj_set_width(rateLimitUiLabel, 360);
         lv_label_set_long_mode(rateLimitUiLabel, LV_LABEL_LONG_WRAP);
@@ -2004,6 +2603,21 @@ void app_main()
         lv_obj_set_style_bg_opa(rateLimitUiLabel, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_pad_all(rateLimitUiLabel, 6, LV_PART_MAIN);
         lv_obj_add_flag(rateLimitUiLabel, LV_OBJ_FLAG_HIDDEN);
+
+        // Zero-aircraft status: centred on the (empty) radar, above its drawing, hidden until needed.
+        idleStatusLabel = lv_label_create(uic_Imageradar);
+        lv_obj_set_width(idleStatusLabel, 340);
+        lv_label_set_long_mode(idleStatusLabel, LV_LABEL_LONG_WRAP);
+        lv_obj_align(idleStatusLabel, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_align(idleStatusLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(idleStatusLabel, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(idleStatusLabel, lv_palette_main(LV_PALETTE_GREEN), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(idleStatusLabel, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(idleStatusLabel, LV_OPA_80, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(idleStatusLabel, 8, LV_PART_MAIN);
+        lv_obj_set_style_radius(idleStatusLabel, 6, LV_PART_MAIN);
+        lv_obj_clear_flag(idleStatusLabel, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(idleStatusLabel, LV_OBJ_FLAG_HIDDEN);
 
         lv_timer_create(
             radar_sweep_timer_cb,
@@ -2043,6 +2657,11 @@ void app_main()
     {
         radarRefreshSec = RADAR_REFRESH_DEFAULT_SEC;
     }
+
+    // 0.0.28: per-provider enable + interval. First boot after the upgrade
+    // carries the old single refresh interval over to the provider in use
+    // (written once; the legacy "refresh" key is left as it was).
+    AircraftProvider_MigrateLegacyInterval(radarRefreshSec);
 
     uint32_t storedLowThreshold = RADAR_LOW_TRAFFIC_THRESHOLD_DEFAULT;
     uint32_t storedLowInterval = RADAR_LOW_TRAFFIC_INTERVAL_DEFAULT_SEC;
@@ -2095,6 +2714,15 @@ void app_main()
         radarOpenSkyDebugEnabled = (storedDebug != 0);
     }
 
+    LoadSeenEvictionPolicy();
+
+    uint32_t storedAutoSel = 0;
+
+    if (LoadRadarU32Setting("autosel", &storedAutoSel))
+    {
+        Radar_SetAutoSelectClosest(storedAutoSel != 0);
+    }
+
     uint32_t storedBrightness = RADAR_BRIGHTNESS_DEFAULT;
 
     if (LoadRadarU32Setting("brightness", &storedBrightness))
@@ -2134,6 +2762,8 @@ void app_main()
     // than waiting for the RadarPredictTask's first pass. Falls back
     // gracefully via IsSystemTimeValid if SNTP hasn't synced yet.
     UpdateDayNightBrightness();
+
+    IdleMaint_Init(&idleMaint);
 
     xTaskCreate(
         radar_update_timer_cb,

@@ -20,6 +20,7 @@
 #include "cJSON.h"
 
 #include "custom_rules.h" /* AircraftType, ResolveAircraftWithHint (diagnostics only) */
+#include "visibility_policy.h" /* VisPolicy_Admit: the shared on-ground / visibility decision */
 
 #define ADSBLOL_NAMESPACE "adsblol"
 #define RATE_LIMIT_KEY "rate_until"
@@ -210,6 +211,7 @@ bool AdsbLol_GetAircraftJson(
     return true;
 }
 
+/* HOSTTEST:BEGIN parse (extracted verbatim by host_tests/visibility_test.c) */
 bool AdsbLol_ParseAircraft(const char *json)
 {
     /* gAircraft/gAircraftCount are only replaced once the response has been
@@ -259,13 +261,22 @@ bool AdsbLol_ParseAircraft(const char *json)
 
     gAircraftCount = 0; /* the response is valid: replace the previous list */
 
-    for (int i = 0; i < count && gAircraftCount < MAX_AIRCRAFT; i++)
+    /* Pass 0 admits airborne aircraft (the 0.0.25 list); pass 1 (only when a
+     * ground visibility/retention policy is enabled) adds on-ground aircraft
+     * into the remaining slots, so airborne aircraft always have priority. */
+    const int passes = VisPolicy_Passes();
+    for (int pass = 0; pass < passes; pass++)
+    /* Pass 1 keeps going when the list is full: those on-ground aircraft are
+     * parsed into a scratch slot only so the airport counts (Y) include them;
+     * VisPolicy_Admit never admits them. */
+    for (int i = 0; i < count && (gAircraftCount < MAX_AIRCRAFT || pass == 1); i++)
     {
         cJSON *entry = cJSON_GetArrayItem(ac, i);
         if (!cJSON_IsObject(entry))
             continue;
 
-        rawCount++;
+        if (pass == 0)
+            rawCount++;
 
         cJSON *hex = cJSON_GetObjectItem(entry, "hex");
         cJSON *flight = cJSON_GetObjectItem(entry, "flight");
@@ -279,11 +290,13 @@ bool AdsbLol_ParseAircraft(const char *json)
         if (!cJSON_IsString(hex) || !cJSON_IsNumber(lat) || !cJSON_IsNumber(lon) ||
             !Aircraft_IsValidPosition(lat->valuedouble, lon->valuedouble))
         {
-            rejectedCount++;
+            if (pass == 0)
+                rejectedCount++;
             continue;
         }
 
-        Aircraft *a = &gAircraft[gAircraftCount];
+        static Aircraft s_countOnlySlot; /* list full (pass 1 only): counted, never admitted */
+        Aircraft *a = gAircraftCount < MAX_AIRCRAFT ? &gAircraft[gAircraftCount] : &s_countOnlySlot;
         memset(a, 0, sizeof(Aircraft));
 
         strncpy(a->icao24, hex->valuestring, sizeof(a->icao24) - 1);
@@ -296,6 +309,23 @@ bool AdsbLol_ParseAircraft(const char *json)
              * label drawing) expects a trimmed callsign like OpenSky's. */
             for (int c = (int)strlen(a->callsign) - 1; c >= 0 && a->callsign[c] == ' '; c--)
                 a->callsign[c] = '\0';
+        }
+
+        /* Registration ("r", readsb/ADSBExchange-v2 field; absent for many
+         * aircraft): kept as plain upper-case letters, digits and '-'. */
+        cJSON *reg = cJSON_GetObjectItem(entry, "r");
+        if (reg && cJSON_IsString(reg))
+        {
+            size_t used = 0;
+            for (const char *p = reg->valuestring; *p && used < sizeof(a->registration) - 1; p++)
+            {
+                char c = *p;
+                if (c >= 'a' && c <= 'z')
+                    c = (char)(c - 'a' + 'A');
+                if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')
+                    a->registration[used++] = c;
+            }
+            a->registration[used] = '\0';
         }
 
         a->latitude = (float)lat->valuedouble;
@@ -316,7 +346,21 @@ bool AdsbLol_ParseAircraft(const char *json)
         }
 
         if (gs && cJSON_IsNumber(gs))
+        {
             a->velocity = (float)gs->valuedouble * 0.514444f; /* knots -> m/s */
+            a->dataFlags |= AIRCRAFT_DATA_VELOCITY;
+        }
+
+        /* 0.0.30, display only (Selected Craft trend arrow): vertical rate in
+         * ft/min, barometric first (same reference as alt_baro), else geometric. */
+        cJSON *vrate = cJSON_GetObjectItem(entry, "baro_rate");
+        if (!cJSON_IsNumber(vrate))
+            vrate = cJSON_GetObjectItem(entry, "geom_rate");
+        if (cJSON_IsNumber(vrate))
+        {
+            a->verticalRateFpm = Aircraft_ClampFpm(vrate->valuedouble);
+            a->dataFlags |= AIRCRAFT_DATA_VRATE;
+        }
 
         if (track && cJSON_IsNumber(track))
             a->heading = (float)track->valuedouble;
@@ -337,13 +381,12 @@ bool AdsbLol_ParseAircraft(const char *json)
         a->hasProviderTypeHint = hasHint;
         a->providerTypeHint = hasHint ? hint : AIRCRAFT_FIXED_WING;
 
-        bool looksParked =
-            (a->altitude <= GROUND_ALTITUDE_THRESHOLD_M) &&
-            (a->velocity <= GROUND_VELOCITY_THRESHOLD_MS);
-
-        if (reportedOnGround || looksParked)
+        /* On-ground rule (provider "ground" OR low AND slow) and the optional
+         * ground visibility policy: one decision for every provider. */
+        if (!VisPolicy_Admit(a, reportedOnGround, pass))
         {
-            rejectedCount++;
+            if (pass == 0)
+                rejectedCount++;
             continue;
         }
 
@@ -371,3 +414,4 @@ bool AdsbLol_ParseAircraft(const char *json)
 
     return true;
 }
+/* HOSTTEST:END parse */

@@ -8,20 +8,34 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "diag_telemetry.h"
 #include "opensky_client.h"
 #include "adsblol_client.h"
+#include "visibility_policy.h"
+#include "provider_merge.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define RADAR_NAMESPACE "radar"
 #define PROVIDER_KEY "aircraft_prov"
 #define DEBUG_LEVEL_KEY "prov_debug"
+/* 0.0.28: independent providers. Enabled set and one interval per provider,
+ * same NVS namespace as every other radar setting. */
+#define ENABLED_KEY "prov_mask"
+static const char *const kIntervalKey[AIRCRAFT_PROVIDER_COUNT] = { "int_osky", "int_adsb" };
 
 static const char *TAG = "AircraftProvider";
 
 Aircraft gAircraft[MAX_AIRCRAFT];
 int gAircraftCount = 0;
 
-static AircraftProviderType activeProvider = AIRCRAFT_PROVIDER_OPENSKY;
+static AircraftProviderType activeProvider = AIRCRAFT_PROVIDER_OPENSKY; /* legacy single selection; = first enabled */
 static ProviderDebugLevel debugLevel = PROVIDER_DEBUG_OFF;
+static uint8_t enabledMask;      /* bit per AircraftProviderType; 0 = not loaded yet (derived from activeProvider) */
+static bool haveStoredMask;
+static uint32_t intervalSec[AIRCRAFT_PROVIDER_COUNT] = { PROVIDER_INTERVAL_DEFAULT_SEC, PROVIDER_INTERVAL_DEFAULT_SEC };
+static bool haveStoredInterval[AIRCRAFT_PROVIDER_COUNT];
+static uint32_t mergeMaxAgeMs[AIRCRAFT_PROVIDER_COUNT];
 
 /* ---- naming / parsing ---- */
 
@@ -90,6 +104,25 @@ static void LoadSelection(void)
     }
 
     stored = 0;
+    if (nvs_get_u32(handle, ENABLED_KEY, &stored) == ESP_OK &&
+        (stored & AIRCRAFT_PROVIDER_ALL_MASK) != 0)
+    {
+        enabledMask = (uint8_t)(stored & AIRCRAFT_PROVIDER_ALL_MASK);
+        haveStoredMask = true;
+    }
+
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++) {
+        stored = 0;
+        if (nvs_get_u32(handle, kIntervalKey[p], &stored) == ESP_OK &&
+            stored >= AircraftProvider_MinIntervalSecondsFor((AircraftProviderType)p) &&
+            stored <= PROVIDER_INTERVAL_MAX_SEC)
+        {
+            intervalSec[p] = stored;
+            haveStoredInterval[p] = true;
+        }
+    }
+
+    stored = 0;
     if (nvs_get_u32(handle, DEBUG_LEVEL_KEY, &stored) == ESP_OK &&
         stored < PROVIDER_DEBUG_COUNT)
     {
@@ -113,13 +146,102 @@ static void SaveU32(const char *key, uint32_t value)
 
 AircraftProviderType AircraftProvider_GetActive(void) { return activeProvider; }
 
+static void SyncActiveFromMask(void)
+{
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        if (enabledMask & (1u << p)) {
+            activeProvider = (AircraftProviderType)p;
+            return;
+        }
+}
+
 void AircraftProvider_SetActive(AircraftProviderType type)
 {
     if (type >= AIRCRAFT_PROVIDER_COUNT)
         return;
-    activeProvider = type;
-    SaveU32(PROVIDER_KEY, (uint32_t)type);
-    ESP_LOGI(TAG, "Active aircraft data provider set to %s", AircraftProviderType_Name(type));
+    (void)AircraftProvider_SetEnabledMask((uint8_t)(1u << type));
+}
+
+/* ---- 0.0.28: independent providers ---- */
+
+uint8_t AircraftProvider_EnabledMask(void) { return enabledMask; }
+
+bool AircraftProvider_IsEnabled(AircraftProviderType type)
+{
+    return type < AIRCRAFT_PROVIDER_COUNT && (enabledMask & (1u << type)) != 0;
+}
+
+bool AircraftProvider_SetEnabledMask(uint8_t mask)
+{
+    mask &= AIRCRAFT_PROVIDER_ALL_MASK;
+    if (!mask)
+        return false; /* at least one provider */
+    if (mask == enabledMask && haveStoredMask)
+        return true;
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        if (!(mask & (1u << p)))
+            ProviderMerge_Forget((AircraftProviderType)p); /* a disabled provider's aircraft leave at once */
+    enabledMask = mask;
+    haveStoredMask = true;
+    SyncActiveFromMask();
+    SaveU32(ENABLED_KEY, mask);
+    SaveU32(PROVIDER_KEY, (uint32_t)activeProvider); /* older firmware reads this one */
+    ESP_LOGI(TAG, "Aircraft data providers: OpenSky %s, adsb.lol %s",
+             (mask & 1u) ? "on" : "off", (mask & 2u) ? "on" : "off");
+    return true;
+}
+
+uint32_t AircraftProvider_MinIntervalSecondsFor(AircraftProviderType type)
+{
+    /* OpenSky: unchanged 10 s floor (documented ~4000 requests/day budget).
+     * adsb.lol: no published fixed minimum ("rate limits are dynamic based on
+     * load", github.com/adsblol/api); 5 s on request, still one request per poll. */
+    return type == AIRCRAFT_PROVIDER_ADSBLOL ? 5u : 10u;
+}
+
+uint32_t AircraftProvider_GetIntervalSeconds(AircraftProviderType type)
+{
+    return type < AIRCRAFT_PROVIDER_COUNT ? intervalSec[type] : PROVIDER_INTERVAL_DEFAULT_SEC;
+}
+
+bool AircraftProvider_SetIntervalSeconds(AircraftProviderType type, uint32_t seconds)
+{
+    if (type >= AIRCRAFT_PROVIDER_COUNT || seconds < AircraftProvider_MinIntervalSecondsFor(type) ||
+        seconds > PROVIDER_INTERVAL_MAX_SEC)
+        return false;
+    if (intervalSec[type] == seconds && haveStoredInterval[type])
+        return true; /* nothing to write */
+    intervalSec[type] = seconds;
+    haveStoredInterval[type] = true;
+    SaveU32(kIntervalKey[type], seconds); /* only this provider's key */
+    return true;
+}
+
+void AircraftProvider_MigrateLegacyInterval(uint32_t legacySeconds)
+{
+    /* Before 0.0.28 there was one provider selection ("aircraft_prov") and one
+     * refresh interval ("refresh"). First boot of 0.0.28: the provider in use
+     * stays the only enabled one and keeps that interval; the other provider
+     * starts disabled with the default. Written once, then independent. */
+    if (!haveStoredMask)
+        (void)AircraftProvider_SetEnabledMask((uint8_t)(1u << activeProvider));
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++) {
+        if (haveStoredInterval[p])
+            continue;
+        uint32_t v = (p == (int)activeProvider) ? legacySeconds : PROVIDER_INTERVAL_DEFAULT_SEC;
+        const uint32_t lo = AircraftProvider_MinIntervalSecondsFor((AircraftProviderType)p);
+        if (v < lo)
+            v = lo;
+        if (v > PROVIDER_INTERVAL_MAX_SEC)
+            v = PROVIDER_INTERVAL_MAX_SEC;
+        (void)AircraftProvider_SetIntervalSeconds((AircraftProviderType)p, v);
+    }
+}
+
+void AircraftProvider_SetMergeMaxAgeMs(AircraftProviderType type, uint32_t ms)
+{
+    if (type < AIRCRAFT_PROVIDER_COUNT)
+        mergeMaxAgeMs[type] = ms;
 }
 
 ProviderDebugLevel AircraftProvider_GetDebugLevel(void) { return debugLevel; }
@@ -138,6 +260,10 @@ void AircraftProvider_SetDebugLevel(ProviderDebugLevel level)
 void AircraftProvider_Init(void)
 {
     LoadSelection();
+    if (haveStoredMask)
+        SyncActiveFromMask();
+    else
+        enabledMask = (uint8_t)(1u << activeProvider); /* until MigrateLegacyInterval persists it */
     OpenSky_Init();
     AdsbLol_Init();
     ESP_LOGI(TAG, "Providers initialized; active=%s debug=%s",
@@ -145,55 +271,150 @@ void AircraftProvider_Init(void)
              ProviderDebugLevel_Name(debugLevel));
 }
 
+/* True when at least one enabled provider can poll (OpenSky with credentials,
+ * or adsb.lol): the "configuration required" prompt is about that. */
 bool AircraftProvider_HasCredentials(void)
 {
-    switch (activeProvider) {
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        if (AircraftProvider_IsEnabled((AircraftProviderType)p) && AircraftProvider_HasCredentialsFor((AircraftProviderType)p))
+            return true;
+    return false;
+}
+
+bool AircraftProvider_HasCredentialsFor(AircraftProviderType type)
+{
+    switch (type) {
     case AIRCRAFT_PROVIDER_OPENSKY: return OpenSky_HasCredentials();
     case AIRCRAFT_PROVIDER_ADSBLOL: return AdsbLol_HasCredentials();
     default: return false;
     }
 }
 
+/* The longest remaining backoff among the enabled providers (the radar's
+ * "API call limit exceeded" banner); AircraftProvider_RateLimitedProvider()
+ * names that provider. */
 uint32_t AircraftProvider_GetRateLimitSeconds(void)
 {
-    switch (activeProvider) {
+    return AircraftProvider_GetRateLimitSecondsFor(AircraftProvider_RateLimitedProvider());
+}
+
+AircraftProviderType AircraftProvider_RateLimitedProvider(void)
+{
+    AircraftProviderType who = activeProvider;
+    uint32_t longest = 0;
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++) {
+        if (!AircraftProvider_IsEnabled((AircraftProviderType)p))
+            continue;
+        const uint32_t s = AircraftProvider_GetRateLimitSecondsFor((AircraftProviderType)p);
+        if (s > longest) {
+            longest = s;
+            who = (AircraftProviderType)p;
+        }
+    }
+    return who;
+}
+
+uint32_t AircraftProvider_GetRateLimitSecondsFor(AircraftProviderType type)
+{
+    switch (type) {
     case AIRCRAFT_PROVIDER_OPENSKY: return OpenSky_GetRateLimitSeconds();
     case AIRCRAFT_PROVIDER_ADSBLOL: return AdsbLol_GetRateLimitSeconds();
     default: return 0;
     }
 }
 
-bool AircraftProvider_GetAircraftJson(float centerLat, float centerLon, float radiusKm, const char **json)
+static bool GetAircraftJsonRaw(AircraftProviderType type, float centerLat, float centerLon, float radiusKm, const char **json)
 {
-    switch (activeProvider) {
+    switch (type) {
     case AIRCRAFT_PROVIDER_OPENSKY: return OpenSky_GetAircraftJson(centerLat, centerLon, radiusKm, json);
     case AIRCRAFT_PROVIDER_ADSBLOL: return AdsbLol_GetAircraftJson(centerLat, centerLon, radiusKm, json);
     default: return false;
     }
 }
 
+/* Same behaviour as before, plus recurring-operation telemetry (duration, failures, skips). A call made
+ * while a 429 backoff is active is counted as skipped, not as a failure. */
+bool AircraftProvider_GetAircraftJson(float centerLat, float centerLon, float radiusKm, const char **json)
+{
+    return AircraftProvider_GetAircraftJsonFor(activeProvider, centerLat, centerLon, radiusKm, json);
+}
+
+bool AircraftProvider_GetAircraftJsonFor(AircraftProviderType type, float centerLat, float centerLon, float radiusKm,
+                                         const char **json)
+{
+    bool backoff = AircraftProvider_GetRateLimitSecondsFor(type) > 0;
+    uint32_t t0 = DiagTelemetry_NowMs();
+    bool ok = GetAircraftJsonRaw(type, centerLat, centerLon, radiusKm, json);
+    if (!ok && backoff)
+        DiagTelemetry_OpDone(DT_OP_PROVIDER_REFRESH, DT_RES_SKIPPED, 0, NULL);
+    else
+        DiagTelemetry_OpEnd(DT_OP_PROVIDER_REFRESH, t0, ok,
+                            AircraftProvider_GetRateLimitSecondsFor(type) > 0
+                                ? (type == AIRCRAFT_PROVIDER_ADSBLOL ? "adsb.lol rate limited (429)" : "OpenSky rate limited (429)")
+                                : (type == AIRCRAFT_PROVIDER_ADSBLOL ? "adsb.lol request or response failed"
+                                                                     : "OpenSky request or response failed"));
+    return ok;
+}
+
+/* HOSTTEST:BEGIN dispatch (extracted verbatim by host_tests/visibility_test.c) */
 bool AircraftProvider_ParseAircraft(const char *json)
 {
-    switch (activeProvider) {
-    case AIRCRAFT_PROVIDER_OPENSKY: return OpenSky_ParseAircraft(json);
-    case AIRCRAFT_PROVIDER_ADSBLOL: return AdsbLol_ParseAircraft(json);
-    default: return false;
-    }
+    return AircraftProvider_ParseAircraftFor(activeProvider, json);
 }
+
+bool AircraftProvider_ParseAircraftFor(AircraftProviderType type, const char *json)
+{
+    /* The provider parsers admit aircraft through VisPolicy_Admit (the one
+     * visibility decision); retention and per-airport counts follow a
+     * successful parse only, so a failed poll keeps the previous list as before. */
+    VisPolicy_BeginPoll();
+    bool ok;
+    switch (type) {
+    case AIRCRAFT_PROVIDER_OPENSKY: ok = OpenSky_ParseAircraft(json); break;
+    case AIRCRAFT_PROVIDER_ADSBLOL: ok = AdsbLol_ParseAircraft(json); break;
+    default: ok = false; break;
+    }
+    if (!ok)
+        return false;
+    const uint32_t nowMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    /* 0.0.28: with more than one provider enabled, the list just parsed is
+     * this provider's snapshot and gAircraft becomes the ICAO24-merged view of
+     * every fresh snapshot (provider_merge.h). One provider: unchanged. */
+    /* The list is kept as this provider's snapshot even while it is the only
+     * provider, so switching the other one on later merges with it at once
+     * instead of showing only the newcomer's aircraft until this provider's
+     * next poll. A provider switched off while its request was in flight
+     * contributes nothing: the list is rebuilt from the enabled providers. */
+    const uint8_t mask = AircraftProvider_EnabledMask();
+    const bool stored = ProviderMerge_Store(type, gAircraft, gAircraftCount, nowMs);
+    bool combined = false, multi = false;
+    if (stored && ((mask & (mask - 1u)) != 0 || !AircraftProvider_IsEnabled(type))) {
+        multi = true;
+        uint32_t maxAge[AIRCRAFT_PROVIDER_COUNT];
+        for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+            maxAge[p] = AircraftProvider_IsEnabled((AircraftProviderType)p) ? AircraftProvider_MergeMaxAgeMs((AircraftProviderType)p) : 0;
+        gAircraftCount = ProviderMerge_Build(gAircraft, MAX_AIRCRAFT, nowMs, maxAge, type);
+        for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+            if (p != (int)type && ProviderMerge_IsFresh((AircraftProviderType)p, nowMs, maxAge[p]))
+                combined = true;
+    }
+    VisPolicy_EndPollFrom(nowMs, multi ? (int)type : -1, combined);
+    return true;
+}
+/* HOSTTEST:END dispatch */
 
 uint32_t AircraftProvider_MinPollIntervalSeconds(void)
 {
-    switch (activeProvider) {
-    /* OpenSky: documented ~4000 req/day budget: the web UI already floors
-     * the refresh interval at 10s, so this just backstops that. */
-    case AIRCRAFT_PROVIDER_OPENSKY: return 10;
-    /* adsb.lol: no published fixed minimum ("rate limits are dynamic based
-     * on load... if you get 4xx errors, you are doing something wrong",
-     * per github.com/adsblol/api). 10s matches OpenSky's floor and is a
-     * conservative, community-friendly default for a free shared service. */
-    case AIRCRAFT_PROVIDER_ADSBLOL: return 10;
-    default: return 10;
-    }
+    return AircraftProvider_MinIntervalSecondsFor(activeProvider);
+}
+
+uint32_t AircraftProvider_MergeMaxAgeMs(AircraftProviderType type)
+{
+    /* Set by the poll loop (2 x the provider's effective interval); a
+     * conservative fallback before the first schedule pass. */
+    if (type >= AIRCRAFT_PROVIDER_COUNT)
+        return 0;
+    return mergeMaxAgeMs[type] ? mergeMaxAgeMs[type] : 2u * 1000u * intervalSec[type];
 }
 
 /* ---- diagnostics ---- */

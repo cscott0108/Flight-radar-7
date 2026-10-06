@@ -86,10 +86,23 @@ bool TfHistory_Lookup(const char *icao24, TfHistoryRecord *out, uint32_t *bucket
  * to do (PROMPT.md section 23). */
 bool TfHistory_Upsert(uint32_t bucketFingerprint, const TfHistoryRecord *rec);
 
-/* Rebuilds index.dat from scratch by scanning every existing bucket file.
- * Called automatically by TfHistory_Init() when the index is missing or
- * fails its size/header sanity check; also exposed for /diag. */
+/* Rebuilds the index from scratch by scanning EVERY bucket file in the
+ * history folder (special buckets and all operator-fingerprint buckets) and
+ * keeping, per ICAO24, the newest record (highest lastSeen, then highest
+ * seenCount, then highest (fingerprint, offset)). Never modifies a bucket
+ * file or the legacy index.dat. History is unavailable while it runs.
+ * Used by TfHistory_Init() when indexv2.dat is missing/building/invalid
+ * (first boot after upgrading from the 4096-slot index = migration). */
 bool TfHistory_RebuildIndex(void);
+
+/* Index load state (index capacity is TF_INDEX_SLOTS; see tf_history.c). */
+typedef enum {
+    TF_LOAD_OK = 0,
+    TF_LOAD_WARN,  /* >= 70% of slots used */
+    TF_LOAD_CAP    /* >= 90%: hard cap, NEW aircraft are not written to History */
+} TfIndexLoad;
+
+#define TF_PROBE_HIST_BINS 6 /* probes per index operation: 1, 2-3, 4-7, 8-15, 16-31, 32+ */
 
 typedef struct {
     bool mounted;          /* filesystem mount succeeded (esp_vfs_fat_sdspi_mount returned OK) and has not been unmounted */
@@ -98,7 +111,21 @@ typedef struct {
     uint64_t usedBytes;
     uint64_t freeBytes;
     uint32_t indexSlotsTotal;
-    uint32_t indexSlotsUsed;
+    uint32_t indexSlotsUsed;   /* distinct aircraft in the index (exact: counted at load, +1 per new aircraft) */
+    uint32_t indexWarnAt;      /* slots used at which the load state becomes WARN (70%) */
+    uint32_t indexHardCap;     /* slots used at which NEW aircraft are refused (90%) */
+    uint8_t indexLoadState;    /* TfIndexLoad */
+
+    /* Insertion outcomes (radar write path only) */
+    uint32_t indexInsertCapRejected; /* new-aircraft writes refused at the hard cap: NOTHING was written to a bucket */
+    uint32_t indexInsertIoFail;      /* record written but the index slot write failed (orphan, adopted on retry) */
+    uint32_t orphanAdopted;          /* retries that reused the orphan record instead of appending a duplicate */
+
+    /* Probe behavior (radar Lookup/Upsert only; /history browsing is not counted) */
+    uint32_t probeHitOps, probeMissOps;
+    uint64_t probeHitTotal, probeMissTotal; /* slots read: avg = total / ops */
+    uint32_t probeMax, probeLast;
+    uint32_t probeHist[TF_PROBE_HIST_BINS];
 
     uint32_t writes;     /* successful Upsert calls (create + update) */
     uint32_t creates;
@@ -147,18 +174,22 @@ typedef enum {
     TF_STAGE_MOUNT,           /* esp_vfs_fat_sdspi_mount */
     TF_STAGE_FS_INFO,         /* f_getfree: capacity/free/filesystem type */
     TF_STAGE_HIST_DIR,        /* /sdcard/history exists or mkdir */
-    TF_STAGE_INDEX_CHECK,     /* open index.dat, size == expected */
-    TF_STAGE_INDEX_CREATE,    /* create empty index.dat (only if missing/wrong size) */
-    TF_STAGE_INDEX_REBUILD,   /* rebuild from bucket files (only after create) */
-    TF_STAGE_INDEX_COUNT,     /* count occupied slots of an existing valid index */
+    TF_STAGE_INDEX_CHECK,     /* open indexv2.dat: valid header, committed, exact size */
+    TF_STAGE_INDEX_SCAN,      /* (only if no valid index) scan every bucket file into the new index */
+    TF_STAGE_INDEX_WRITE,     /* write indexv2.dat in state "building" (legacy index.dat and buckets untouched) */
+    TF_STAGE_INDEX_VERIFY,    /* re-read and verify the new index before it is committed */
+    TF_STAGE_INDEX_COMMIT,    /* single header write (+fsync) flips building -> committed */
+    TF_STAGE_INDEX_COUNT,     /* count occupied slots of an existing committed index */
     TF_STAGE_COUNT
 } TfInitStage;
 
 typedef enum {
     TF_INDEX_NOT_INIT = 0, /* init never reached the index (or unmounted) */
-    TF_INDEX_LOADED,       /* existing index.dat had the right size; slots counted */
-    TF_INDEX_REBUILT,      /* index.dat was missing/wrong size: created empty, then rebuilt from buckets */
-    TF_INDEX_FAILED        /* index.dat could not be created */
+    TF_INDEX_LOADED,       /* existing committed indexv2.dat; slots counted */
+    TF_INDEX_REBUILT,      /* indexv2.dat was missing/unfinished/invalid: rebuilt from all bucket files */
+    TF_INDEX_FAILED,       /* indexv2.dat could not be built/verified/committed */
+    TF_INDEX_MIGRATED,     /* first boot after upgrade: legacy 4096-slot index.dat found, new index built beside it */
+    TF_INDEX_FRESH         /* no index and no bucket files: new empty index created */
 } TfIndexState;
 
 typedef struct {
@@ -169,10 +200,12 @@ typedef struct {
     uint8_t fsType;        /* 0 unknown, 1 FAT12, 2 FAT16, 3 FAT32, 4 exFAT (FATFS fs_type) */
     bool busAlreadyInit;   /* spi_bus_initialize said INVALID_STATE (tolerated by the existing code) */
     bool dirExisted;       /* history dir was already there before init tried mkdir */
-    bool indexFileOpened;  /* index.dat could be opened for reading */
-    bool indexSizeValid;
+    bool indexFileOpened;  /* indexv2.dat could be opened for reading */
+    bool indexSizeValid;   /* header valid + committed + exact size */
     int32_t indexSizeBytes;     /* -1 = unknown/missing */
     uint32_t indexSizeExpected;
+    int32_t legacyIndexSizeBytes; /* legacy index.dat size, -1 = not present (left untouched, read-only) */
+    int32_t stackFreeMinBytes;    /* calling task's minimum free stack after init (app_main has only 3584 B); -1 = n/a */
     uint32_t runs;         /* number of init runs (boot + diagnostic reinit) */
     TfStepInfo stage[TF_STAGE_COUNT];
     int8_t lastErrStage;   /* stage of lastError, -1 = none */
@@ -182,8 +215,42 @@ typedef struct {
     char lastRuntimeError[48]; /* last failed Upsert/Lookup op (best-effort errno), empty if none */
     const char *historyDir;
     const char *indexPath;
+    const char *legacyIndexPath;
     const char *scratchPath;
 } TfInitInfo;
+
+/* Result of the last index build (boot-time migration, rebuild or fresh create). */
+typedef enum { TF_BUILD_NONE = 0, TF_BUILD_FRESH, TF_BUILD_MIGRATE, TF_BUILD_REBUILD } TfBuildMode;
+
+typedef struct {
+    bool ran;
+    uint8_t mode;             /* TfBuildMode */
+    bool ok;
+    bool usedStaging;         /* true = transient PSRAM staging; false = on-disk fallback */
+    uint32_t stagingBytes;
+    uint32_t buckets;         /* bucket files scanned */
+    uint32_t headerFallbackBuckets; /* buckets whose header was bad: record count taken from file size (records still CRC-checked) */
+    uint32_t bucketsUnreadable;
+    uint32_t recordsScanned;
+    uint32_t recordsCorrupt;  /* failed CRC / empty: NOT indexed */
+    uint32_t duplicatesResolved; /* extra records for an ICAO24 already seen in the scan */
+    uint32_t aircraftIndexed;
+    uint32_t rejectedAtCap;   /* aircraft left out because the hard cap was reached */
+    bool legacyChecked;
+    uint32_t legacyValid, legacySame, legacyNewer, legacyMissing; /* legacy entries vs the new index (report only) */
+    uint32_t verifySampled, verifyMismatch;
+    uint32_t scanUs, writeUs, verifyUs, commitUs, totalUs;
+    char error[96];
+} TfIndexBuildReport;
+
+void TfHistory_GetIndexBuildReport(TfIndexBuildReport *out);
+
+#ifndef ESP_PLATFORM
+/* Host-test hooks only (never compiled into firmware). */
+void TfHistory_HostTestNoStaging(bool force);     /* force the on-disk fallback builder */
+void TfHistory_HostTestAbortBuild(int phase);     /* 1 = stop after write, 2 = stop after verify (power-loss simulation) */
+void TfHistory_HostTestFailSlotWrites(int n);     /* make the next n index slot writes fail (I/O error simulation) */
+#endif
 
 const char *TfHistory_StageName(int stage);
 void TfHistory_GetInitInfo(TfInitInfo *out);
@@ -312,6 +379,21 @@ TfBrowseStatus TfHistory_BucketInfo(uint32_t fp, uint32_t *recordCountOut);
  * TF_BR_END with *gotN == 0 means startIdx is at/after the end. */
 TfBrowseStatus TfHistory_BrowseChunk(uint32_t fp, uint32_t startIdx, size_t maxN,
                                      TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut);
+
+/* Up to maxN (<= TF_LIST_MAX) bucket fingerprints strictly greater than
+ * `after` (all when afterValid is false), in ascending order, from ONE
+ * directory pass; no file is opened. *totalOut = number of buckets on the
+ * card, *moreOut = more buckets follow the last one returned. Counts come
+ * from TfHistory_BucketInfo (one header read each, separate lock). */
+#define TF_LIST_MAX 50u
+TfBrowseStatus TfHistory_ListBuckets(bool afterValid, uint32_t after, size_t maxN, uint32_t *fps,
+                                     size_t *gotN, uint32_t *totalOut, bool *moreOut);
+
+/* Same as TfHistory_BrowseChunk without the index check: for /history search
+ * scans (records CRC-checked; state is TF_REC_CORRUPT or TF_REC_INDEX_UNKNOWN,
+ * the caller classifies matches with TfHistory_IsLive). */
+TfBrowseStatus TfHistory_ScanChunk(uint32_t fp, uint32_t startIdx, size_t maxN,
+                                   TfBrowseRecord *out, size_t *gotN, uint32_t *recordCountOut);
 
 /* Is the record at (fp, recordIdx) the one the index currently considers
  * authoritative for icao24? Pure read of index.dat; result in *stateOut

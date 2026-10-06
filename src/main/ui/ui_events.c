@@ -140,6 +140,7 @@ void Radar_SelectPrev(lv_event_t *e)
 		selectedIcao24,
 		gAircraft[selectedAircraft].icao24);
 
+	Radar_NoteManualSelection(); // auto-select holds a manual choice for a while
 	Radar_Refresh();
 	UpdateSelectedAircraftUI();
 }
@@ -163,6 +164,7 @@ void Radar_SelectNext(lv_event_t *e)
 		selectedIcao24,
 		gAircraft[selectedAircraft].icao24);
 
+	Radar_NoteManualSelection(); // auto-select holds a manual choice for a while
 	Radar_Refresh();
 	UpdateSelectedAircraftUI();
 }

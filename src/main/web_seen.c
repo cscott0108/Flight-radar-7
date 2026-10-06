@@ -12,6 +12,7 @@
 #include "craft_types.h"
 #include "custom_rules.h"
 #include "feature_flags.h"
+#include "pattern_match.h"
 #include "seen_aircraft.h"
 #include "time_util.h"
 #include "web_style.h"
@@ -64,6 +65,8 @@ static const struct { const char *token; SeenFilter filter; const char *label; }
 
 typedef struct {
     char search[SEARCH_MAX + 1];
+    SearchField searchField; /* "sf": e / c / r */
+    bool patternMode;        /* "pm=1" */
     size_t sortIndex;
     size_t filterIndex;
     bool descending;
@@ -92,6 +95,10 @@ static void ParseQuery(httpd_req_t *req, PageQuery *pq)
             used--;
         pq->search[used] = '\0';
     }
+    if (httpd_query_key_value(query, "sf", value, sizeof(value)) == ESP_OK)
+        pq->searchField = SearchField_FromToken(value);
+    if (httpd_query_key_value(query, "pm", value, sizeof(value)) == ESP_OK)
+        pq->patternMode = strcmp(value, "1") == 0;
     if (httpd_query_key_value(query, "f", value, sizeof(value)) == ESP_OK) {
         for (size_t i = 0; i < FILTER_CHOICES; i++)
             if (strcmp(value, filterChoices[i].token) == 0)
@@ -121,7 +128,9 @@ static void ConfiguredText(const SeenConfigInfo *info, char *out, size_t cap)
 {
     char escaped[128];
     if (info->source == CRAFT_SRC_REGISTRY) {
-        WebUtil_EscapeHtml(escaped, sizeof(escaped), info->registryPrefix);
+        char label[MAX_RULE_LABEL];
+        CustomRules_EntryLabel(info->registryIcao24, info->registryPrefix, label, sizeof(label));
+        WebUtil_EscapeHtml(escaped, sizeof(escaped), label);
         snprintf(out, cap, "Registry: %s", escaped);
     } else if (info->operatorCode[0]) {
         WebUtil_EscapeHtml(escaped, sizeof(escaped), info->operatorCode);
@@ -132,6 +141,35 @@ static void ConfiguredText(const SeenConfigInfo *info, char *out, size_t cap)
         snprintf(out, cap, "No");
     }
 }
+
+/* Search Help popup (0.0.28). Describes exactly what MatchesSearch
+ * (seen_aircraft.c) and pattern_match.c do; example links run a real search
+ * with the existing query parameters (q, sf, pm). */
+static const char kSeenSearchHelp[] =
+    "<h4>Normal search</h4>"
+    "<p>Not case-sensitive. Plain text (no <code>?</code> or <code>*</code>) matches anywhere in the value, "
+    "e.g. <a href='/seen?q=N12345'>N12345</a> or <a href='/seen?q=ual&amp;sf=c'>ual</a> (any call sign containing UAL).</p>"
+    "<p><b>In</b> chooses what is searched:</p><ul>"
+    "<li><b>Either</b>: plain text searches the ICAO24, call sign, provider operator, your registry rule and its note, "
+    "and your configured operator; a <code>?</code>/<code>*</code> or Pattern search checks the call sign and your registry rule.</li>"
+    "<li><b>Call sign</b>: the call sign only.</li>"
+    "<li><b>Registration</b>: Seen does not store registrations, so this searches the call sign (light aircraft often fly "
+    "their registration as the call sign) and the Registered Aircraft rule that matched the aircraft.</li></ul>"
+    "<h4>Wildcards</h4><ul>"
+    "<li><code>?</code> = exactly one character, <code>*</code> = zero or more characters.</li>"
+    "<li>With a wildcard the whole value must match: "
+    "<a href='/seen?q=ABC%3F&amp;sf=c'>ABC?</a> = four characters starting ABC; "
+    "<a href='/seen?q=*ABC*&amp;sf=c'>*ABC*</a> = contains ABC anywhere; "
+    "<a href='/seen?q=UAL*&amp;sf=c'>UAL*</a> = starts with UAL.</li></ul>"
+    "<h4>Pattern mode</h4>"
+    "<p>Only when <b>Pattern mode</b> is ticked: <code>L</code> = exactly one letter, <code>N</code> = exactly one digit, "
+    "plus <code>?</code> and <code>*</code>; everything else is literal and the whole value must match. "
+    "<a href='/seen?q=LLLNNNNL&amp;sf=c&amp;pm=1'>LLLNNNNL</a> = three letters, four digits, one letter; "
+    "<a href='/seen?q=LLL*&amp;sf=c&amp;pm=1'>LLL*</a> = starts with three letters; "
+    "<a href='/seen?q=NNN*&amp;sf=c&amp;pm=1'>NNN*</a> = starts with three digits.</p>"
+    "<p>Without Pattern mode, L and N are ordinary letters: <a href='/seen?q=LLL123'>LLL123</a> looks for the text LLL123.</p>"
+    "<p><small>Example links start a new search (filter and sort return to their defaults). Registered Aircraft rules on "
+    "/registered use their own syntax, not this one.</small></p>";
 
 static esp_err_t SendRecordRow(httpd_req_t *req, const SeenRecord *r)
 {
@@ -196,6 +234,8 @@ static esp_err_t SeenPage(httpd_req_t *req)
 
     SeenQuery query = {
         .search = pq.search,
+        .searchField = (uint8_t)pq.searchField,
+        .searchMode = (uint8_t)(pq.patternMode ? PATTERN_MODE_PATTERN : PATTERN_MODE_NORMAL),
         .filter = filterChoices[pq.filterIndex].filter,
         .sort = sortChoices[pq.sortIndex].key,
         .descending = pq.descending,
@@ -267,12 +307,25 @@ static esp_err_t SeenPage(httpd_req_t *req)
         SendFormat(req,
             "<form class='f' method='get' action='/seen'>"
             "<label>Search <input name='q' value='%s' maxlength='%d' placeholder='ICAO24, call sign, operator, registry, note'></label>"
+            "<label>In <select name='sf'><option value='e'%s>Either</option><option value='c'%s>Call sign</option>"
+            "<option value='r'%s>Registration</option></select></label>"
+            "<label><input type='checkbox' name='pm' value='1'%s> Pattern mode</label>"
             "<label>Show <select name='f'>%s</select></label>"
             "<label>Sort by <select name='s'>%s</select></label>"
             "<label>Order <select name='d'><option value='d'%s>Descending</option><option value='a'%s>Ascending</option></select></label>"
             "<button>Apply</button> <a href='/seen'>Reset</a></form>",
-            eSearch, SEARCH_MAX, filterOpts, sortOpts,
-            pq.descending ? " selected" : "", pq.descending ? "" : " selected") != ESP_OK) {
+            eSearch, SEARCH_MAX,
+            pq.searchField == SEARCH_FIELD_EITHER ? " selected" : "", pq.searchField == SEARCH_FIELD_CALLSIGN ? " selected" : "",
+            pq.searchField == SEARCH_FIELD_REGISTRATION ? " selected" : "", pq.patternMode ? " checked" : "",
+            filterOpts, sortOpts,
+            pq.descending ? " selected" : "", pq.descending ? "" : " selected") != ESP_OK ||
+        SendChunk(req, "<p class='meta'><small>? = one character, * = any number of characters (whole value); text "
+                       "without them matches anywhere. Pattern mode: L = letter, N = number (e.g. LLLNNNN, N*). Either "
+                       "also searches ICAO24, operator, registry and note for plain text. Seen does not store "
+                       "registrations: Registration searches the call sign and your registry rule. ") != ESP_OK ||
+        WebStyle_SendHelpLink(req, "searchHelp", "Search Help") != ESP_OK ||
+        SendChunk(req, "</small></p>") != ESP_OK ||
+        WebStyle_SendHelpDialog(req, "searchHelp", "Seen search help", kSeenSearchHelp) != ESP_OK) {
         err = ESP_FAIL;
         goto done;
     }
@@ -306,7 +359,8 @@ static esp_err_t SeenPage(httpd_req_t *req)
     {
         char base[256], enc[SEARCH_MAX * 3 + 1];
         WebUtil_UrlEncode(enc, sizeof(enc), pq.search);
-        snprintf(base, sizeof(base), "q=%s&amp;f=%s&amp;s=%s&amp;d=%s", enc, filterChoices[pq.filterIndex].token,
+        snprintf(base, sizeof(base), "q=%s&amp;sf=%s%s&amp;f=%s&amp;s=%s&amp;d=%s", enc, SearchField_Token(pq.searchField),
+                 pq.patternMode ? "&amp;pm=1" : "", filterChoices[pq.filterIndex].token,
                  sortChoices[pq.sortIndex].token, pq.descending ? "d" : "a");
 
         if (SendChunk(req, "</table></div><p>") != ESP_OK ||
@@ -320,12 +374,13 @@ static esp_err_t SeenPage(httpd_req_t *req)
 
     if (SendFormat(req,
             "</p><p><small>Seen counts visits: an aircraft that returns after %d minutes or more counts again. "
-            "History holds up to %d aircraft; the least recently seen are dropped first. Times are stored in UTC and "
+            "History holds up to %d aircraft; when it is full, the setup page's policy decides which one is dropped (now: %s). Times are stored in UTC and "
             "shown in the time zone set on the setup page. Changes are saved to flash about every %d minutes. "
             "Add / Edit opens the Registry / Operator dialog. The persistent record kept on the TF card is on the <a href='/history'>History</a> page.</small></p>"
             "<form method='post' action='/seen/clear' onsubmit=\"return confirm('Delete the entire seen-aircraft history? This cannot be undone.')\">"
             "<button>Clear history</button></form></body></html>",
-            SEEN_VISIT_GAP_SEC / 60, SEEN_MAX_RECORDS, SEEN_FLUSH_INTERVAL_SEC / 60) != ESP_OK) {
+            SEEN_VISIT_GAP_SEC / 60, SEEN_MAX_RECORDS,
+            SeenEvictionPolicy_Name(SeenAircraft_GetEvictionPolicy()), SEEN_FLUSH_INTERVAL_SEC / 60) != ESP_OK) {
         err = ESP_FAIL;
     }
 

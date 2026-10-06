@@ -7,7 +7,7 @@
 
 /* Two user-editable lists, both plain CSV on the SPIFFS partition:
  *
- *   Registry (custom_rules.csv):   PREFIX,TYPE[,AIRCRAFT[,NOTES]] - explicit
+ *   Registry (custom_rules.csv):   PREFIX,TYPE[,AIRCRAFT[,NOTES[,ICAO24]]] - explicit
  *                                  per-aircraft (registration / call sign)
  *                                  classification, plus the manual aircraft
  *                                  type (FIXED, HELI or OTHER; optional, a
@@ -33,6 +33,10 @@
 #define MAX_CUSTOM_RULES 5000
 #define MAX_RULE_PREFIX 15
 #define MAX_RULE_NOTES 96 /* optional free-text context, e.g. "South Korea, LG Electronics" */
+/* Optional ICAO24 on a registry entry. Same width and normalization as the
+ * Seen/History ICAO24 key (SeenAircraft_NormalizeIcao: hex, upper-cased, an
+ * optional leading "~" for non-ICAO addresses), so one aircraft is one key. */
+#define MAX_RULE_ICAO24 8
 #define MAX_OPERATORS 1000
 #define MAX_OPERATOR_CODE 4
 #define MAX_OPERATOR_NAME 39
@@ -41,17 +45,40 @@
  * file without any #FORMAT marker is a pre-Personal/Business/Cargo/Important
  * file, in which PRIVATE meant the small-aircraft category, so it is read as
  * Personal and rewritten. Version 3 adds the optional trailing Notes column;
- * a version-2 file loads with every rule's notes empty. */
-#define CUSTOM_RULES_FORMAT_VERSION 3
+ * a version-2 file loads with every rule's notes empty. Version 4 adds the
+ * optional trailing ICAO24 column; PREFIX may then be empty (ICAO24-only
+ * entry). A version-3 file loads unchanged (every entry callsign-only) and is
+ * rewritten as version 4. */
+#define CUSTOM_RULES_FORMAT_VERSION 4
 
+#ifndef CUSTOM_RULES_CSV_PATH /* overridable only so host tests can use a scratch directory */
 #define CUSTOM_RULES_CSV_PATH "/spiffs/custom_rules.csv"
+#endif
+#ifndef OPERATORS_CSV_PATH /* overridable only so host tests can use a scratch directory */
 #define OPERATORS_CSV_PATH "/spiffs/operators.csv"
+#endif
 /* Old operator-extras file. Read once (only if operators.csv does not exist
  * yet) and migrated into operators.csv; never written again. */
+#ifndef COMMERCIAL_CODES_CSV_PATH /* overridable only so host tests can use a scratch directory */
 #define COMMERCIAL_CODES_CSV_PATH "/spiffs/commercial_codes.csv"
+#endif
 
+/* A Registered Aircraft entry. It is identified by the (icao24, prefix) pair;
+ * at least one of the two is non-empty.
+ *
+ * Matching (ResolveAircraftOpts):
+ *   prefix only     : the existing call-sign pattern match (prefix, ignores
+ *                     case, '?' = one letter/digit), longest rule wins.
+ *   icao24 only     : aircraft ICAO24 equals icao24, whatever its call sign
+ *                     (blank included).
+ *   icao24 + prefix : BOTH must hold; a blank or non-matching call sign does
+ *                     not match.
+ * Most specific wins: icao24+prefix > icao24 only > prefix only; within a
+ * tier the longest prefix wins. ICAO24 is only an identifier: the craft type
+ * always comes from the entry's configured type. */
 typedef struct {
-    char prefix[MAX_RULE_PREFIX + 1];
+    char prefix[MAX_RULE_PREFIX + 1]; /* call-sign pattern, may be "" when icao24 is set */
+    char icao24[MAX_RULE_ICAO24 + 1]; /* optional, "" = callsign-only entry */
     CraftType type;
     AircraftType aircraftType;
     char notes[MAX_RULE_NOTES + 1]; /* optional, may be empty */
@@ -89,7 +116,8 @@ typedef struct {
     AircraftTypeSource aircraftTypeSource;
     CraftSource source;
     char operatorCode[MAX_OPERATOR_CODE + 1]; /* set when source == CRAFT_SRC_OPERATOR */
-    char registryPrefix[MAX_RULE_PREFIX + 1]; /* matching rule, set when source == CRAFT_SRC_REGISTRY */
+    char registryPrefix[MAX_RULE_PREFIX + 1]; /* matching rule, set when source == CRAFT_SRC_REGISTRY ("" for an ICAO24-only rule) */
+    char registryIcao24[MAX_RULE_ICAO24 + 1]; /* matching rule's ICAO24 ("" for a callsign-only rule) */
 } CraftResolution;
 
 /* Call after nvs_flash_init(), before the web server or OpenSky polling. */
@@ -97,15 +125,32 @@ bool CustomRules_Init(void);
 /* Re-reads both CSV files from scratch (used after a bulk upload). */
 bool CustomRules_Reload(void);
 
+/* Increases whenever the registry or operator rules may have changed (edit, delete, reload).
+ * Lets a cache of "is this aircraft configured?" know when to discard itself. Cheap; lock-free. */
+uint32_t CustomRules_Revision(void);
+
 /* ---- registry ---- */
 size_t CustomRules_Count(void);
 bool CustomRules_Get(size_t index, CustomRule *out);
-/* Exact (case-insensitive) lookup of one rule; used for duplicate detection. */
+/* Exact (case-insensitive) lookup of one callsign-only rule; used for duplicate detection. */
 bool CustomRules_Find(const char *prefix, CustomRule *out);
-/* notes may be NULL or empty (optional). add or update. */
+/* notes may be NULL or empty (optional). add or update a callsign-only rule. */
 bool CustomRules_Add(const char *prefix, CraftType type, AircraftType aircraftType, const char *notes);
 bool CustomRules_Delete(const char *prefix);
+/* Entry-keyed variants: icao24 and prefix are each optional (NULL or "" = not
+ * set) but not both. Same normalizers as everywhere else. */
+bool CustomRules_FindEntry(const char *icao24, const char *prefix, CustomRule *out);
+bool CustomRules_AddEntry(const char *icao24, const char *prefix, CraftType type,
+                          AircraftType aircraftType, const char *notes);
+bool CustomRules_DeleteEntry(const char *icao24, const char *prefix);
 bool CustomRules_NormalizePrefix(const char *input, char out[MAX_RULE_PREFIX + 1]);
+/* Human-readable entry key for UI text: "SAM", "ICAO24 A1B2C3" or
+ * "SAM (ICAO24 A1B2C3)". Always NUL-terminated; MAX_RULE_LABEL fits all. */
+#define MAX_RULE_LABEL 40
+void CustomRules_EntryLabel(const char *icao24, const char *prefix, char *out, size_t cap);
+/* Optional ICAO24: NULL/blank -> out = "" and true; otherwise the shared
+ * SeenAircraft_NormalizeIcao rules (false if invalid or too long). */
+bool CustomRules_NormalizeIcao24(const char *input, char out[MAX_RULE_ICAO24 + 1]);
 /* Trims, then accepts 0..MAX_RULE_NOTES printable ASCII characters. Commas
  * and double quotes are rejected (same convention as Operators_NormalizeName)
  * so the CSV never needs quoting. NULL/empty input is valid - Notes is optional. */

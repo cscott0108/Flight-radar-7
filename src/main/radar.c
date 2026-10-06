@@ -2,6 +2,8 @@
 #include "main.h"
 #include "draw_aircraft.h"
 #include "airports.h"
+#include "visibility_policy.h"
+#include "auto_select.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -30,6 +32,15 @@ static bool autoSelectClosest = false;
 static bool Radar_GeoOffsetKm(float lat, float lon, float centerLat, float centerLon,
                               float *eastKmOut, float *northKmOut);
 
+/* HOSTTEST:BEGIN sel (extracted verbatim by host_tests/radar_glue_test.c) */
+static AutoSelectState autoState;
+static AutoSelectCand autoCands[MAX_AIRCRAFT]; /* only touched with the LVGL lock held */
+
+static uint32_t NowMs(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
 static float AircraftDistanceKm(const Aircraft *aircraft)
 {
     // Use the dead-reckoned position so auto-select-closest tracks aircraft
@@ -43,31 +54,43 @@ static float AircraftDistanceKm(const Aircraft *aircraft)
     return sqrtf(eastKm * eastKm + northKm * northKm);
 }
 
-void Radar_ReconcileSelection(void)
+/* Auto-select: classification, then radar ring, then distance (auto_select.c); ties rotate
+ * by ICAO24, independent of the order of gAircraft[]. Returns an index into gAircraft[]. */
+static int AutoSelectGet(void)
+{
+    int n = gAircraftCount;
+    if (n > MAX_AIRCRAFT)
+        n = MAX_AIRCRAFT;
+    for (int i = 0; i < n; i++)
+    {
+        CraftType t = evaluateAircraftType(gAircraft[i].callsign, gAircraft[i].icao24);
+        autoCands[i].icao24 = gAircraft[i].icao24;
+        autoCands[i].cls = (t == CRAFT_IMPORTANT)     ? AUTOSEL_CLASS_IMPORTANT
+                           : (t == CRAFT_INTERESTING) ? AUTOSEL_CLASS_INTERESTING
+                                                      : AUTOSEL_CLASS_OTHER;
+        autoCands[i].distKm = AircraftDistanceKm(&gAircraft[i]);
+    }
+    return AutoSelect_Choose(&autoState, autoCands, n, radarRadiusKm, NowMs());
+}
+
+static void ReconcileSelectionInner(void)
 {
     if (gAircraftCount <= 0)
     {
         selectedAircraft = -1;
         selectedIcao24[0] = '\0';
+        AutoSelect_Choose(&autoState, autoCands, 0, radarRadiusKm, NowMs());
         return;
     }
 
     if (autoSelectClosest)
     {
-        int closest = 0;
-        float closestDistance = AircraftDistanceKm(&gAircraft[0]);
-        for (int i = 1; i < gAircraftCount; i++)
+        int pick = AutoSelectGet();
+        if (pick >= 0)
         {
-            float distance = AircraftDistanceKm(&gAircraft[i]);
-            if (distance < closestDistance)
-            {
-                closest = i;
-                closestDistance = distance;
-            }
+            selectedAircraft = pick;
+            strcpy(selectedIcao24, gAircraft[pick].icao24);
         }
-
-        selectedAircraft = closest;
-        strcpy(selectedIcao24, gAircraft[closest].icao24);
         return;
     }
 
@@ -103,6 +126,24 @@ void Radar_ReconcileSelection(void)
         gAircraft[0].icao24);
 }
 
+/* Callers hold the LVGL lock. Whenever the selected identity changes (auto-select moving to another
+ * aircraft, the old one leaving, ...) the Selected Craft panel is repainted here, so the panel can
+ * never lag behind the highlight on the radar. */
+void Radar_ReconcileSelection(void)
+{
+    char before[sizeof(selectedIcao24)];
+    strcpy(before, selectedIcao24);
+    ReconcileSelectionInner();
+    if (strcmp(before, selectedIcao24) != 0)
+        UpdateSelectedAircraftUI();
+}
+
+void Radar_NoteManualSelection(void)
+{
+    AutoSelect_NoteManual(&autoState, selectedIcao24, NowMs());
+}
+/* HOSTTEST:END sel */
+
 Aircraft *Radar_GetSelectedAircraft(void)
 {
     if (selectedAircraft < 0 ||
@@ -134,7 +175,9 @@ void Radar_PredictAircraft(void)
         Aircraft *a =
             &gAircraft[i];
 
-        if (!a->valid)
+        // A stale (retained, no longer reported) aircraft stays at its last
+        // reported position instead of being dead-reckoned onward.
+        if (!a->valid || a->visState == AIRCRAFT_VIS_STALE)
             continue;
 
         uint32_t now =
@@ -182,8 +225,55 @@ void Radar_PredictAircraft(void)
     }
 }
 
+/* HOSTTEST:BEGIN idle (extracted verbatim by host_tests/display_idle_test.c) */
+/* Zero-traffic display idle. The LCD being dimmed is a display/power-saving state only: polling,
+ * tracking, the WebUI and every task keep running. While BOTH idle dim is active (main.c,
+ * UpdateDayNightBrightness) AND there are zero aircraft, the 30 ms sweep stops advancing and stops
+ * invalidating the 380x380 radar area, so LVGL renders nothing there. The aircraft count is read live
+ * on every call, so the first tick/refresh after aircraft return redraws at once, independently of
+ * the backlight's 250 ms wake path. Setters never touch LVGL: safe from any task. */
+static volatile bool idleDimActive = false;
+static volatile bool redrawPending = false; /* one frame wanted while frozen (e.g. range changed) */
+static bool renderFrozen = false;            /* LVGL timer context only */
+
+void Radar_SetIdleDimActive(bool active)
+{
+    idleDimActive = active;
+}
+
+bool Radar_IsDisplayIdle(void)
+{
+    return idleDimActive && gAircraftCount == 0;
+}
+
+void Radar_RequestRedraw(void)
+{
+    redrawPending = true;
+}
+
+/* LVGL timer context (30 ms). */
 void Radar_SweepTick(void)
 {
+    if (Radar_IsDisplayIdle())
+    {
+        /* Render once, then freeze: the tick that enters the idle state draws one final frame of the
+         * current (empty) radar - rings, labels, airports - and after that no sweep animation and no
+         * repaint. A pending request (range/airport change) still gets exactly one frame. */
+        if (!renderFrozen)
+        {
+            renderFrozen = true;
+            redrawPending = true;
+        }
+        if (redrawPending && radarObject)
+        {
+            redrawPending = false;
+            lv_obj_invalidate(radarObject);
+        }
+        return;
+    }
+    renderFrozen = false;  /* aircraft back (or idle dim ended): sweep resumes on this very tick */
+    redrawPending = false; /* the normal invalidate below covers it */
+
     sweepAngle += 3.0f;
 
     if (sweepAngle >= 360.0f)
@@ -198,12 +288,28 @@ void Radar_SweepTick(void)
     }
 }
 
+/* Callers hold the LVGL lock. While display-idle there is nothing new to draw (zero aircraft), so this
+ * is a no-op; with aircraft present (including the first poll after they return) it always repaints. */
+void Radar_Refresh(void)
+{
+    if (Radar_IsDisplayIdle())
+        return;
+
+    if (radarObject)
+    {
+        lv_obj_invalidate(
+            radarObject);
+    }
+}
+/* HOSTTEST:END idle */
+
 /* The one authoritative geographic-offset calculation (flat-earth
  * approximation, valid at radar ranges): east/north km from
  * (centerLat,centerLon) to (lat,lon). Radar_ProjectPosition (screen
  * position) and Radar_GeoBearingAndDistance (bearing/range, for the
  * off-screen indicator) both derive from this and nothing else, so the
  * coordinate system can never disagree with itself. */
+/* HOSTTEST:BEGIN geo */
 static bool Radar_GeoOffsetKm(float lat, float lon, float centerLat, float centerLon,
                               float *eastKmOut, float *northKmOut)
 {
@@ -232,6 +338,9 @@ static bool Radar_GeoOffsetKm(float lat, float lon, float centerLat, float cente
     return true;
 }
 
+/* HOSTTEST:END geo */
+
+/* HOSTTEST:BEGIN proj (extracted verbatim by host_tests/locations_test.c) */
 bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLon,
                            float radiusKm, int radiusPixels, int *x, int *y)
 {
@@ -262,6 +371,7 @@ bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLo
 
     return true;
 }
+/* HOSTTEST:END proj */
 
 bool Radar_GeoBearingAndDistance(float lat, float lon, float centerLat, float centerLon,
                                  float *bearingDegOut, float *distanceKmOut)
@@ -424,7 +534,24 @@ static void DrawBoldLabel(
         NULL);
 }
 
-// Draws one airport marker at the given screen position. Dot mode (or a
+// "Count only" airport mode: the number of on-ground aircraft at an airport
+// (latest poll), drawn just above-right of the airport marker. Same label
+// drawing as the compass/range labels; no aircraft rendering involved.
+static void DrawAirportCountLabel(lv_draw_ctx_t *draw_ctx, int x, int y, unsigned count)
+{
+    char text[8];
+    snprintf(text, sizeof(text), "%u", count);
+    lv_draw_label_dsc_t label;
+    lv_draw_label_dsc_init(&label);
+    label.color = lv_color_white();
+    label.font = &lv_font_montserrat_12;
+    label.align = LV_TEXT_ALIGN_LEFT;
+    lv_area_t area = {.x1 = x + 6, .y1 = y - 16, .x2 = x + 36, .y2 = y - 2};
+    lv_draw_label(draw_ctx, &label, &area, text, NULL);
+}
+
+// Draws one location marker (airport, heliport H, special-location square or
+// generic dot) at the given screen position. Dot mode (or a
 // directional marker whose runway text doesn't currently resolve to a valid
 // axis - see Airport_ParseRunwayAxis) draws the original plain dot;
 // otherwise draws the "[=( )=]"-style runway-axis marker: a short line along
@@ -432,20 +559,41 @@ static void DrawBoldLabel(
 // a small center dot, all in the airport's own configured color. Geometry
 // (axis math, line/cap lengths) is shared with the /airports SVG preview via
 // airports.h/.c - this function is only the LVGL-specific draw calls.
+// axisOverrideDeg (may be NULL): exact runway axis for a Directional marker,
+// used for built-in airports (database axis or a 1-degree user override).
 static void DrawAirportMarker(
     lv_draw_ctx_t *draw_ctx,
     int cx,
     int cy,
-    const AirportMarker *airport)
+    const AirportMarker *airport,
+    const float *axisOverrideDeg)
 {
     const lv_color_t color = lv_color_hex(airport->color);
-    float axisDeg;
-    const bool directional =
-        airport->markerMode == AIRPORT_MARKER_DIRECTIONAL &&
-        Airport_ParseRunwayAxis(airport->runway, &axisDeg);
+    float axisDeg = 0.0f;
+    const AirportMarkerMode shape = Airport_EffectiveShape(airport, &axisDeg);
+    if (shape == AIRPORT_MARKER_DIRECTIONAL && axisOverrideDeg)
+        axisDeg = *axisOverrideDeg;
+
+    if (shape == AIRPORT_MARKER_HELIPORT)
+    {
+        // "H": geometry shared with the web preview (Airport_HeliportSegments).
+        int seg[3][4];
+        Airport_HeliportSegments(airport->diameter, seg);
+        lv_draw_line_dsc_t line;
+        lv_draw_line_dsc_init(&line);
+        line.color = color;
+        line.width = 2;
+        for (int i = 0; i < 3; i++)
+        {
+            const lv_point_t a = {cx + seg[i][0], cy + seg[i][1]};
+            const lv_point_t b = {cx + seg[i][2], cy + seg[i][3]};
+            lv_draw_line(draw_ctx, &line, &a, &b);
+        }
+        return;
+    }
 
     int centerDiameter = airport->diameter;
-    if (directional)
+    if (shape == AIRPORT_MARKER_DIRECTIONAL)
     {
         float dx1, dy1, dx2, dy2;
         const float lineLength = airport->diameter * AIRPORT_RUNWAY_LINE_LENGTH_FACTOR;
@@ -489,7 +637,9 @@ static void DrawAirportMarker(
     lv_draw_rect_dsc_init(&dot);
     dot.bg_color = color;
     dot.bg_opa = LV_OPA_COVER;
-    dot.radius = LV_RADIUS_CIRCLE;
+    // Square = special aviation-interest location (contextual only); every
+    // other shape keeps the original round dot.
+    dot.radius = (shape == AIRPORT_MARKER_SQUARE) ? 0 : LV_RADIUS_CIRCLE;
     lv_draw_rect(draw_ctx, &dot, &dotArea);
 }
 
@@ -780,8 +930,26 @@ static void radar_draw_cb(
         }
     }
 
-    // Airports sit above the sweep, rings and off-screen indicators, but
-    // below aircraft icons.
+    // Locations sit above the sweep, rings and off-screen indicators, but
+    // below aircraft icons. Built-in airports (regionally selected for the
+    // current center/range, see Airports_SelectBuiltins) are drawn first so
+    // user-defined locations always sit on top of them.
+    size_t builtinCount = Airports_SelectBuiltins(radarCenterLat, radarCenterLon, radarRadiusKm);
+    for (size_t i = 0; i < builtinCount; i++)
+    {
+        AirportMarker airport;
+        AirportBuiltinView view;
+        int px, py;
+        // Overrides are already applied: hidden ones stay selected but are
+        // not drawn; position and rotation overrides replace the defaults.
+        if (!Airports_GetActiveBuiltinView(i, &airport, &view) || view.hidden ||
+            !Radar_ProjectPosition(airport.latitude, airport.longitude,
+                                   radarCenterLat, radarCenterLon,
+                                   radarRadiusKm, radius, &px, &py))
+            continue;
+        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport, view.hasAxis ? &view.axisDeg : NULL);
+    }
+
     size_t airportCount = Airports_Count();
     for (size_t i = 0; i < airportCount; i++)
     {
@@ -792,7 +960,29 @@ static void radar_draw_cb(
                                    radarCenterLat, radarCenterLon,
                                    radarRadiusKm, radius, &px, &py))
             continue;
-        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport);
+        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport, NULL);
+    }
+
+    // Airport aircraft "Count only": per-airport on-ground counts from the
+    // latest poll (visibility_policy.c), drawn next to the airport.
+    {
+        VisSettings vis;
+        VisPolicy_GetSettings(&vis);
+        if (vis.airportMode == VIS_AIRPORT_COUNT)
+        {
+            size_t n = VisPolicy_AirportCountTotal();
+            for (size_t i = 0; i < n; i++)
+            {
+                VisAirportCount c;
+                int px, py;
+                if (!VisPolicy_GetAirportCount(i, &c) || c.associated == 0 ||
+                    !Radar_ProjectPosition(c.latitude, c.longitude,
+                                           radarCenterLat, radarCenterLon,
+                                           radarRadiusKm, radius, &px, &py))
+                    continue;
+                DrawAirportCountLabel(draw_ctx, cx + px, cy + py, c.associated);
+            }
+        }
     }
 
     for (int i = 0;
@@ -880,13 +1070,5 @@ void Radar_SetCenter(
     radarCenterLat = lat;
     radarCenterLon = lon;
     radarRadiusKm = radiusKm;
-}
-
-void Radar_Refresh(void)
-{
-    if (radarObject)
-    {
-        lv_obj_invalidate(
-            radarObject);
-    }
+    Radar_RequestRedraw(); /* range labels/airports must update even while the sweep is frozen */
 }

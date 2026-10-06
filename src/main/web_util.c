@@ -1,6 +1,7 @@
 #include "web_util.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 size_t WebUtil_EscapeHtml(char *dst, size_t cap, const char *src)
@@ -79,4 +80,41 @@ size_t WebUtil_UrlEncode(char *dst, size_t cap, const char *src)
     }
     dst[used] = '\0';
     return used;
+}
+
+/* Copies src without leading/trailing spaces into a bounded buffer. */
+static void TrimCopy(char *dst, size_t cap, const char *src)
+{
+    if (!src)
+        src = "";
+    while (*src == ' ')
+        src++;
+    size_t n = strlen(src);
+    while (n > 0 && src[n - 1] == ' ')
+        n--;
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+size_t WebUtil_BuildLookupQuery(char *dst, size_t cap, const char *icao24, const char *callsign)
+{
+    if (!dst || cap == 0)
+        return 0;
+    char hx[16], cs[24];
+    TrimCopy(hx, sizeof(hx), icao24);
+    TrimCopy(cs, sizeof(cs), callsign);
+    int n;
+    if (hx[0] && cs[0])
+        n = snprintf(dst, cap, "aircraft ICAO24 %s callsign %s", hx, cs);
+    else if (hx[0])
+        n = snprintf(dst, cap, "aircraft ICAO24 %s", hx);
+    else if (cs[0])
+        n = snprintf(dst, cap, "aircraft callsign %s", cs);
+    else
+        n = 0, dst[0] = '\0';
+    if (n < 0)
+        n = 0;
+    return (size_t)n < cap ? (size_t)n : cap - 1;
 }

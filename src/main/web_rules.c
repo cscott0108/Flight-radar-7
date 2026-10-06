@@ -142,6 +142,9 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "<p id='smsg' role='alert'></p>" \
     "<p><button type='button' onclick='dNext()'>Continue</button> <button type='button' onclick='dClose()'>Cancel</button></p></div>" \
     "<div id='s2' hidden><label><span id='lkt'></span><input type='text' id='fkey' autocomplete='off'></label>" \
+    "<label id='lic' hidden>ICAO24 <input type='text' id='ficao' maxlength='8' autocomplete='off'>" \
+    "<small>Optional. With ICAO24 only, this aircraft matches whatever its call sign (or none); " \
+    "with both, the call sign must match too.</small></label>" \
     "<label id='lo' hidden>Airline / Operator <input type='text' id='fname' maxlength='39' autocomplete='off'></label>" \
     "<label>Craft Type <select id='ftype'>"
 
@@ -157,7 +160,7 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
 
 #define SCRIPT_REG \
     "function editReg(b){var f=document.getElementById('regForm').elements;" \
-    "f['prefix'].value=b.dataset.prefix;f['type'].value=b.dataset.type;" \
+    "f['prefix'].value=b.dataset.prefix;f['icao24'].value=b.dataset.icao24||'';f['type'].value=b.dataset.type;" \
     "f['atype'].value=b.dataset.atype;f['notes'].value=b.dataset.notes||'';f['prefix'].focus();}"
 
 #define SCRIPT_OPS \
@@ -181,14 +184,32 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "location.reload();" \
     "}"
 
+/* Rule Help popup (0.0.28): a short reference to the existing rule syntax
+ * (custom_rules.c MatchesRulePattern / ResolveRegistry); the page's own
+ * explanation above the form stays the full description. */
+static const char kRuleHelp[] =
+    "<h4>Registry / call sign</h4><ul>"
+    "<li><b>Prefix match</b>, not case-sensitive: <code>SWA</code> matches SWA1234; a rule also covers any following "
+    "flight number.</li>"
+    "<li><code>?</code> = one unknown <b>letter or digit</b>: <code>S?NFRD</code> matches SANFRD12 and S1NFRD.</li>"
+    "<li>When several call-sign rules match, the <b>longest</b> wins.</li></ul>"
+    "<h4>ICAO24</h4><ul>"
+    "<li>The aircraft's 24-bit address, normally <b>6 hex digits</b> (e.g. <code>A1B2C3</code>).</li>"
+    "<li><b>ICAO24 only</b>: that aircraft with any call sign or none. <b>ICAO24 + call sign</b>: both must match. "
+    "<b>Call sign only</b>: any aircraft with a matching call sign.</li>"
+    "<li>Precedence: ICAO24 + call sign &rarr; ICAO24 only &rarr; call sign only.</li></ul>"
+    "<p><small>This is rule syntax, not search: here <code>*</code> has no meaning and a rule always matches as a "
+    "prefix. The <a href='/seen'>Seen</a> and <a href='/history'>History</a> search boxes use their own convention "
+    "(<code>?</code> any character, <code>*</code> any number, Pattern mode L/N).</small></p>";
+
 /* The search provider lives in one place: SEARCH_URL below. The browser builds
  * the URL and opens it in a new tab; the device never contacts the search site. */
 #define PAGE_SCRIPT_AIRCRAFT \
-    "var SEARCH_URL='https://www.google.com/search?q={CALLSIGN}';" \
+    "var SEARCH_URL='https://www.google.com/search?q={QUERY}';" \
     "var D=document.getElementById('dlg'),cur={},orig='',mode='',ex=null;" \
     "function $(i){return document.getElementById(i);}" \
     "function lookup(b){var q=b.dataset.q;if(!q){return;}" \
-    "window.open(SEARCH_URL.split('{CALLSIGN}').join(encodeURIComponent(q)),'_blank','noopener');}" \
+    "window.open(SEARCH_URL.split('{QUERY}').join(encodeURIComponent(q)),'_blank','noopener');}" \
     "function dOpen(b){cur=b.dataset;var has=(cur.hasreg==='1'||cur.hasop==='1');" \
     "$('dt').textContent=(has?'Edit':'Add')+' Aircraft';" \
     "$('dcs').textContent=cur.cs||'(no call sign)';" \
@@ -202,7 +223,10 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "function dNext(){var k=document.querySelector('input[name=k]:checked');" \
     "if(!k){$('smsg').textContent='Choose one option.';return;}" \
     "mode=k.value;var reg=(mode==='reg');" \
-    "$('lkt').textContent=reg?'Registry Number ':'ICAO Code ';" \
+    "$('lkt').textContent=reg?'Registry Number / call sign (optional with ICAO24) ':'ICAO Code ';" \
+    "$('lic').hidden=!reg;" \
+    "$('ficao').value=reg?(cur.hasreg==='1'?(cur.regicao||''):(cur.reg?'':(cur.hx||''))):'';" \
+    "$('ficao').placeholder=cur.hx?('this aircraft: '+cur.hx):'optional';" \
     "$('lo').hidden=reg;" \
     "$('fkey').maxLength=reg?15:4;" \
     "$('fkey').value=reg?cur.reg:cur.icao;" \
@@ -213,30 +237,32 @@ static esp_err_t SendRow(httpd_req_t *req, const char *format, ...)
     "$('fnotes').value=reg?(cur.regnotes||''):'';" \
     "$('fnotes').closest('label').hidden=!reg;" \
     "var has=reg?cur.hasreg==='1':cur.hasop==='1';" \
-    "orig=has?$('fkey').value.toUpperCase():'';" \
+    "orig=has?dId():'';" \
     "$('fkey').readOnly=(!reg&&has);" \
     "$('dedit').hidden=true;ex=null;$('dmsg').textContent='';" \
     "$('s1').hidden=true;$('s2').hidden=false;$('fkey').focus();}" \
-    "async function dSave(){var key=$('fkey').value.trim(),name=$('fname').value.trim();" \
-    "if(!key){$('dmsg').textContent=(mode==='reg'?'Registry number':'ICAO code')+' is required.';return;}" \
+    "function dId(){return $('fkey').value.trim().toUpperCase()+'|'+(mode==='reg'?$('ficao').value.trim().toUpperCase():'');}" \
+    "async function dSave(){var key=$('fkey').value.trim(),name=$('fname').value.trim(),ic=$('ficao').value.trim();" \
+    "if(mode==='reg'&&!key&&!ic){$('dmsg').textContent='Enter a registry number / call sign, an ICAO24, or both.';return;}" \
+    "if(mode==='op'&&!key){$('dmsg').textContent='ICAO code is required.';return;}" \
     "if(mode==='op'&&!name){$('dmsg').textContent='Airline / operator is required.';return;}" \
     "var p=new URLSearchParams();p.set('mode',mode);p.set('key',key);" \
     "if(mode==='op'){p.set('name',name);}" \
     "p.set('type',$('ftype').value);" \
-    "if(mode==='reg'){p.set('atype',$('fatype').value);p.set('notes',$('fnotes').value);}" \
-    "p.set('overwrite',(orig&&key.toUpperCase()===orig)?'1':'0');" \
+    "if(mode==='reg'){p.set('atype',$('fatype').value);p.set('notes',$('fnotes').value);p.set('icao24',ic);}" \
+    "p.set('overwrite',(orig&&dId()===orig)?'1':'0');" \
     "$('dmsg').textContent='Saving...';" \
     "try{var r=await fetch('/rules/save',{method:'POST',body:p});" \
     "var t=(await r.text()).split('\\n');" \
     "if(r.ok){D.close();try{sessionStorage.setItem('msg',t[1]||'Saved.');}catch(e){}location.replace(location.pathname);return;}" \
     "$('dmsg').textContent=t[1]||'Save failed.';" \
-    "if(r.status===409){ex={key:t[2],name:t[3],type:t[4],atype:t[5],notes:t[6]};$('dedit').hidden=false;}" \
+    "if(r.status===409){ex={key:t[2],name:t[3],type:t[4],atype:t[5],notes:t[6],icao:t[7]||''};$('dedit').hidden=false;}" \
     "}catch(e){$('dmsg').textContent='Could not reach the device.';}}" \
     "function dUseExisting(){if(!ex){return;}" \
     "$('fkey').value=ex.key;$('fkey').readOnly=(mode==='op');" \
     "if(mode==='op'){$('fname').value=ex.name;}" \
     "$('ftype').value=ex.type;if(ex.atype){$('fatype').value=ex.atype;}" \
-    "if(ex.notes!==undefined){$('fnotes').value=ex.notes;}orig=ex.key.toUpperCase();" \
+    "if(ex.notes!==undefined){$('fnotes').value=ex.notes;}if(mode==='reg'){$('ficao').value=ex.icao;}orig=dId();" \
     "$('dedit').hidden=true;$('dmsg').textContent='Editing the existing entry. Change it and press Save.';}" \
     "try{var m=sessionStorage.getItem('msg');if(m){sessionStorage.removeItem('msg');var bn=$('banner');bn.textContent=m;bn.hidden=false;}}catch(e){}"
 
@@ -268,6 +294,8 @@ typedef struct {
     char icao[MAX_OPERATOR_CODE + 1];
     OperatorInfo op;
     char regKey[MAX_RULE_PREFIX + 1];
+    char regIcao[MAX_RULE_ICAO24 + 1]; /* matched rule's ICAO24 ("" = callsign-only rule or none) */
+    char hxNorm[MAX_RULE_ICAO24 + 1];  /* this aircraft's ICAO24, normalized ("" if blank/invalid) */
     char regNotes[MAX_RULE_NOTES + 1];
 } AircraftInfo;
 
@@ -287,6 +315,8 @@ static void BuildAircraftInfo(AircraftInfo *info, const char *callsign, const ch
      * Type shown here is the one actually drawn. */
     info->resolved = ResolveAircraftWithHintOpts(info->cs, info->hx, hint, hasHint, useRegistry, useOperators);
     info->hasReg = (info->resolved.source == CRAFT_SRC_REGISTRY);
+    if (!CustomRules_NormalizeIcao24(info->hx, info->hxNorm))
+        info->hxNorm[0] = '\0';
 
     if (info->resolved.source == CRAFT_SRC_OPERATOR)
         snprintf(info->icao, sizeof(info->icao), "%s", info->resolved.operatorCode);
@@ -298,8 +328,9 @@ static void BuildAircraftInfo(AircraftInfo *info, const char *callsign, const ch
      * (blank if it is not a valid registry pattern). */
     if (info->hasReg) {
         snprintf(info->regKey, sizeof(info->regKey), "%s", info->resolved.registryPrefix);
+        snprintf(info->regIcao, sizeof(info->regIcao), "%s", info->resolved.registryIcao24);
         CustomRule regRule;
-        if (CustomRules_Find(info->resolved.registryPrefix, &regRule))
+        if (CustomRules_FindEntry(info->resolved.registryIcao24, info->resolved.registryPrefix, &regRule))
             snprintf(info->regNotes, sizeof(info->regNotes), "%s", regRule.notes);
     } else if (!CustomRules_NormalizePrefix(info->cs, info->regKey)) {
         info->regKey[0] = '\0'; /* the normalizer may have partially written */
@@ -325,10 +356,10 @@ static esp_err_t SendEditButton(httpd_req_t *req, const AircraftInfo *info, bool
     const char *regAircraftType = AircraftType_CsvName(info->resolved.aircraftType);
 
     return SendRow(req,
-        "<button type='button'%s data-cs='%s' data-reg='%s' data-regtype='%s' data-regatype='%s' data-regnotes='%s' "
+        "<button type='button'%s data-cs='%s' data-reg='%s' data-regicao='%s' data-hx='%s' data-regtype='%s' data-regatype='%s' data-regnotes='%s' "
         "data-hasreg='%s' data-icao='%s' data-opname='%s' data-optype='%s' data-hasop='%s' onclick='dOpen(this)'%s>%s</button>",
         autoOpen ? " id='autoOpen'" : "",
-        eCs, eReg, regType, regAircraftType, eRegNotes,
+        eCs, eReg, info->regIcao, info->hxNorm, regType, regAircraftType, eRegNotes,
         info->hasReg ? "1" : "0", info->icao, eName, opType, info->hasOp ? "1" : "0",
         autoOpen ? " hidden" : "",
         (info->hasReg || info->hasOp) ? "&#9998; Edit" : "&#10133; Add");
@@ -359,8 +390,11 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
     /* Decided by: craft type (color) and Aircraft Type (shape) can come from
      * different places, so both are stated. */
     char craftBy[64];
-    if (res->source == CRAFT_SRC_REGISTRY)
-        snprintf(craftBy, sizeof(craftBy), "Registry %s", res->registryPrefix);
+    if (res->source == CRAFT_SRC_REGISTRY) {
+        char label[MAX_RULE_LABEL];
+        CustomRules_EntryLabel(res->registryIcao24, res->registryPrefix, label, sizeof(label));
+        snprintf(craftBy, sizeof(craftBy), "Registry %s", label);
+    }
     else if (res->source == CRAFT_SRC_OPERATOR)
         snprintf(craftBy, sizeof(craftBy), "Operator %s", res->operatorCode);
     else
@@ -368,7 +402,12 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
 
     char eShown[128], eQuery[128], eHx[64], eCraftBy[128];
     EscapeInto(eShown, sizeof(eShown), info.cs[0] ? info.cs : "(empty)");
-    EscapeInto(eQuery, sizeof(eQuery), info.cs[0] ? info.cs : info.hx);
+    /* 0.0.28: the web lookup always says it is about an aircraft, so a call
+     * sign that looks like a part number or chip name still finds aircraft:
+     * "aircraft ICAO24 a1b2c3 callsign N12345", or the one identifier known. */
+    char lookupQuery[96];
+    WebUtil_BuildLookupQuery(lookupQuery, sizeof(lookupQuery), info.hx, info.cs);
+    EscapeInto(eQuery, sizeof(eQuery), lookupQuery);
     EscapeInto(eHx, sizeof(eHx), info.hx);
     EscapeInto(eCraftBy, sizeof(eCraftBy), craftBy);
 
@@ -404,7 +443,9 @@ static esp_err_t SendAircraftRow(httpd_req_t *req, int index)
     char registryCell[MAX_RULE_NOTES * 6 + 160];
     registryCell[0] = '\0';
     if (info.hasReg) {
-        AppendEscaped(registryCell, sizeof(registryCell), info.regKey);
+        char label[MAX_RULE_LABEL];
+        CustomRules_EntryLabel(info.regIcao, info.regKey, label, sizeof(label));
+        AppendEscaped(registryCell, sizeof(registryCell), label);
         if (info.regNotes[0]) {
             AppendRaw(registryCell, sizeof(registryCell), "<small>");
             AppendEscaped(registryCell, sizeof(registryCell), info.regNotes);
@@ -466,15 +507,24 @@ static esp_err_t RegisteredPage(httpd_req_t *req)
         "<p class='wn'>Registered Aircraft matching is <b>OFF</b> (Setup &rarr; Features). "
         "Saved registrations are kept and can still be edited here, but the radar is not using them.</p>") != ESP_OK)
         return ESP_FAIL;
-    if (SendChunk(req,
+    if (WebStyle_SendHelpDialog(req, "ruleHelp", "Rule Help", kRuleHelp) != ESP_OK ||
+        SendChunk(req,
         "<p>Each aircraft resolves to one craft type, which decides its marker and color. "
         "Order of lookup: <b>Registry</b> rule (exact aircraft) &rarr; built-in military/police/EMS prefixes "
         "&rarr; <b>Operator</b> (ICAO code) &rarr; Personal. Changes apply immediately and are saved.</p>"
         "<p>Prefix matches ignore case and include any following flight number. "
         "Use ? for one unknown letter or digit (for example S?NFRD). The longest rule wins. "
-        "Blank call signs are Personal.</p>"
+        "Blank call signs are Personal unless an ICAO24 entry matches. "
+        "<small>(These are classification rules, not a search: the Seen and History search boxes use their own "
+        "convention, where ? is any one character and * any number of characters.) "
+        "<a href='#' class='helpln' onclick=\"document.getElementById('ruleHelp').showModal();return false;\">Rule Help</a></small></p>"
+        "<p>An entry can also (or instead) name the aircraft's <b>ICAO24</b> address (6 hex digits, e.g. A1B2C3), "
+        "for aircraft that do not broadcast a call sign. ICAO24 only: matches that aircraft with any call sign or none. "
+        "ICAO24 + call sign: both must match. When several entries match, ICAO24 + call sign wins over ICAO24 only, "
+        "which wins over call sign only. The ICAO24 only identifies the aircraft; the craft type comes from the entry.</p>"
         "<form class='inline' method='post' action='/add' id='regForm'>"
-        "<label>Registry / call sign <input name='prefix' maxlength='15' pattern='[A-Za-z0-9?]+' required></label> "
+        "<label>Registry / call sign <input name='prefix' maxlength='15' pattern='[A-Za-z0-9?]+' placeholder='optional with ICAO24'></label> "
+        "<label>ICAO24 <input name='icao24' maxlength='8' size='8' pattern='~?[0-9A-Fa-f]{1,8}' placeholder='optional'></label> "
         "<label>Craft type <select name='type'>") != ESP_OK ||
         SendTypeOptions(req) != ESP_OK ||
         SendChunk(req,
@@ -486,11 +536,11 @@ static esp_err_t RegisteredPage(httpd_req_t *req)
         "<p><a href='/rules/export'>Download custom_rules.csv</a> &middot; "
         "<label style='display:inline'>Upload a replacement: <input type='file' id='importRulesFile' accept='.csv,text/csv'></label> "
         "<button type='button' onclick=\"importCsv('importRulesFile','/rules/import')\">Upload &amp; replace</button></p>"
-        "<div class='w'><table><tr><th>Registry / prefix</th><th>Craft Type</th><th>Aircraft Type</th><th>Notes</th><th>Action</th></tr>") != ESP_OK)
+        "<div class='w'><table><tr><th>Registry / prefix</th><th>ICAO24</th><th>Craft Type</th><th>Aircraft Type</th><th>Notes</th><th>Action</th></tr>") != ESP_OK)
         return ESP_FAIL;
 
     size_t count = CustomRules_Count();
-    if (!count && SendChunk(req, "<tr><td colspan='5'>No registry rules</td></tr>") != ESP_OK)
+    if (!count && SendChunk(req, "<tr><td colspan='6'>No registry rules</td></tr>") != ESP_OK)
         return ESP_FAIL;
     for (size_t i = 0; i < count; i++) {
         CustomRule rule;
@@ -499,13 +549,17 @@ static esp_err_t RegisteredPage(httpd_req_t *req)
             continue;
         EscapeInto(prefix, sizeof(prefix), rule.prefix);
         EscapeInto(notes, sizeof(notes), rule.notes);
+        /* rule.icao24 is normalized hex (and '~'), so it needs no escaping. */
         if (SendRow(req,
-                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>"
-                "<button type='button' data-prefix='%s' data-type='%s' data-atype='%s' data-notes='%s' onclick='editReg(this)'>Edit</button>"
+                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>"
+                "<button type='button' data-prefix='%s' data-icao24='%s' data-type='%s' data-atype='%s' data-notes='%s' onclick='editReg(this)'>Edit</button>"
                 "<form class='inline' method='post' action='/delete'>"
-                "<input type='hidden' name='prefix' value='%s'><button>Delete</button></form></td></tr>",
-                prefix, CraftType_Name(rule.type), AircraftType_Name(rule.aircraftType), notes,
-                prefix, CraftType_CsvName(rule.type), AircraftType_CsvName(rule.aircraftType), notes, prefix) != ESP_OK)
+                "<input type='hidden' name='prefix' value='%s'><input type='hidden' name='icao24' value='%s'>"
+                "<button>Delete</button></form></td></tr>",
+                prefix[0] ? prefix : "<small>(any call sign)</small>", rule.icao24[0] ? rule.icao24 : "&mdash;",
+                CraftType_Name(rule.type), AircraftType_Name(rule.aircraftType), notes,
+                prefix, rule.icao24, CraftType_CsvName(rule.type), AircraftType_CsvName(rule.aircraftType), notes,
+                prefix, rule.icao24) != ESP_OK)
             return ESP_FAIL;
     }
     LogHttpdMemory("registered page after rules");
@@ -850,10 +904,15 @@ static esp_err_t ImportOperators(httpd_req_t *req)
 
 static esp_err_t AddRule(httpd_req_t *req)
 {
-    char body[FORM_BODY_MAX], prefix[64], typeText[40], aircraftTypeText[24], notesText[MAX_RULE_NOTES * 3 + 1];
-    if (!ReadForm(req, body) || !FormValue(body, "prefix", prefix, sizeof(prefix)) ||
-        !FormValue(body, "type", typeText, sizeof(typeText)))
+    char body[FORM_BODY_MAX], prefix[64], icaoText[24], typeText[40], aircraftTypeText[24],
+        notesText[MAX_RULE_NOTES * 3 + 1];
+    if (!ReadForm(req, body) || !FormValue(body, "type", typeText, sizeof(typeText)))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
+    /* Both key parts are optional on their own; at least one is required. */
+    if (!FormValue(body, "prefix", prefix, sizeof(prefix)))
+        prefix[0] = '\0';
+    if (!FormValue(body, "icao24", icaoText, sizeof(icaoText)))
+        icaoText[0] = '\0';
     CraftType type;
     if (!CraftType_Parse(typeText, false, &type))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid craft type");
@@ -864,14 +923,19 @@ static esp_err_t AddRule(httpd_req_t *req)
         AircraftType_Parse(aircraftTypeText, &aircraftType);
     if (!FormValue(body, "notes", notesText, sizeof(notesText)))
         notesText[0] = '\0';
-    char normalized[MAX_RULE_PREFIX + 1];
-    if (!CustomRules_NormalizePrefix(prefix, normalized))
+    char normalized[MAX_RULE_PREFIX + 1] = "", normalizedIcao[MAX_RULE_ICAO24 + 1];
+    if (prefix[0] && !CustomRules_NormalizePrefix(prefix, normalized))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Pattern must be 1-15 letters, digits, or ? characters");
+    if (!CustomRules_NormalizeIcao24(icaoText, normalizedIcao))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ICAO24 must be hex digits, for example A1B2C3");
+    if (!normalized[0] && !normalizedIcao[0])
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Enter a registry / call sign, an ICAO24, or both");
     char normalizedNotes[MAX_RULE_NOTES + 1];
     if (!CustomRules_NormalizeNotes(notesText, normalizedNotes))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                    "Notes must be under 96 characters, without commas or quotes");
-    if (!CustomRules_Add(normalized, type, aircraftType, normalizedNotes))
+    if (!CustomRules_AddEntry(normalizedIcao, normalized, type, aircraftType, normalizedNotes))
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                    "Could not save rule (storage error)");
     LogHttpdMemory("registry save");
@@ -880,10 +944,14 @@ static esp_err_t AddRule(httpd_req_t *req)
 
 static esp_err_t DeleteRule(httpd_req_t *req)
 {
-    char body[FORM_BODY_MAX], prefix[64];
-    if (!ReadForm(req, body) || !FormValue(body, "prefix", prefix, sizeof(prefix)))
+    char body[FORM_BODY_MAX], prefix[64], icaoText[24];
+    if (!ReadForm(req, body))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
-    if (!CustomRules_Delete(prefix))
+    if (!FormValue(body, "prefix", prefix, sizeof(prefix)))
+        prefix[0] = '\0';
+    if (!FormValue(body, "icao24", icaoText, sizeof(icaoText)))
+        icaoText[0] = '\0'; /* older page / bookmark: a callsign-only entry */
+    if (!CustomRules_DeleteEntry(icaoText, prefix))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Rule not found or storage error");
     return RedirectTo(req, "/registered");
 }
@@ -948,15 +1016,17 @@ static esp_err_t Reply(httpd_req_t *req, const char *status, const char *text)
     return httpd_resp_sendstr(req, text);
 }
 
-/* POST /rules/save: mode=reg|op, key, [name], type, overwrite=0|1.
+/* POST /rules/save: mode=reg|op, key, [icao24 (reg only)], [name], type, overwrite=0|1.
  * Reuses the same normalizers and storage calls as the dedicated forms.
  * Without overwrite=1, an existing entry is reported (409) instead of replaced. */
 static esp_err_t SaveFromAircraft(httpd_req_t *req)
 {
     char body[FORM_BODY_MAX], mode[8], key[64], name[160], typeText[40], overwriteText[8];
     if (!ReadForm(req, body) || !FormValue(body, "mode", mode, sizeof(mode)) ||
-        !FormValue(body, "key", key, sizeof(key)) || !FormValue(body, "type", typeText, sizeof(typeText)))
+        !FormValue(body, "type", typeText, sizeof(typeText)))
         return Reply(req, "400 Bad Request", "ERR\nInvalid form data.");
+    if (!FormValue(body, "key", key, sizeof(key)))
+        key[0] = '\0'; /* optional for an ICAO24-only registry entry; required (checked below) for operators */
     if (!FormValue(body, "name", name, sizeof(name)))
         name[0] = '\0';
     bool overwrite = FormValue(body, "overwrite", overwriteText, sizeof(overwriteText)) &&
@@ -980,27 +1050,37 @@ static esp_err_t SaveFromAircraft(httpd_req_t *req)
 
     char reply[512];
     if (!strcmp(mode, "reg")) {
-        char prefix[MAX_RULE_PREFIX + 1];
-        if (!CustomRules_NormalizePrefix(key, prefix))
+        char prefix[MAX_RULE_PREFIX + 1] = "", icao[MAX_RULE_ICAO24 + 1], icaoText[24];
+        if (!FormValue(body, "icao24", icaoText, sizeof(icaoText)))
+            icaoText[0] = '\0';
+        if (key[0] && !CustomRules_NormalizePrefix(key, prefix))
             return Reply(req, "400 Bad Request",
                          "ERR\nRegistry number must be 1-15 letters, digits, or ? characters.");
+        if (!CustomRules_NormalizeIcao24(icaoText, icao))
+            return Reply(req, "400 Bad Request", "ERR\nICAO24 must be hex digits, for example A1B2C3.");
+        if (!prefix[0] && !icao[0])
+            return Reply(req, "400 Bad Request",
+                         "ERR\nEnter a registry number / call sign, an ICAO24, or both.");
+        char label[MAX_RULE_LABEL];
+        CustomRules_EntryLabel(icao, prefix, label, sizeof(label));
         char normalizedNotes[MAX_RULE_NOTES + 1];
         if (!CustomRules_NormalizeNotes(notesText, normalizedNotes))
             return Reply(req, "400 Bad Request",
                          "ERR\nNotes must be under 96 characters, without commas or quotes.");
         CustomRule existing;
-        if (!overwrite && CustomRules_Find(prefix, &existing)) {
+        if (!overwrite && CustomRules_FindEntry(icao, prefix, &existing)) {
+            /* Lines: status, message, key, name (unused), type, aircraft type, notes, ICAO24. */
             snprintf(reply, sizeof(reply),
                      "EXISTS\n%s is already configured. Current: %s" ARROW "%s. "
-                     "Would you like to edit the existing entry?\n%s\n\n%s\n%s\n%s",
-                     prefix, prefix, CraftType_Name(existing.type), prefix,
+                     "Would you like to edit the existing entry?\n%s\n\n%s\n%s\n%s\n%s",
+                     label, label, CraftType_Name(existing.type), prefix,
                      CraftType_CsvName(existing.type), AircraftType_CsvName(existing.aircraftType),
-                     existing.notes);
+                     existing.notes, existing.icao24);
             return Reply(req, "409 Conflict", reply);
         }
-        if (!CustomRules_Add(prefix, type, aircraftType, normalizedNotes))
+        if (!CustomRules_AddEntry(icao, prefix, type, aircraftType, normalizedNotes))
             return Reply(req, "500 Internal Server Error", "ERR\nCould not save (storage error).");
-        snprintf(reply, sizeof(reply), "OK\nSaved registry rule %s" ARROW "%s, %s.", prefix,
+        snprintf(reply, sizeof(reply), "OK\nSaved registry rule %s" ARROW "%s, %s.", label,
                  CraftType_Name(type), AircraftType_Name(aircraftType));
     } else if (!strcmp(mode, "op")) {
         char code[MAX_OPERATOR_CODE + 1], opName[MAX_OPERATOR_NAME + 1];
