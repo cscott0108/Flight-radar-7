@@ -136,6 +136,32 @@ The card is optional either way: without one, or if it fails, the radar, WebUI a
 
 ---
 
+## 📸 Screenshots
+
+All screenshots use a fictional example setup (radar centre 37.6189, -122.3750, network "HomeWiFi", 192.168.1.150, example call signs and registrations); no real installation data is shown.
+
+### Device UI
+
+![Device UI: radar with range rings, labelled aircraft, airport runway markers, the Overview and Settings panels and the Selected Craft panel](docs/images/flight-radar-7-device-ui.png)
+
+*The 7" radar screen: live aircraft with labels, built-in airports (runway-axis markers), heliports, the overview / settings panels and the Selected Craft panel for the highlighted helicopter. Photo of a real device; location, network and aircraft identifiers replaced with example values.*
+
+### WebUI
+
+The WebUI images below were rendered from the 0.0.30 WebUI handler code with example data (not captured from a live device).
+
+| Setup: location and aircraft data providers | Current Aircraft |
+|---|---|
+| ![Setup page with location, range and both aircraft data providers enabled](docs/images/webui-setup.png) | ![Current Aircraft table with craft type, operator, registry match and decision source](docs/images/webui-current-aircraft.png) |
+| *Location, range and the OpenSky / adsb.lol provider intervals.* | *Each aircraft with its craft type, operator, registry match and what decided it.* |
+
+| Airports and Special Air Traffic | Registered Aircraft with Rule Help |
+|---|---|
+| ![Airports page with the radar preview of built-in airports and user-defined locations](docs/images/webui-airports.png) | ![Registered Aircraft page with the Rule Help dialog open](docs/images/webui-registered-rule-help.png) |
+| *Radar snapshot of active built-in airports and user-defined locations; click to add a location.* | *Registry / call-sign / ICAO24 rules and the built-in rule syntax help.* |
+
+---
+
 ## 🛠️ Hardware & Software Stack
 
 | | |
