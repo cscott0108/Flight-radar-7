@@ -65,11 +65,13 @@ typedef struct {
     uint32_t consecutiveFailures;
     uint32_t lastMs;
     uint32_t worstMs;
-    DiagStamp worstWhen;
-    DiagStamp lastRun;
+    DiagStamp worstWhen; /* completion of the worst run; its start is worstWhen - worstMs (not stored) */
+    DiagStamp lastRun;   /* completion of the latest run; its start is lastRun - lastMs (not stored) */
     bool haveFailure;
     DiagStamp lastFailureWhen;
     char lastFailure[DT_REASON_MAX]; /* fixed short text from the call site, never user data */
+    bool haveOk;
+    DiagStamp lastOkWhen; /* completion of the latest successful run (0.0.31) */
 } DiagOpStats;
 
 /* ---- core recording (pure: values are passed in, so tests need no hardware) ---- */
@@ -107,6 +109,20 @@ const char *DiagTelemetry_OpName(DiagOp op);
 bool DiagTelemetry_NeedsAttention(void);
 /* "T+812s" or "T+812s, 2026-10-05 14:03:22 UTC" (clock was synced) into out. */
 void DiagTelemetry_FormatStamp(const DiagStamp *s, char *out, size_t cap);
+
+/* /diag display (0.0.31), in the configured time zone (time_util.c, same zone/DST
+ * as every other page), to the second. Serial event lines keep FormatStamp (UTC).
+ *  FormatStampLocal: "2026-10-07 09:42:31 PDT", or "T+812s (clock not synced)".
+ *  FormatRunHtml:    the run that FINISHED at `finish` and took durationMs, start
+ *                    derived as finish - duration (rounded to the second):
+ *                    "2026-10-07 09:42:31 &rarr; 09:42:33 PDT (1.982 s)"; both ends
+ *                    in full when the date or zone abbreviation differs; without a
+ *                    synced clock "T+810s &rarr; T+812s (clock not synced) (1.982 s)".
+ *                    HTML output (uses &rarr;). Never fabricates a date. */
+void DiagTelemetry_FormatStampLocal(const DiagStamp *s, char *out, size_t cap);
+void DiagTelemetry_FormatRunHtml(const DiagStamp *finish, uint32_t durationMs, char *out, size_t cap);
+/* The start stamp of a run that finished at `finish` after durationMs. */
+DiagStamp DiagTelemetry_RunStart(const DiagStamp *finish, uint32_t durationMs);
 
 /* ---- host-test hooks ---- */
 typedef struct {

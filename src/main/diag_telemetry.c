@@ -129,6 +129,62 @@ void DiagTelemetry_FormatStamp(const DiagStamp *s, char *out, size_t cap)
     snprintf(out, cap, "T+%us (clock not synced)", (unsigned)s->uptimeSec);
 }
 
+DiagStamp DiagTelemetry_RunStart(const DiagStamp *finish, uint32_t durationMs)
+{
+    DiagStamp st = {0, 0};
+    if (!finish)
+        return st;
+    const uint32_t d = (durationMs + 500u) / 1000u; /* nearest second: stamps are whole seconds */
+    st.uptimeSec = finish->uptimeSec >= d ? finish->uptimeSec - d : 0;
+    st.utc = finish->utc > 0 ? finish->utc - (int64_t)d : 0;
+    return st;
+}
+
+static bool StampLocal(const DiagStamp *s, TimeLocal *tl)
+{
+    return s && s->utc > 0 && TimeUtil_ToLocal(s->utc, tl);
+}
+
+void DiagTelemetry_FormatStampLocal(const DiagStamp *s, char *out, size_t cap)
+{
+    if (!out || !cap)
+        return;
+    if (!s) {
+        out[0] = 0;
+        return;
+    }
+    TimeLocal tl;
+    if (StampLocal(s, &tl))
+        snprintf(out, cap, "%04d-%02d-%02d %02d:%02d:%02d %s", tl.year, tl.month, tl.day, tl.hour, tl.minute, tl.second, tl.abbr);
+    else
+        snprintf(out, cap, "T+%us (clock not synced)", (unsigned)s->uptimeSec);
+}
+
+void DiagTelemetry_FormatRunHtml(const DiagStamp *finish, uint32_t durationMs, char *out, size_t cap)
+{
+    if (!out || !cap)
+        return;
+    if (!finish) {
+        out[0] = 0;
+        return;
+    }
+    const DiagStamp start = DiagTelemetry_RunStart(finish, durationMs);
+    const unsigned sec = (unsigned)(durationMs / 1000u), ms = (unsigned)(durationMs % 1000u);
+    TimeLocal a, b;
+    if (StampLocal(&start, &a) && StampLocal(finish, &b)) {
+        if (a.year == b.year && a.month == b.month && a.day == b.day && !strcmp(a.abbr, b.abbr))
+            snprintf(out, cap, "%04d-%02d-%02d %02d:%02d:%02d &rarr; %02d:%02d:%02d %s (%u.%03u s)", a.year, a.month, a.day,
+                     a.hour, a.minute, a.second, b.hour, b.minute, b.second, b.abbr, sec, ms);
+        else
+            snprintf(out, cap, "%04d-%02d-%02d %02d:%02d:%02d %s &rarr; %04d-%02d-%02d %02d:%02d:%02d %s (%u.%03u s)", a.year,
+                     a.month, a.day, a.hour, a.minute, a.second, a.abbr, b.year, b.month, b.day, b.hour, b.minute, b.second,
+                     b.abbr, sec, ms);
+    } else {
+        snprintf(out, cap, "T+%us &rarr; T+%us (clock not synced) (%u.%03u s)", (unsigned)start.uptimeSec,
+                 (unsigned)finish->uptimeSec, sec, ms);
+    }
+}
+
 /* ---- events ---- */
 
 bool DiagTelemetry_EventsEnabled(void) { return s_hooks.eventsOn ? s_hooks.eventsOn() : DefaultEventsOn(); }
@@ -251,6 +307,8 @@ void DiagTelemetry_OpDone(DiagOp op, DiagOpResult res, uint32_t durationMs, cons
         if (res == DT_RES_OK) {
             o->ok++;
             o->consecutiveFailures = 0;
+            o->haveOk = true;
+            o->lastOkWhen = st;
         } else {
             o->failures++;
             o->consecutiveFailures++;

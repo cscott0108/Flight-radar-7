@@ -138,6 +138,42 @@ static esp_err_t Row(httpd_req_t *req, const char *label, const char *value, con
         label, value, evidence);
 }
 
+/* Last-run timing of one recurring operation, shown in that operation's own section (0.0.31).
+ * Reads the existing DiagTelemetry record only: finish/worst stamps, durations, result; start is
+ * derived (finish - duration). "Last success" appears only while the latest run is a failure. */
+static esp_err_t OpTimingRows(httpd_req_t *req, DiagOp op, const char *lastLabel, bool withCounts)
+{
+    DiagOpStats o;
+    DiagTelemetry_GetOp(op, &o);
+    char buf[360]; /* room for an escaped failure reason (up to 6x its length) plus the fixed text */
+    if (withCounts) {
+        snprintf(buf, sizeof(buf), "%u / %u / %u", (unsigned)o.runs, (unsigned)o.failures, (unsigned)o.skipped);
+        if (Row(req, "Runs / failed / skipped (since boot)", buf, "Measured (DiagTelemetry; skipped = could not start)") != ESP_OK) return ESP_FAIL;
+    }
+    if (o.runs == 0)
+        return Row(req, lastLabel, "none since boot", "Measured (DiagTelemetry)");
+    DiagTelemetry_FormatRunHtml(&o.lastRun, o.lastMs, buf, sizeof(buf));
+    if (Row(req, lastLabel, buf, "Measured: finish stamped when the run ended; start = finish - duration (to the second)") != ESP_OK) return ESP_FAIL;
+    const bool failed = o.consecutiveFailures > 0;
+    if (failed) {
+        char esc[DT_REASON_MAX * 6];
+        WebUtil_EscapeHtml(esc, sizeof(esc), o.lastFailure);
+        snprintf(buf, sizeof(buf), "<b style='color:#c00'>FAILED</b> (%s), %u in a row", esc, (unsigned)o.consecutiveFailures);
+    } else {
+        snprintf(buf, sizeof(buf), "OK");
+    }
+    if (Row(req, "Result", buf, "Measured (result of the run above)") != ESP_OK) return ESP_FAIL;
+    if (failed) {
+        if (o.haveOk)
+            DiagTelemetry_FormatStampLocal(&o.lastOkWhen, buf, sizeof(buf));
+        else
+            snprintf(buf, sizeof(buf), "none since boot");
+        if (Row(req, "Last success", buf, "Measured (finish time of the most recent successful run)") != ESP_OK) return ESP_FAIL;
+    }
+    DiagTelemetry_FormatRunHtml(&o.worstWhen, o.worstMs, buf, sizeof(buf));
+    return Row(req, "Worst run", buf, "Measured (longest run since boot: start &rarr; finish, duration)");
+}
+
 /* Collapsible group (<details>). `open` = initially expanded. Deep links such as
  * /diag#tf still work: the script at the end of the page opens the group that
  * contains the target anchor. No extra RAM: the markup is streamed. */
@@ -505,6 +541,7 @@ static esp_err_t TfSection(httpd_req_t *req)
         snprintf(buf, sizeof(buf), "%d bytes", (int)in.stackFreeMinBytes);
         if (Row(req, "Init task stack, minimum free", buf, "Measured at the end of the last init, for the task that ran it (app_main has only 3584 B at boot)") != ESP_OK) return ESP_FAIL;
     }
+    if (OpTimingRows(req, DT_OP_TF_FLUSH, "Last History flush", true) != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u", (unsigned)tf.writes);
     if (Row(req, "Writes since boot (creates + updates)", buf, "Measured") != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u / %u", (unsigned)tf.creates, (unsigned)tf.updates);
@@ -674,7 +711,7 @@ static esp_err_t MinTimingSection(httpd_req_t *req)
         DiagMinHeap h;
         if (DiagTelemetry_GetHeap((DiagHeapKind)k, &h)) {
             snprintf(buf, sizeof(buf), "%u bytes", (unsigned)h.minFree);
-            DiagTelemetry_FormatStamp(&h.when, when, sizeof(when));
+            DiagTelemetry_FormatStampLocal(&h.when, when, sizeof(when));
         } else {
             snprintf(buf, sizeof(buf), "not sampled yet");
             when[0] = 0;
@@ -687,37 +724,58 @@ static esp_err_t MinTimingSection(httpd_req_t *req)
         char label[48];
         snprintf(label, sizeof(label), "Stack min-free: %s", st[i].name);
         snprintf(buf, sizeof(buf), "%u bytes", (unsigned)st[i].minFreeBytes);
-        DiagTelemetry_FormatStamp(&st[i].when, when, sizeof(when));
+        DiagTelemetry_FormatStampLocal(&st[i].when, when, sizeof(when));
         if (Row(req, label, buf, when) != ESP_OK) return ESP_FAIL;
     }
-    return Send(req, "</table><p class='ev'>Stack rows appear once that task has run a sampling pass. Times are seconds since boot, plus UTC once the clock has synced.</p>");
+    return Send(req, "</table><p class='ev'>Stack rows appear once that task has run a sampling pass. Times are in the configured time zone, or seconds since boot (T+) until the clock has synced.</p>");
 }
 
 // ---- Recurring operations (step 7) ----
 static esp_err_t OpsSection(httpd_req_t *req)
 {
     if (Send(req, "<h3 id='ops'>Recurring operations</h3><table><tr><th>Operation</th><th>Runs / failed / skipped</th>"
-                  "<th>Failing in a row</th><th>Last / worst</th><th>Last failure</th></tr>") != ESP_OK)
+                  "<th>Last run (start &rarr; finish)</th><th>Result</th><th>Worst run</th><th>Last failure</th></tr>") != ESP_OK)
         return ESP_FAIL;
     for (int i = 0; i < DT_OP_COUNT; i++) {
         DiagOpStats o;
         DiagTelemetry_GetOp((DiagOp)i, &o);
-        char when[80], last[160];
+        char when[80], last[160], run[200], worst[200], result[160];
         if (o.haveFailure) {
-            DiagTelemetry_FormatStamp(&o.lastFailureWhen, when, sizeof(when));
+            DiagTelemetry_FormatStampLocal(&o.lastFailureWhen, when, sizeof(when));
             snprintf(last, sizeof(last), "%s (%s)", o.lastFailure, when);
         } else {
             snprintf(last, sizeof(last), "none");
         }
-        if (SendFormat(req, "<tr><td>%s</td><td>%u / %u / %u</td><td>%s%u</td><td>%u ms / %u ms</td><td class='ev'>%s</td></tr>",
-                       DiagTelemetry_OpName((DiagOp)i), (unsigned)o.runs, (unsigned)o.failures, (unsigned)o.skipped,
-                       o.consecutiveFailures >= DT_ATTENTION_CONSECUTIVE ? "<b style='color:#c00'>ATTENTION </b>" : "",
-                       (unsigned)o.consecutiveFailures, (unsigned)o.lastMs, (unsigned)o.worstMs, last) != ESP_OK)
+        if (o.runs == 0) {
+            snprintf(run, sizeof(run), "none since boot");
+            snprintf(worst, sizeof(worst), "-");
+            snprintf(result, sizeof(result), "-");
+        } else {
+            DiagTelemetry_FormatRunHtml(&o.lastRun, o.lastMs, run, sizeof(run));
+            DiagTelemetry_FormatRunHtml(&o.worstWhen, o.worstMs, worst, sizeof(worst));
+            if (o.consecutiveFailures == 0) {
+                snprintf(result, sizeof(result), "OK");
+            } else {
+                if (o.haveOk)
+                    DiagTelemetry_FormatStampLocal(&o.lastOkWhen, when, sizeof(when));
+                else
+                    snprintf(when, sizeof(when), "none since boot");
+                snprintf(result, sizeof(result), "%sFAILED, %u in a row; last success %s",
+                         o.consecutiveFailures >= DT_ATTENTION_CONSECUTIVE ? "<b style='color:#c00'>ATTENTION</b> " : "",
+                         (unsigned)o.consecutiveFailures, when);
+            }
+        }
+        /* Two sends: each stays well inside SendFormat's 512-byte buffer even with both ends dated. */
+        if (SendFormat(req, "<tr><td>%s</td><td>%u / %u / %u</td><td>%s</td>", DiagTelemetry_OpName((DiagOp)i),
+                       (unsigned)o.runs, (unsigned)o.failures, (unsigned)o.skipped, run) != ESP_OK ||
+            SendFormat(req, "<td>%s</td><td>%s</td><td class='ev'>%s</td></tr>", result, worst, last) != ESP_OK)
             return ESP_FAIL;
     }
-    return Send(req, "</table><p class='ev'>Since boot. A skipped run is one that could not start (rate-limit backoff, TF unavailable); "
+    return Send(req, "</table><p class='ev'>Since boot, in the configured time zone. Finish is stamped when a run ends; start = finish - duration "
+                     "(to the second). A skipped run is one that could not start (rate-limit backoff, TF unavailable); "
                      "it is not a failure. History flush only counts passes that had entries to write. "
-                     "ATTENTION appears after 3 failures in a row and clears on the next success.</p>");
+                     "ATTENTION appears after 3 failures in a row and clears on the next success. "
+                     "The Seen and History flush rows are repeated in Storage / History next to their other metrics.</p>");
 }
 
 // Manual flush section (Storage group): saves pending Hot Seen changes and asks the poll task to write
@@ -1116,6 +1174,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
         return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u", (unsigned)ps.flushCount);
     if (Row(req, "Flushes since boot", buf, "Measured (counter in WriteBinaryLocked)") != ESP_OK) return ESP_FAIL;
+    if (OpTimingRows(req, DT_OP_SEEN_FLUSH, "Last flush", false) != ESP_OK) return ESP_FAIL;
     if (ps.flushCount == 0) {
         if (Row(req, "Last / worst duration", "no flush yet", "N/A") != ESP_OK) return ESP_FAIL;
     } else {
