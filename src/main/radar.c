@@ -4,6 +4,8 @@
 #include "airports.h"
 #include "visibility_policy.h"
 #include "auto_select.h"
+#include "north_ref.h"
+#include "ui_prefs.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -197,7 +199,7 @@ void Radar_PredictAircraft(void)
             speedKmh * dt / 3600.0f;
 
         float headingRad =
-            a->heading *
+            a->trackTrueDeg *
             0.0174532925f;
 
         float northKm =
@@ -341,6 +343,21 @@ static bool Radar_GeoOffsetKm(float lat, float lon, float centerLat, float cente
 /* HOSTTEST:END geo */
 
 /* HOSTTEST:BEGIN proj (extracted verbatim by host_tests/locations_test.c) */
+/* 0.0.32: the one display rotation. Geography is true; when the radar is
+ * magnetic-up (north_ref.h) the screen is rotated so a point at true bearing B
+ * appears at B - R (R = Radar_DisplayRotationDeg(), 0 when true-up). Every
+ * screen position and display bearing goes through here. */
+static void Radar_RotateToDisplay(float *eastKm, float *northKm)
+{
+    const float r = Radar_DisplayRotationDeg();
+    if (r == 0.0f)
+        return;
+    const float rad = r * 0.0174532925f, c = cosf(rad), s = sinf(rad);
+    const float e = *eastKm, n = *northKm;
+    *eastKm = e * c - n * s;
+    *northKm = n * c + e * s;
+}
+
 bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLon,
                            float radiusKm, int radiusPixels, int *x, int *y)
 {
@@ -350,6 +367,7 @@ bool Radar_ProjectPosition(float lat, float lon, float centerLat, float centerLo
     float eastKm, northKm;
     if (!Radar_GeoOffsetKm(lat, lon, centerLat, centerLon, &eastKm, &northKm))
         return false;
+    Radar_RotateToDisplay(&eastKm, &northKm);
 
     float distance =
         sqrtf(
@@ -382,6 +400,7 @@ bool Radar_GeoBearingAndDistance(float lat, float lon, float centerLat, float ce
     float eastKm, northKm;
     if (!Radar_GeoOffsetKm(lat, lon, centerLat, centerLon, &eastKm, &northKm))
         return false;
+    Radar_RotateToDisplay(&eastKm, &northKm); /* display bearing (off-screen indicator) */
 
     *distanceKmOut = sqrtf(eastKm * eastKm + northKm * northKm);
 
@@ -393,6 +412,18 @@ bool Radar_GeoBearingAndDistance(float lat, float lon, float centerLat, float ce
         bearing += 360.0f;
     *bearingDegOut = bearing;
     return true;
+}
+
+/* Radar accent color (0.0.32, Setup > Features & appearance; default the green
+ * this file always used). Rings, sweep, compass/range labels, call signs. */
+static lv_color_t Radar_AccentColor(void)
+{
+    return lv_color_hex(UiPrefs_RadarAccentRgb());
+}
+
+float Radar_DisplayRotationDeg(void)
+{
+    return NorthRef_DisplayRotationDeg();
 }
 
 // Draws a two-digit compass heading label (e.g. "36" for North, meaning
@@ -427,8 +458,7 @@ static void DrawCompassLabel(
     lv_draw_label_dsc_init(&label);
 
     label.color =
-        lv_palette_main(
-            LV_PALETTE_GREEN);
+        Radar_AccentColor();
 
     label.font = &lv_font_montserrat_12;
     label.align = LV_TEXT_ALIGN_CENTER;
@@ -446,6 +476,24 @@ static void DrawCompassLabel(
         &area,
         text,
         NULL);
+}
+
+/* 0.0.32: which north the ring's "36" points to, as RESOLVED (AUTO never shows
+ * as "A"): up-arrow + M (magnetic) or T (true). 0.1.1: drawn in the upper-left
+ * corner of the radar view (4 px inset from its square bounds, outside the
+ * outer ring), no longer beside "36". */
+static void DrawNorthRefIndicator(lv_draw_ctx_t *draw_ctx, int cx, int cy, int radius)
+{
+    lv_draw_label_dsc_t label;
+    lv_draw_label_dsc_init(&label);
+    label.color = Radar_AccentColor();
+    label.font = &lv_font_montserrat_12;
+    label.align = LV_TEXT_ALIGN_LEFT;
+    const int x1 = cx - radius + 4;
+    const int y1 = cy - radius + 4;
+    lv_area_t area = {.x1 = x1, .y1 = y1, .x2 = x1 + 32, .y2 = y1 + 14};
+    lv_draw_label(draw_ctx, &label, &area,
+                  NorthRef_Resolved() == NORTH_RESOLVED_MAGNETIC ? LV_SYMBOL_UP "M" : LV_SYMBOL_UP "T", NULL);
 }
 
 // Distance label for one range ring, placed a few pixels outside the
@@ -482,8 +530,7 @@ static void DrawRangeLabel(
     lv_draw_label_dsc_init(&label);
 
     label.color =
-        lv_palette_main(
-            LV_PALETTE_GREEN);
+        Radar_AccentColor();
 
     label.font = &lv_font_montserrat_12;
     label.align = LV_TEXT_ALIGN_CENTER;
@@ -763,8 +810,7 @@ static void radar_draw_cb(
         &arc);
 
     arc.color =
-        lv_palette_main(
-            LV_PALETTE_GREEN);
+        Radar_AccentColor();
 
     arc.width = 2;
 
@@ -800,6 +846,7 @@ static void radar_draw_cb(
     // N=36, E=09, S=18, W=27 (true bearing / 10, matching aviation
     // heading-tape notation).
     DrawCompassLabel(draw_ctx, cx, cy, radius, 0.0f, "36");
+    DrawNorthRefIndicator(draw_ctx, cx, cy, radius);
     DrawCompassLabel(draw_ctx, cx, cy, radius, 90.0f, "09");
     DrawCompassLabel(draw_ctx, cx, cy, radius, 180.0f, "18");
     DrawCompassLabel(draw_ctx, cx, cy, radius, 270.0f, "27");
@@ -827,8 +874,7 @@ static void radar_draw_cb(
         &line);
 
     line.color =
-        lv_palette_main(
-            LV_PALETTE_GREEN);
+        Radar_AccentColor();
 
     line.width = 2;
 
@@ -861,8 +907,7 @@ static void radar_draw_cb(
             &d);
 
         d.color =
-            lv_palette_main(
-                LV_PALETTE_GREEN);
+            Radar_AccentColor();
 
         d.width = 1;
 
@@ -934,6 +979,10 @@ static void radar_draw_cb(
     // below aircraft icons. Built-in airports (regionally selected for the
     // current center/range, see Airports_SelectBuiltins) are drawn first so
     // user-defined locations always sit on top of them.
+    /* 0.0.32: runway axes in display degrees (designator = magnetic -> true -> display). */
+    float declDeg = 0.0f;
+    (void)NorthRef_Declination(&declDeg);
+    const float rotDeg = Radar_DisplayRotationDeg();
     size_t builtinCount = Airports_SelectBuiltins(radarCenterLat, radarCenterLon, radarRadiusKm);
     for (size_t i = 0; i < builtinCount; i++)
     {
@@ -947,7 +996,9 @@ static void radar_draw_cb(
                                    radarCenterLat, radarCenterLon,
                                    radarRadiusKm, radius, &px, &py))
             continue;
-        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport, view.hasAxis ? &view.axisDeg : NULL);
+        float axis;
+        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport,
+                          Airport_DisplayAxisDeg(&airport, &view, declDeg, rotDeg, &axis) ? &axis : NULL);
     }
 
     size_t airportCount = Airports_Count();
@@ -960,7 +1011,9 @@ static void radar_draw_cb(
                                    radarCenterLat, radarCenterLon,
                                    radarRadiusKm, radius, &px, &py))
             continue;
-        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport, NULL);
+        float axis;
+        DrawAirportMarker(draw_ctx, cx + px, cy + py, &airport,
+                          Airport_DisplayAxisDeg(&airport, NULL, declDeg, rotDeg, &axis) ? &axis : NULL);
     }
 
     // Airport aircraft "Count only": per-airport on-ground counts from the
@@ -1017,7 +1070,7 @@ static void radar_draw_cb(
             draw_ctx,
             cx + px,
             cy + py,
-            a->heading,
+            NorthRef_TrueToDisplay(a->trackTrueDeg), /* raw true track, drawn in the display reference */
             &look,
             i == selectedAircraft);
 
@@ -1028,8 +1081,7 @@ static void radar_draw_cb(
             lv_draw_label_dsc_init(&label);
 
             label.color =
-                lv_palette_main(
-                    LV_PALETTE_GREEN);
+                Radar_AccentColor();
 
             label.font =
                 &lv_font_montserrat_14;

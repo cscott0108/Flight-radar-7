@@ -93,6 +93,14 @@ void ProviderMerge_Fill(Aircraft *newer, const Aircraft *older)
         newer->verticalRateFpm = older->verticalRateFpm;
         newer->dataFlags |= AIRCRAFT_DATA_VRATE;
     }
+    if (!(newer->dataFlags & AIRCRAFT_DATA_MAG_HDG) && (older->dataFlags & AIRCRAFT_DATA_MAG_HDG)) {
+        newer->magHeadingDeci = older->magHeadingDeci;
+        newer->dataFlags |= AIRCRAFT_DATA_MAG_HDG;
+    }
+    if (!(newer->dataFlags & AIRCRAFT_DATA_TRUE_HDG) && (older->dataFlags & AIRCRAFT_DATA_TRUE_HDG)) {
+        newer->trueHeadingDeci = older->trueHeadingDeci;
+        newer->dataFlags |= AIRCRAFT_DATA_TRUE_HDG;
+    }
 }
 
 static int FindIcao(const Aircraft *list, int count, const char *icao24)

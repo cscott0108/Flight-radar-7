@@ -13,6 +13,8 @@
 #include "main.h"
 #include "opensky_client.h"
 #include "radar.h"
+#include "north_ref.h"
+#include "nvs.h" /* ESP_ERR_NVS_* names in the save-error message */
 #include "visibility_policy.h"
 
 static esp_err_t Send(httpd_req_t *req, const char *value)
@@ -211,8 +213,8 @@ static esp_err_t SendOverrideActions(httpd_req_t *req, const char *icao)
     char dLat[24], dLon[24], oLat[24] = "", oLon[24] = "", dRot[8] = "", oRot[8] = "";
     FormatCoordinate(def.latitude, dLat);
     FormatCoordinate(def.longitude, dLon);
-    if (isfinite(dbAxis))
-        snprintf(dRot, sizeof(dRot), "%ld", lroundf(dbAxis));
+    if (isfinite(dbAxis)) /* 0.0.32: shown as the TRUE axis the database designator gives (designator + variation) */
+        snprintf(dRot, sizeof(dRot), "%ld", (long)lroundf(fmodf(NorthRef_DesignatorToTrue(dbAxis), 180.0f)) % 180);
     if (has && (o.fields & AIRPORT_OVR_LAT))
         FormatCoordinate((float)o.latE5 / 1e5f, oLat);
     if (has && (o.fields & AIRPORT_OVR_LON))
@@ -253,8 +255,9 @@ static esp_err_t SendOverrideEditor(httpd_req_t *req)
         "<small>blank = database default</small></label>"
         "<label>Longitude <input name='olon' type='number' step='any' min='-180' max='180'> "
         "<small>blank = database default</small></label>"
-        "<label>Rotation <input name='orot' type='number' step='1' min='0' max='359'> degrees "
-        "<small>runway axis; blank = database default. 142 and 322 are the same axis. "
+        "<label>Rotation <input name='orot' type='number' step='1' min='0' max='359'> degrees true "
+        "<small>runway axis in TRUE (geographic) degrees; blank = database default (the runway number, a magnetic heading, "
+        "corrected by the local magnetic variation). 142 and 322 are the same axis. "
         "Setting it shows the airport with the Directional marker.</small></label>"
         "<label><input type='checkbox' name='ocolset' value='1'> Override display color "
         "<input name='ocolor' type='color' value='#FF0000'> "
@@ -429,13 +432,17 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "<circle cx='200' cy='200' r='127' fill='none' stroke='#00B849' opacity='.7'/>"
         "<circle cx='200' cy='200' r='63' fill='none' stroke='#00B849' opacity='.7'/>"
         "<path d='M200 10V390M10 200H390' stroke='#00B849' opacity='.35'/>"
-        "<text x='195' y='25' fill='#00E060'>N</text><text x='373' y='194' fill='#00E060'>E</text>"
+        "<text x='195' y='25' fill='#00E060'>N</text><text id='nref' x='208' y='25' fill='#00E060' font-size='11'></text><text x='373' y='194' fill='#00E060'>E</text>"
         "<text x='195' y='385' fill='#00E060'>S</text><text x='15' y='194' fill='#00E060'>W</text>") != ESP_OK)
         return ESP_FAIL;
 
     /* Location markers precede aircraft polygons so aircraft cover them;
      * built-in airports first so user-defined locations sit on top, as on the radar.
      * builtinShowing counts the active built-ins actually drawn (same test as radar.c). */
+    /* 0.0.32: same display reference as the radar (north_ref.h) */
+    float declDeg = 0.0f;
+    (void)NorthRef_Declination(&declDeg);
+    const float rotDeg = Radar_DisplayRotationDeg();
     size_t builtinShowing = 0;
     unsigned hiddenByOverride = 0, movedOutside = 0, notDrawnOther = 0;
     for (size_t i = 0; i < builtinCount; i++) {
@@ -457,7 +464,9 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             continue;
         }
         builtinShowing++;
-        if (SendAirportMarker(req, &marker, 200 + x, 200 + y, view.hasAxis ? &view.axisDeg : NULL) != ESP_OK)
+        float axis;
+        if (SendAirportMarker(req, &marker, 200 + x, 200 + y,
+                              Airport_DisplayAxisDeg(&marker, &view, declDeg, rotDeg, &axis) ? &axis : NULL) != ESP_OK)
             return ESP_FAIL;
     }
     size_t airportCount = userCount;
@@ -468,7 +477,9 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             !Radar_ProjectPosition(marker.latitude, marker.longitude,
                                    centerLat, centerLon, radiusKm, 190, &x, &y))
             continue;
-        if (SendAirportMarker(req, &marker, 200 + x, 200 + y, NULL) != ESP_OK)
+        float axis;
+        if (SendAirportMarker(req, &marker, 200 + x, 200 + y,
+                              Airport_DisplayAxisDeg(&marker, NULL, declDeg, rotDeg, &axis) ? &axis : NULL) != ESP_OK)
             return ESP_FAIL;
     }
     int count = gAircraftCount;
@@ -489,8 +500,8 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         CraftAppearance appearance = CraftType_Appearance(resolved.type, resolved.aircraftType);
         char fill[8];
         snprintf(fill, sizeof(fill), "#%06X", (unsigned)(appearance.colorRgb & 0xFFFFFFu));
-        const bool haveHeading = isfinite(a.heading);
-        const float h = haveHeading ? a.heading * 0.0174532925f : 0.0f;
+        const bool haveHeading = isfinite(a.trackTrueDeg);
+        const float h = haveHeading ? NorthRef_TrueToDisplay(a.trackTrueDeg) * 0.0174532925f : 0.0f;
         esp_err_t err;
         if (resolved.aircraftType == AIRCRAFT_HELICOPTER) {
             /* Same solid-circle-with-ring the radar draws, scaled to this
@@ -677,6 +688,8 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         Send(req, latText) != ESP_OK || Send(req, ",centerLon=") != ESP_OK ||
         Send(req, lonText) != ESP_OK || Send(req, ",rangeKm=") != ESP_OK ||
         Send(req, rangeText) != ESP_OK ||
+        SendFormat(req, ",rotDeg=%ld/1000;document.getElementById('nref').textContent='\u2191%c';",
+                   (long)lroundf(rotDeg * 1000.0f), NorthRef_Resolved() == NORTH_RESOLVED_MAGNETIC ? 'M' : 'T') != ESP_OK ||
         Send(req,
         ";const f=document.getElementById('airportForm');"
         "const latInput=document.getElementById('latitude'),lonInput=document.getElementById('longitude');"
@@ -686,7 +699,8 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "const indexInput=document.getElementById('index');"
         "function preview(){let lat=Number(latInput.value),lon=Number(lonInput.value);"
         "if(!latInput.value||!lonInput.value){dot.setAttribute('visibility','hidden');return;}"
-        "let east=(lon-centerLon)*111*Math.cos(centerLat*Math.PI/180),north=(lat-centerLat)*111;"
+        "let e0=(lon-centerLon)*111*Math.cos(centerLat*Math.PI/180),n0=(lat-centerLat)*111;"
+        "const rr=rotDeg*Math.PI/180;let east=e0*Math.cos(rr)-n0*Math.sin(rr),north=n0*Math.cos(rr)+e0*Math.sin(rr);"
         "let x=200+east/rangeKm*190,y=200-north/rangeKm*190;"
         "if(!Number.isFinite(x)||!Number.isFinite(y)||Math.hypot(x-200,y-200)>190){"
         "dot.setAttribute('visibility','hidden');return;}"
@@ -695,8 +709,9 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "map.addEventListener('click',function(e){let p=map.createSVGPoint();p.x=e.clientX;p.y=e.clientY;"
         "p=p.matrixTransform(map.getScreenCTM().inverse());"
         "let dx=p.x-200,dy=p.y-200;if(Math.hypot(dx,dy)>190)return;"
-        "latInput.value=(centerLat-dy/190*rangeKm/111).toFixed(6);"
-        "lonInput.value=(centerLon+dx/190*rangeKm/(111*Math.cos(centerLat*Math.PI/180))).toFixed(6);"
+        "const rr=rotDeg*Math.PI/180,de=dx,dn=-dy,te=de*Math.cos(rr)+dn*Math.sin(rr),tn=dn*Math.cos(rr)-de*Math.sin(rr);"
+        "latInput.value=(centerLat+tn/190*rangeKm/111).toFixed(6);"
+        "lonInput.value=(centerLon+te/190*rangeKm/(111*Math.cos(centerLat*Math.PI/180))).toFixed(6);"
         "preview();});"
         "function newAirport(){f.reset();indexInput.value='-1';sizeInput.value='12';colorInput.value='#FF0000';"
         "modeInput.value='0';runwayInput.value='';"
@@ -792,6 +807,25 @@ static bool ParseHtmlColor(const char *text, uint32_t *out)
     return true;
 }
 
+/* The real reason a location save/remove failed (0.0.32; previously one
+ * "storage error or 100-location limit" message covered every case). */
+static esp_err_t SendSaveError(httpd_req_t *req, const char *what)
+{
+    const esp_err_t e = Airports_LastError();
+    char msg[160];
+    if (e == ESP_ERR_INVALID_STATE)
+        snprintf(msg, sizeof(msg), "Could not %s location: the %d-location limit is reached", what, MAX_AIRPORTS);
+    else if (e == ESP_ERR_INVALID_ARG)
+        snprintf(msg, sizeof(msg), "Could not %s location: the location details are invalid", what);
+    else if (e == ESP_ERR_NOT_FOUND)
+        snprintf(msg, sizeof(msg), "Could not %s location: it no longer exists (reload the page)", what);
+    else if (e == ESP_ERR_NVS_NOT_ENOUGH_SPACE)
+        snprintf(msg, sizeof(msg), "Could not %s location: settings storage (NVS) is full (%s); see /diag Flash / filesystem", what, esp_err_to_name(e));
+    else
+        snprintf(msg, sizeof(msg), "Could not %s location: storage error %s", what, esp_err_to_name(e));
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, msg);
+}
+
 static esp_err_t SaveAirport(httpd_req_t *req)
 {
     char body[256], indexText[12], name[64], latText[32], lonText[32], sizeText[12], colorText[16];
@@ -830,9 +864,12 @@ static esp_err_t SaveAirport(httpd_req_t *req)
     if (marker.name[0] == '\0' || marker.latitude < -90 || marker.latitude > 90 ||
         marker.longitude < -180 || marker.longitude > 180)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid location position or name");
+    for (const char *c = marker.name; *c; c++)
+        if ((unsigned char)*c < 32 || (unsigned char)*c > 126)
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "Invalid location name: use plain ASCII letters, digits and punctuation (no accents or symbols)");
     if (!Airports_Save((int)index, &marker))
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "Could not save location (storage error or 100-location limit)");
+        return SendSaveError(req, "save");
     Radar_RequestRedraw(); /* show it even while the zero-traffic radar is frozen */
     return Redirect(req);
 }
@@ -846,8 +883,7 @@ static esp_err_t DeleteAirport(httpd_req_t *req)
         !ParseLong(indexText, &index) || index < 0 || index >= MAX_AIRPORTS)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid location selection");
     if (!Airports_Delete((size_t)index))
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "Could not remove location");
+        return SendSaveError(req, "remove");
     Radar_RequestRedraw();
     return Redirect(req);
 }

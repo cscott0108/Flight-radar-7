@@ -1,10 +1,24 @@
 #include "web_style.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "feature_flags.h"
 #include "tf_history.h"
+#include "north_ref.h"
+#include "time_util.h"
+#include "ui_prefs.h"
+
+#include <stdlib.h>
+#include <time.h>
+
+static void (*s_appearanceHook)(void);
+
+void WebStyle_SetAppearanceChangedHook(void (*hook)(void))
+{
+    s_appearanceHook = hook;
+}
 
 /* Shared stylesheet. Colors are variables on :root (light, the original look)
  * and are redefined under html.dk. Sent with httpd_resp_send_chunk, so '%' is
@@ -50,7 +64,8 @@ static const char kCss[] =
     ".ok,#banner{background:var(--okb);border:1px solid var(--okbd)}"
     ".wn{background:var(--wb);border:1px solid var(--wbd)}"
     ".er,#dmsg,#smsg{color:var(--er)}.er{background:var(--erb);border:1px solid var(--er)}"
-    "#dmsg,#smsg{min-height:1.2em}[hidden]{display:none!important}";
+    "#dmsg,#smsg{min-height:1.2em}[hidden]{display:none!important}"
+    "nav.nv small.nt{margin-left:auto;align-self:center;color:var(--mut);white-space:nowrap}";
 
 static const struct {
     WebPageId id;
@@ -104,6 +119,15 @@ esp_err_t WebStyle_SendHead(httpd_req_t *req, const char *title, WebPageId page,
         return ESP_FAIL;
     if (extraCss && extraCss[0] && httpd_resp_send_chunk(req, extraCss, HTTPD_RESP_USE_STRLEN) != ESP_OK)
         return ESP_FAIL;
+    /* 0.0.32: WebUI accent color (its own setting, independent of the radar's).
+     * Only emitted when it differs from the stylesheet default, so the default
+     * page is byte-identical to earlier firmware. */
+    const uint32_t acc = UiPrefs_WebAccentRgb();
+    if (acc != UI_ACCENT_DEFAULT_RGB) {
+        n = snprintf(buf, sizeof(buf), ":root,html.dk{--acc:#%06X}", (unsigned)(acc & 0xFFFFFFu));
+        if (n <= 0 || n >= (int)sizeof(buf) || httpd_resp_send_chunk(req, buf, n) != ESP_OK)
+            return ESP_FAIL;
+    }
 
     n = snprintf(buf, sizeof(buf), "</style></head><body><nav class='nv'>");
     for (size_t i = 0; i < sizeof(kNav) / sizeof(kNav[0]) && n > 0 && n < (int)sizeof(buf); i++) {
@@ -120,8 +144,30 @@ esp_err_t WebStyle_SendHead(httpd_req_t *req, const char *title, WebPageId page,
     }
     if (n <= 0 || n >= (int)sizeof(buf) - 8)
         return ESP_FAIL;
-    n += snprintf(buf + n, sizeof(buf) - n, "</nav>");
+    /* 0.0.32: the device's local time when this page was generated (server-side,
+     * configured zone/DST; no browser timer - reload for a new value). */
+    char now[40];
+    WebStyle_FormatNowShort(now, sizeof(now));
+    const int w = snprintf(buf + n, sizeof(buf) - n, "<small class='nt' title='Device time when this page loaded'>%s</small></nav>", now);
+    if (w <= 0 || w >= (int)sizeof(buf) - n)
+        return ESP_FAIL;
+    n += w;
     return httpd_resp_send_chunk(req, buf, n);
+}
+
+void WebStyle_FormatNowShort(char *out, size_t cap)
+{
+    if (!out || !cap)
+        return;
+    TimeLocal tl;
+    if (!TimeUtil_ToLocal((int64_t)time(NULL), &tl)) {
+        snprintf(out, cap, "time not synced");
+        return;
+    }
+    char hm[16];
+    UiClockFormat fmt = UiPrefs_ClockFormat();
+    UiPrefs_FormatClock(fmt == UI_CLOCK_24H ? UI_CLOCK_24H : UI_CLOCK_12H, tl.hour, tl.minute, hm, sizeof(hm));
+    snprintf(out, cap, "%s %s", hm, tl.abbr);
 }
 
 const char *WebStyle_HtmlAttr(void)
@@ -131,7 +177,7 @@ const char *WebStyle_HtmlAttr(void)
 
 esp_err_t WebStyle_SendFeatureControls(httpd_req_t *req)
 {
-    char buf[1100];
+    char buf[1600];
     int n = snprintf(buf, sizeof(buf),
         "<h3 id='features'>Features &amp; appearance</h3>"
         "<form method='POST' action='/features'><fieldset><legend>Optional subsystems</legend>"
@@ -154,9 +200,37 @@ esp_err_t WebStyle_SendFeatureControls(httpd_req_t *req)
         "<label><input type='checkbox' name='p_trend' value='1'%s> Altitude trend arrow "
         "(climbing / descending, from the provider's reported climb rate)</label>"
         "<label><input type='checkbox' name='p_speed' value='1'%s> Speed row</label>"
-        "<small>Display only: aircraft tracking, filtering and classification are not affected.</small></fieldset>"
-        "<button type='submit'>Save features</button></form>",
+        "<small>Display only: aircraft tracking, filtering and classification are not affected.</small></fieldset>",
         Features_PanelAltTrend() ? " checked" : "", Features_PanelSpeed() ? " checked" : "");
+    if (n <= 0 || n >= (int)sizeof(buf) || httpd_resp_send_chunk(req, buf, n) != ESP_OK)
+        return ESP_FAIL;
+    /* 0.0.32: north reference, accent colors, device clock. */
+    const NorthRefMode mode = NorthRef_GetMode();
+    const UiClockFormat cf = UiPrefs_ClockFormat();
+    NorthRefStatus st;
+    NorthRef_GetStatus(&st);
+    char resolved[96];
+    if (st.varValid)
+        snprintf(resolved, sizeof(resolved), "now %s; magnetic variation %.1f&deg; %s", st.resolved == NORTH_RESOLVED_MAGNETIC ? "MAGNETIC" : "TRUE",
+                 (double)fabsf(st.declDeg), st.declDeg >= 0.0f ? "E" : "W");
+    else
+        snprintf(resolved, sizeof(resolved), "now TRUE; no magnetic variation available");
+    n = snprintf(buf, sizeof(buf),
+        "<fieldset><legend>Radar reference, colors and clock</legend><input type='hidden' name='d_form' value='1'>"
+        "<label>Radar north <select name='northref'>"
+        "<option value='0'%s>AUTO (magnetic when available)</option><option value='1'%s>MAGNETIC</option>"
+        "<option value='2'%s>TRUE (geographic)</option></select></label> <small>%s. Runway numbers are magnetic; "
+        "aircraft tracks are true. The radar rotates so both agree (see README).</small>"
+        "<label>Radar accent color <input type='color' name='acc_radar' value='#%06X'></label>"
+        "<label>WebUI accent color <input type='color' name='acc_web' value='#%06X'></label>"
+        "<small>Independent of each other; default #4CAF50 (green).</small>"
+        "<label>Device clock <select name='clockfmt'><option value='0'%s>Off</option>"
+        "<option value='1'%s>12-hour</option><option value='2'%s>24-hour</option></select></label>"
+        "</fieldset><button type='submit'>Save features</button></form>",
+        mode == NORTH_REF_AUTO ? " selected" : "", mode == NORTH_REF_MAGNETIC ? " selected" : "",
+        mode == NORTH_REF_TRUE ? " selected" : "", resolved,
+        (unsigned)(UiPrefs_RadarAccentRgb() & 0xFFFFFFu), (unsigned)(UiPrefs_WebAccentRgb() & 0xFFFFFFu),
+        cf == UI_CLOCK_OFF ? " selected" : "", cf == UI_CLOCK_12H ? " selected" : "", cf == UI_CLOCK_24H ? " selected" : "");
     if (n <= 0 || n >= (int)sizeof(buf))
         return ESP_FAIL;
     return httpd_resp_send_chunk(req, buf, n);
@@ -176,9 +250,38 @@ static bool HasKey(const char *body, const char *name)
     return false;
 }
 
+/* Value of "<name>=" in an urlencoded body (only %XX and '+' decoding needed for
+ * these fields: numbers and "#RRGGBB" colors). */
+static bool FormValue(const char *body, const char *name, char *out, size_t cap)
+{
+    const size_t len = strlen(name);
+    for (const char *p = body; p && *p;) {
+        if (!strncmp(p, name, len) && p[len] == '=') {
+            const char *v = p + len + 1;
+            size_t o = 0;
+            while (*v && *v != '&' && o + 1 < cap) {
+                if (v[0] == '%' && v[1] && v[2]) {
+                    char hex[3] = {v[1], v[2], 0};
+                    out[o++] = (char)strtol(hex, NULL, 16);
+                    v += 3;
+                } else {
+                    out[o++] = (*v == '+') ? ' ' : *v;
+                    v++;
+                }
+            }
+            out[o] = 0;
+            return true;
+        }
+        p = strchr(p, '&');
+        if (p)
+            p++;
+    }
+    return false;
+}
+
 static esp_err_t FeaturesPost(httpd_req_t *req)
 {
-    char body[160];
+    char body[384];
     size_t total = req->content_len;
     if (total == 0 || total >= sizeof(body))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
@@ -200,6 +303,21 @@ static esp_err_t FeaturesPost(httpd_req_t *req)
     if (HasKey(body, "p_form")) {
         ok = Features_Set(FEATURE_PANEL_ALT_TREND, HasKey(body, "p_trend")) && ok;
         ok = Features_Set(FEATURE_PANEL_SPEED, HasKey(body, "p_speed")) && ok;
+    }
+    /* 0.0.32 display settings; an older form without them leaves them unchanged. */
+    if (HasKey(body, "d_form")) {
+        char v[16];
+        uint32_t rgb;
+        if (FormValue(body, "northref", v, sizeof(v)))
+            ok = NorthRef_SetMode((NorthRefMode)atoi(v)) && ok;
+        if (FormValue(body, "acc_radar", v, sizeof(v)))
+            ok = UiPrefs_ParseColor(v, &rgb) && UiPrefs_SetRadarAccentRgb(rgb) && ok;
+        if (FormValue(body, "acc_web", v, sizeof(v)))
+            ok = UiPrefs_ParseColor(v, &rgb) && UiPrefs_SetWebAccentRgb(rgb) && ok;
+        if (FormValue(body, "clockfmt", v, sizeof(v)))
+            ok = UiPrefs_SetClockFormat((UiClockFormat)atoi(v)) && ok;
+        if (s_appearanceHook)
+            s_appearanceHook(); /* radar redraw (rotation / accent) even while frozen */
     }
     if (!ok)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save settings");

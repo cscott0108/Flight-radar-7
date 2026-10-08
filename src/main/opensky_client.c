@@ -357,7 +357,7 @@ bool OpenSky_ParseAircraft(
         }
 
         if (cJSON_IsNumber(hdg))
-            a->heading = hdg->valuedouble;
+            a->trackTrueDeg = hdg->valuedouble;
 
         if (cJSON_IsNumber(alt))
             a->altitude = alt->valuedouble;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "esp_err.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -65,6 +67,13 @@ size_t Airports_Count(void);
 bool Airports_Get(size_t index, AirportMarker *out);
 bool Airports_Save(int index, const AirportMarker *marker); /* -1 appends */
 bool Airports_Delete(size_t index);
+/* Why the last Save/Delete returned false (0.0.32): ESP_ERR_INVALID_ARG = invalid
+ * location, ESP_ERR_INVALID_STATE = 100-location limit, ESP_ERR_NOT_FOUND = no
+ * such entry, ESP_ERR_NO_MEM = scratch buffer, otherwise the NVS error
+ * (e.g. ESP_ERR_NVS_NOT_ENOUGH_SPACE). ESP_OK after a success. */
+esp_err_t Airports_LastError(void);
+/* Bytes the stored location blob takes for the current count (header + used markers). */
+size_t Airports_StoredBlobBytes(void);
 
 /* ---- built-in airports: regional selection ----
  *
@@ -192,6 +201,20 @@ void Airport_HeliportSegments(int diameter, int seg[3][4]);
  * otherwise malformed. Callers MUST treat a false return as "no known
  * orientation" and fall back to the plain dot - never draw a guessed axis. */
 bool Airport_ParseRunwayAxis(const char *runwayText, float *axisDegOut);
+
+/* 0.0.32: the runway axis to DRAW, in display degrees (0 = screen up). One
+ * rule for the radar and the /airports preview:
+ *   - a 1-degree rotation override (view->overrideFields & AIRPORT_OVR_ROTATION)
+ *     is an exact TRUE axis;
+ *   - otherwise the axis comes from the runway designator (built-in database
+ *     axis / user "Primary runway"), which is MAGNETIC: true = axis + declDeg;
+ *   - display = true - rotationDeg (rotationDeg = declination when the radar is
+ *     magnetic-up, 0 when true-up).
+ * declDeg = 0 when no declination is known (designator then drawn as before).
+ * view = NULL for user-defined locations. False when the marker is not drawn
+ * Directional (no usable axis). Pure function. */
+bool Airport_DisplayAxisDeg(const AirportMarker *marker, const AirportBuiltinView *view, float declDeg,
+                            float rotationDeg, float *displayAxisOut);
 
 /* Given a physical axis bearing (0=N/vertical, 90=E/horizontal, compass
  * convention, same as Radar_ProjectPosition/DrawAircraft's heading math) and

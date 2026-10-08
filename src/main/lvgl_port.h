@@ -154,6 +154,28 @@ void lvgl_port_unlock(void);
  */
 bool lvgl_port_notify_rgb_vsync(void);
 
+/**
+ * @brief 0.1.2: runtime 180-degree screen rotation.
+ *
+ * Normal keeps the original zero-copy direct-mode path. Rotated allocates a 768,000 B PSRAM render
+ * buffer plus a 292 B dirty-area record in one block (freed again when returning to Normal) and copies each frame's dirty areas, rotated by
+ * 180 degrees, into the RGB frame buffers. Takes the LVGL lock (up to LVGL_PORT_ROT180_LOCK_MS);
+ * the whole screen is redrawn on the next LVGL refresh.
+ *
+ * @return
+ *      - ESP_OK: now in the requested orientation (also when it already was)
+ *      - ESP_ERR_NO_MEM: rotation buffer allocation failed; still Normal, nothing changed
+ *      - ESP_ERR_TIMEOUT: LVGL lock not obtained; nothing changed
+ *      - ESP_ERR_NOT_SUPPORTED / ESP_ERR_INVALID_STATE: display not set up for it; nothing changed
+ */
+#define LVGL_PORT_ROT180_LOCK_MS (2000)
+esp_err_t lvgl_port_set_rotation_180(bool rotated);
+
+/**
+ * @brief true while the 180-degree rotated display path is active.
+ */
+bool lvgl_port_rotation_180(void);
+
 #ifdef __cplusplus
 }
 #endif

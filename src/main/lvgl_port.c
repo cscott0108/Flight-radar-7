@@ -12,6 +12,8 @@
 #include "esp_lcd_touch.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include <string.h>
 #include "lvgl.h"
 #include "lvgl_port.h"
 
@@ -267,8 +269,208 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
 
 #else
 
+/* HOSTTEST:BEGIN rot180 */
+/* ---- 0.1.2: runtime 180-degree screen rotation (Setup -> Display -> Screen orientation) ----
+ * Normal: unchanged. LVGL direct mode renders straight into the two RGB frame buffers and
+ * flush_callback() below only switches which one the panel scans out (zero copy).
+ * Rotated 180: Espressif's direct-mode rotation scheme (the EXAMPLE_LVGL_PORT_ROTATION_DEGREE != 0
+ * branch above, which is compile-time only) selected at runtime. LVGL renders, unrotated and
+ * single-buffered, into a 768,000 B PSRAM buffer that exists only while rotated; each frame's dirty
+ * areas are copied, rotated by exactly 180 degrees (pixel (x,y) -> (W-1-x, H-1-y)), into the RGB
+ * frame buffer that is shown next and then into the other one. LVGL/application coordinates never
+ * change. The RGB panel, its frame buffers, DMA and bounce buffers are not touched. Switching happens
+ * under the LVGL lock, between refreshes, followed by a full-screen redraw. */
+#define ROT180_W  (LVGL_PORT_H_RES)
+#define ROT180_H  (LVGL_PORT_V_RES)
+#define ROT180_PX ((size_t)ROT180_W * ROT180_H)
+
+typedef struct {
+    uint16_t inv_p;
+    uint8_t inv_area_joined[LV_INV_BUF_SIZE];
+    lv_area_t inv_areas[LV_INV_BUF_SIZE];
+} rot180_dirty_t;
+#define ROT180_ALLOC_BYTES (ROT180_PX * sizeof(lv_color_t) + sizeof(rot180_dirty_t))
+
+static volatile bool s_rot180;          /* true while the rotated path is active */
+static lv_color_t *s_rot180Buf;         /* LVGL render buffer, allocated only while rotated */
+static void *s_rot180Fb[2];             /* the two RGB frame buffers (LVGL's buf1/buf2 in Normal) */
+static void *s_rot180Shown;             /* RGB frame buffer currently scanned out while rotated */
+static bool s_rot180PrevFull;           /* previous rotated flush was full screen (Espressif probe) */
+static rot180_dirty_t *s_rot180Dirty;   /* dirty-area copy; lives in the rotation allocation (no .bss in Normal) */
+
+/* Exact 180-degree copy of the area (x1..x2, y1..y2, inclusive) of a w x h image. */
+IRAM_ATTR static void rot180_copy_area(const uint16_t *from, uint16_t *to, int x1, int y1, int x2, int y2, int w, int h)
+{
+    for (int y = y1; y <= y2; y++) {
+        const uint16_t *s = from + (size_t)y * w + x1;
+        uint16_t *d = to + (size_t)(h - 1 - y) * w + (w - 1 - x1);
+        for (int x = x1; x <= x2; x++) {
+            *d-- = *s++;
+        }
+    }
+}
+
+/* Espressif's get_next_frame_buffer(): toggles and returns the RGB frame buffer to use. After every
+ * rotated frame the toggle state equals the buffer being shown. */
+static void *rot180_toggle_fb(void)
+{
+    s_rot180Shown = (s_rot180Shown == s_rot180Fb[0]) ? s_rot180Fb[1] : s_rot180Fb[0];
+    return s_rot180Shown;
+}
+
+static void rot180_dirty_save(rot180_dirty_t *d)
+{
+    lv_disp_t *disp = _lv_refr_get_disp_refreshing();
+    d->inv_p = disp->inv_p;
+    for (int i = 0; i < disp->inv_p; i++) {
+        d->inv_area_joined[i] = disp->inv_area_joined[i];
+        d->inv_areas[i] = disp->inv_areas[i];
+    }
+}
+
+static void rot180_dirty_copy(void *dst, const void *src, const rot180_dirty_t *d)
+{
+    for (int i = 0; i < d->inv_p; i++) {
+        if (d->inv_area_joined[i] == 0) {
+            rot180_copy_area(src, dst, d->inv_areas[i].x1, d->inv_areas[i].y1, d->inv_areas[i].x2,
+                             d->inv_areas[i].y2, ROT180_W, ROT180_H);
+        }
+    }
+}
+
+typedef enum { ROT180_PART_COPY, ROT180_SKIP_COPY, ROT180_FULL_COPY } rot180_probe_t;
+
+/* Espressif's flush_copy_probe(). */
+static rot180_probe_t rot180_copy_probe(lv_disp_drv_t *drv)
+{
+    lv_disp_t *disp_refr = _lv_refr_get_disp_refreshing();
+    uint32_t flush_ver = 0, flush_hor = 0;
+    for (int i = 0; i < disp_refr->inv_p; i++) {
+        if (disp_refr->inv_area_joined[i] == 0) {
+            flush_ver = (disp_refr->inv_areas[i].y2 + 1 - disp_refr->inv_areas[i].y1);
+            flush_hor = (disp_refr->inv_areas[i].x2 + 1 - disp_refr->inv_areas[i].x1);
+            break;
+        }
+    }
+    const bool curFull = (flush_ver == (uint32_t)drv->ver_res) && (flush_hor == (uint32_t)drv->hor_res);
+    rot180_probe_t r;
+    if (s_rot180PrevFull) {
+        r = curFull ? ROT180_SKIP_COPY : ROT180_FULL_COPY;
+    } else {
+        r = ROT180_PART_COPY;
+    }
+    s_rot180PrevFull = curFull;
+    return r;
+}
+
+/* Espressif's rotated direct-mode flush_callback(), with the rotation fixed at 180. */
+static void rot180_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+{
+    esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
+    lv_disp_t *disp = lv_disp_get_default();
+
+    if (lv_disp_flush_is_last(drv)) {
+        if (drv->full_refresh) {
+            drv->full_refresh = 0;
+            void *next_fb = rot180_toggle_fb();
+            rot180_copy_area((const uint16_t *)color_map, next_fb, area->x1, area->y1, area->x2, area->y2,
+                             ROT180_W, ROT180_H);
+            esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, next_fb);
+            ulTaskNotifyValueClear(NULL, ULONG_MAX);
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            rot180_dirty_copy(rot180_toggle_fb(), color_map, s_rot180Dirty);
+            rot180_toggle_fb();
+        } else {
+            const rot180_probe_t probe = rot180_copy_probe(drv);
+            if (probe == ROT180_FULL_COPY) {
+                rot180_dirty_save(s_rot180Dirty);
+                drv->full_refresh = 1;
+                disp->rendering_in_progress = false;
+                lv_disp_flush_ready(drv);
+                lv_refr_now(_lv_refr_get_disp_refreshing()); /* re-enters this function with full_refresh set */
+            } else {
+                void *next_fb = rot180_toggle_fb();
+                rot180_dirty_save(s_rot180Dirty);
+                rot180_dirty_copy(next_fb, color_map, s_rot180Dirty);
+                esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, next_fb);
+                ulTaskNotifyValueClear(NULL, ULONG_MAX);
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                if (probe == ROT180_PART_COPY) {
+                    rot180_dirty_save(s_rot180Dirty);
+                    rot180_dirty_copy(rot180_toggle_fb(), color_map, s_rot180Dirty);
+                    rot180_toggle_fb();
+                }
+            }
+        }
+    }
+    lv_disp_flush_ready(drv);
+}
+
+bool lvgl_port_rotation_180(void)
+{
+    return s_rot180;
+}
+
+esp_err_t lvgl_port_set_rotation_180(bool rotated)
+{
+    if (!lvgl_port_lock(LVGL_PORT_ROT180_LOCK_MS)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp == NULL || disp->driver == NULL || disp->driver->draw_buf == NULL) {
+        err = ESP_ERR_INVALID_STATE;
+    } else if (rotated != s_rot180) {
+        lv_disp_drv_t *drv = disp->driver;
+        lv_disp_draw_buf_t *db = drv->draw_buf;
+        if (rotated) {
+            /* one PSRAM allocation: the 768,000 B render buffer + the small dirty-area record */
+            lv_color_t *buf = heap_caps_malloc(ROT180_ALLOC_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (buf == NULL) {
+                err = ESP_ERR_NO_MEM; /* nothing changed: Normal path untouched */
+            } else {
+                s_rot180Fb[0] = db->buf1;
+                s_rot180Fb[1] = db->buf2;
+                /* direct mode swaps buf_act after each frame, so the shown buffer is the other one */
+                s_rot180Shown = (db->buf_act == db->buf1) ? db->buf2 : db->buf1;
+                s_rot180PrevFull = false;
+                s_rot180Dirty = (rot180_dirty_t *)(void *)(buf + ROT180_PX);
+                memset(s_rot180Dirty, 0, sizeof(*s_rot180Dirty));
+                s_rot180Buf = buf;
+                db->buf1 = buf;
+                db->buf2 = NULL;
+                db->buf_act = buf;
+                s_rot180 = true;
+            }
+        } else {
+            db->buf1 = s_rot180Fb[0];
+            db->buf2 = s_rot180Fb[1];
+            /* LVGL renders into the buffer that is not shown, exactly as in Normal operation */
+            db->buf_act = (s_rot180Shown == s_rot180Fb[0]) ? s_rot180Fb[1] : s_rot180Fb[0];
+            s_rot180 = false;
+            heap_caps_free(s_rot180Buf);
+            s_rot180Buf = NULL;
+            s_rot180Dirty = NULL;
+        }
+        if (err == ESP_OK) {
+            /* drop stale direct-mode sync areas and pending areas, then redraw the whole screen */
+            drv->full_refresh = 0;
+            _lv_ll_clear(&disp->sync_areas);
+            _lv_inv_area(disp, NULL);
+            lv_area_t all = {0, 0, (lv_coord_t)(lv_disp_get_hor_res(disp) - 1), (lv_coord_t)(lv_disp_get_ver_res(disp) - 1)};
+            _lv_inv_area(disp, &all);
+        }
+    }
+    lvgl_port_unlock();
+    return err;
+}
+
 static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
+    if (s_rot180) { /* 0.1.2: runtime 180-degree rotation (see above); Normal continues unchanged below */
+        rot180_flush(drv, area, color_map);
+        return;
+    }
     esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data; // Get the panel handle from driver user data
     const int offsetx1 = area->x1; // Start X coordinate of the area to flush
     const int offsetx2 = area->x2; // End X coordinate of the area to flush
@@ -287,6 +489,7 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
 
     lv_disp_flush_ready(drv); // Mark the display flush as complete
 }
+/* HOSTTEST:END rot180 */
 #endif /* EXAMPLE_LVGL_PORT_ROTATION_DEGREE */
 
 #elif LVGL_PORT_FULL_REFRESH && LVGL_PORT_LCD_RGB_BUFFER_NUMS == 2
@@ -366,6 +569,20 @@ void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color
 
 #endif /* LVGL_PORT_AVOID_TEAR_ENABLE */
 
+#if !(LVGL_PORT_AVOID_TEAR_ENABLE && LVGL_PORT_DIRECT_MODE && EXAMPLE_LVGL_PORT_ROTATION_DEGREE == 0)
+/* 0.1.2: runtime 180-degree rotation is implemented only for the configuration this project builds
+ * (avoid-tear mode 3 = direct mode, compile-time rotation 0). */
+bool lvgl_port_rotation_180(void)
+{
+    return false;
+}
+
+esp_err_t lvgl_port_set_rotation_180(bool rotated)
+{
+    return rotated ? ESP_ERR_NOT_SUPPORTED : ESP_OK;
+}
+#endif
+
 static lv_disp_t *display_init(esp_lcd_panel_handle_t panel_handle)
 {
     assert(panel_handle); // Ensure the panel handle is valid
@@ -441,6 +658,10 @@ static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     /* Read data from touch controller */
     bool touchpad_pressed = esp_lcd_touch_get_coordinates(tp, &touchpad_x, &touchpad_y, NULL, &touchpad_cnt, 1); // Get touch coordinates
     if (touchpad_pressed && touchpad_cnt > 0) {
+        if (lvgl_port_rotation_180()) { /* 0.1.2: glass is upside down relative to LVGL coordinates */
+            touchpad_x = (uint16_t)(LVGL_PORT_H_RES - 1 - touchpad_x);
+            touchpad_y = (uint16_t)(LVGL_PORT_V_RES - 1 - touchpad_y);
+        }
         data->point.x = touchpad_x; // Set the X coordinate
         data->point.y = touchpad_y; // Set the Y coordinate
         data->state = LV_INDEV_STATE_PRESSED; // Set state to pressed

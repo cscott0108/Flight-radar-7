@@ -32,6 +32,8 @@
 #include "seen_aircraft.h"
 #include "reboot_flush.h"
 #include "time_util.h"
+#include "ui_prefs.h"
+#include "lvgl_port.h"
 #include <time.h>
 
 static const char *TAG = "WEBSERVER";
@@ -612,6 +614,72 @@ static esp_err_t BrightnessHandler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* HOSTTEST:BEGIN screenrot (extracted by host_tests/screen_rot_test.c) */
+/* 0.1.2: Setup -> Display -> Screen orientation. Switches the display first (the 768,000 B
+ * rotation buffer is allocated only for Rotated 180) and saves "screenrot" only after that
+ * succeeded; if saving fails the display is switched back. Returns the HTTP status to send
+ * (200 = applied and saved) and a message (HTML-safe ASCII) for the page. */
+static int ApplyScreenOrientation(bool rotated, char *msg, size_t cap)
+{
+    const bool was = lvgl_port_rotation_180();
+    const size_t psramBefore = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const esp_err_t err = lvgl_port_set_rotation_180(rotated);
+    if (err != ESP_OK)
+    {
+        snprintf(msg, cap,
+                 "Screen orientation was not changed (%s%s). The screen stays %s and the setting was not saved.",
+                 esp_err_to_name(err),
+                 err == ESP_ERR_NO_MEM ? ": not enough free PSRAM for the 768 KB rotation buffer" : "",
+                 was ? "rotated 180 degrees" : "normal");
+        return 500;
+    }
+    if (!UiPrefs_SetScreenRot180(rotated))
+    {
+        const esp_err_t back = lvgl_port_set_rotation_180(was);
+        snprintf(msg, cap,
+                 "Screen orientation could not be saved (NVS write failed). %s",
+                 back == ESP_OK ? (was ? "The screen was returned to rotated 180 degrees."
+                                       : "The screen was returned to normal.")
+                                : "The screen could not be switched back; it stays as shown until the next restart.");
+        return 500;
+    }
+    const size_t psramAfter = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI("SCREENROT", "%s -> %s: PSRAM free %u -> %u, internal free %u, DMA free %u",
+             was ? "rotated" : "normal", rotated ? "rotated" : "normal",
+             (unsigned)psramBefore, (unsigned)psramAfter,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    snprintf(msg, cap,
+             "Screen orientation: %s. Applied now and saved. PSRAM free: %u &rarr; %u bytes.",
+             rotated ? "Rotated 180&deg;" : "Normal", (unsigned)psramBefore, (unsigned)psramAfter);
+    return 200;
+}
+/* HOSTTEST:END screenrot */
+
+// POST /display (Setup -> Display -> Screen orientation form).
+static esp_err_t DisplayHandler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > 64)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form");
+
+    char body[65];
+    int received = httpd_req_recv(req, body, req->content_len);
+    if (received <= 0)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Receive failed");
+    body[received] = '\0';
+
+    char value[8];
+    if (!FormValue(body, "screenrot", value, sizeof(value)) || (strcmp(value, "0") != 0 && strcmp(value, "1") != 0))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Screen orientation must be 0 (Normal) or 1 (Rotated 180)");
+
+    char msg[256];
+    if (ApplyScreenOrientation(value[0] == '1', msg, sizeof(msg)) != 200)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, msg);
+
+    SendRedirectPage(req, msg, 5);
+    return ESP_OK;
+}
+
 static bool SaveCredentials(
     const char *clientId,
     const char *clientSecret)
@@ -1052,6 +1120,14 @@ static esp_err_t RootHandler(
         "},150);"
         "}"
         "</script>"
+        "<form method='POST' action='/display'>"
+        "<label>Screen orientation <select name='screenrot'>"
+        "<option value='0'%s>Normal</option><option value='1'%s>Rotated 180&deg;</option></select></label>"
+        "<small>Turns the whole device screen upside down, for a panel mounted the other way up. Applies "
+        "immediately without a restart and is kept across power cycles. Rotated uses about 768 KB of extra "
+        "PSRAM while it is active.</small>"
+        "<button type='submit'>Apply orientation</button>"
+        "</form>"
         "<h2>OpenSky Credentials</h2>"
         "<p>Status: %s. Select credentials.json</p>"
         "<form method='POST' "
@@ -1198,6 +1274,8 @@ static esp_err_t RootHandler(
             (SeenAircraft_GetEvictionPolicy() == SEEN_EVICT_REGISTERED_PREFERRED) ? " selected" : "",
             (unsigned long)GetRadarBrightness(),
             (unsigned long)GetRadarBrightness(),
+            lvgl_port_rotation_180() ? "" : " selected",
+            lvgl_port_rotation_180() ? " selected" : "",
             OpenSky_HasCredentials() ? "Configured (the secret is never shown)" : "Not configured");
 
         if (lengthB > 0 && lengthB < 8192 &&
@@ -1246,6 +1324,7 @@ esp_err_t StartWebServer(void)
     // Wi-Fi profiles replaced the single POST /wifi with GET+POST /wifi (web_wifi.c): net +1.
     // 0.0.25: POST /airports/override (web_airports.c): +1.
     // 0.0.26: POST /airports/visibility (web_airports.c): +1 (34 of 36).
+    // 0.1.2: POST /display (screen orientation): +1 (35 of 36).
     config.max_uri_handlers = 36;
 
     if (httpd_start(
@@ -1299,6 +1378,13 @@ esp_err_t StartWebServer(void)
             .handler = BrightnessHandler,
             .user_ctx = NULL};
 
+    httpd_uri_t display_uri =
+        {
+            .uri = "/display",
+            .method = HTTP_POST,
+            .handler = DisplayHandler,
+            .user_ctx = NULL};
+
     // These 6 core routes previously weren't checked for registration
     // failure at all - a silent way for exactly this class of bug (the
     // handler-table capacity issue above) to hide. Aggregated the same
@@ -1310,6 +1396,7 @@ esp_err_t StartWebServer(void)
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &radar_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &delete_credentials_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &brightness_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(server_handle, &display_uri);
 
     if (err != ESP_OK)
     {

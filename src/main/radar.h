@@ -35,6 +35,9 @@ void Radar_SetIdleDimActive(bool active);
 bool Radar_IsDisplayIdle(void);
 /* Ask for one radar frame even while frozen (safe from any task). */
 void Radar_RequestRedraw(void);
+/* 0.0.32: display rotation R in degrees (north_ref.h): display bearing =
+ * true bearing - R; 0 when the radar is true-up. Used by the projection. */
+float Radar_DisplayRotationDeg(void);
 
 void Radar_PredictAircraft(void);
 extern bool showAircraftLabels;

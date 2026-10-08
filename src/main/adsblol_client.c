@@ -363,7 +363,22 @@ bool AdsbLol_ParseAircraft(const char *json)
         }
 
         if (track && cJSON_IsNumber(track))
-            a->heading = (float)track->valuedouble;
+            a->trackTrueDeg = (float)track->valuedouble; /* readsb "track": true track over the ground */
+
+        /* 0.0.32: raw heading fields, kept exactly as reported (magnetic stays
+         * magnetic, true stays true; neither is derived from the other here). */
+        {
+            cJSON *magHdg = cJSON_GetObjectItem(entry, "mag_heading");
+            cJSON *trueHdg = cJSON_GetObjectItem(entry, "true_heading");
+            if (cJSON_IsNumber(magHdg) && magHdg->valuedouble >= 0.0 && magHdg->valuedouble <= 360.0) {
+                a->magHeadingDeci = (int16_t)lround(magHdg->valuedouble * 10.0);
+                a->dataFlags |= AIRCRAFT_DATA_MAG_HDG;
+            }
+            if (cJSON_IsNumber(trueHdg) && trueHdg->valuedouble >= 0.0 && trueHdg->valuedouble <= 360.0) {
+                a->trueHeadingDeci = (int16_t)lround(trueHdg->valuedouble * 10.0);
+                a->dataFlags |= AIRCRAFT_DATA_TRUE_HDG;
+            }
+        }
 
         /* Owner/operator: "ownOp" is emitted by readsb-based ADSBExchange-v2
          * services when their aircraft database has an owner for the hex. It

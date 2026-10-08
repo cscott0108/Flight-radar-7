@@ -84,6 +84,8 @@ idf_component_register(
         "adv_diag.c"
         "boot_warmup.c"
         "expert_debug.c"
+        "north_ref.c"
+        "ui_prefs.c"
         ${SRC_UI}
     INCLUDE_DIRS 
         "."

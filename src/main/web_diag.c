@@ -17,6 +17,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_spiffs.h"
+#include "nvs.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -36,6 +37,8 @@
 #include "reboot_flush.h"
 #include "tf_history.h"
 #include "time_util.h"
+#include "north_ref.h"
+#include "ui_prefs.h"
 #include "universal_value.h"
 #include "web_util.h"
 
@@ -730,6 +733,74 @@ static esp_err_t MinTimingSection(httpd_req_t *req)
     return Send(req, "</table><p class='ev'>Stack rows appear once that task has run a sampling pass. Times are in the configured time zone, or seconds since boot (T+) until the clock has synced.</p>");
 }
 
+/* 0.0.32: the device's local time when this snapshot was generated. */
+static esp_err_t LocalTimeRow(httpd_req_t *req)
+{
+    DiagStamp now = {(uint32_t)(esp_timer_get_time() / 1000000), 0};
+    const int64_t t = (int64_t)time(NULL);
+    now.utc = TimeUtil_IsSynced(t) ? t : 0;
+    char text[64];
+    DiagTelemetry_FormatStampLocal(&now, text, sizeof(text));
+    return Row(req, "Local time (this snapshot)", text,
+               "Measured (system clock via time_util: configured zone and DST; reload for a new value)");
+}
+
+/* 0.0.32: radar north reference and magnetic variation (north_ref.c). */
+static esp_err_t NorthRefSection(httpd_req_t *req)
+{
+    NorthRefStatus st;
+    NorthRef_GetStatus(&st);
+    char buf[288], when[80];
+    if (Send(req, "<h3 id='northref'>Heading reference</h3><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
+        return ESP_FAIL;
+    if (Row(req, "Selected mode", NorthRefMode_Name(st.mode), "Setting (NVS radar/northref; Setup &gt; Features &amp; appearance; default AUTO)") != ESP_OK)
+        return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%s%s", st.resolved == NORTH_RESOLVED_MAGNETIC ? "MAGNETIC" : "TRUE",
+             st.fallback ? " (FALLBACK)" : "");
+    if (Row(req, "Resolved reference (radar up)", buf, "Derived (AUTO = magnetic when WMM is valid and reliable)") != ESP_OK)
+        return ESP_FAIL;
+    if (st.fallback && Row(req, "Fallback reason", st.fallbackReason ? st.fallbackReason : "-", "Derived") != ESP_OK)
+        return ESP_FAIL;
+    if (st.varValid) {
+        snprintf(buf, sizeof(buf), "%.2f&deg; %s (H %.0f nT%s)", (double)fabsf(st.declDeg), st.declDeg >= 0 ? "E" : "W",
+                 (double)st.horizNt, st.blackout ? ", BLACKOUT zone" : st.caution ? ", caution zone" : "");
+    } else {
+        snprintf(buf, sizeof(buf), "unavailable");
+    }
+    if (Row(req, "Magnetic variation", buf, "WMM2025 (NOAA/BGS, computed on the device; true = magnetic + variation)") != ESP_OK)
+        return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%.4f, %.4f%s", (double)st.lat, (double)st.lon, st.varValid ? "" : " (no value)");
+    if (Row(req, "Location used", buf, "The radar centre the value was computed for (recomputed when the centre moves &gt; 0.01&deg;)") != ESP_OK)
+        return ESP_FAIL;
+    if (st.varValid) {
+        DiagStamp c = {0, st.computedUtc};
+        if (st.computedUtc > 0)
+            DiagTelemetry_FormatStampLocal(&c, when, sizeof(when));
+        snprintf(buf, sizeof(buf), "model date %.2f; %s%s%s", (double)st.decYear,
+                 st.dateEstimated ? "estimated date (clock not synced yet)" : st.computedUtc > 0 ? "computed " : "",
+                 st.computedUtc > 0 ? when : "", st.stale ? " - STALE, refresh in the next zero-aircraft maintenance window" : "");
+        if (Row(req, "Value date", buf, "Recomputed yearly (stale after 365 days), on location change and after first clock sync if estimated") != ESP_OK)
+            return ESP_FAIL;
+    }
+    snprintf(buf, sizeof(buf), "%s%s", st.cacheState ? st.cacheState : "-", st.fromCache ? " (value in use came from the cache)" : "");
+    if (Row(req, "Cache (" NORTHREF_CACHE_PATH ")", buf, "SPIFFS file: location, value, date, CRC") != ESP_OK)
+        return ESP_FAIL;
+    if (st.lastAttemptUptimeSec || st.lastAttemptUtc) {
+        DiagStamp a = {st.lastAttemptUptimeSec, st.lastAttemptUtc};
+        DiagTelemetry_FormatStampLocal(&a, when, sizeof(when));
+        snprintf(buf, sizeof(buf), "%s: %s (%s; %u since boot)", st.lastAttemptOk ? "OK" : "FAILED",
+                 st.lastResult ? st.lastResult : "-", when, (unsigned)st.computeCount);
+    } else {
+        snprintf(buf, sizeof(buf), "none this boot (%s)", st.lastResult ? st.lastResult : "-");
+    }
+    if (Row(req, "Last computation", buf, "Measured (local WMM evaluation, no network)") != ESP_OK)
+        return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "radar #%06X, WebUI #%06X", (unsigned)UiPrefs_RadarAccentRgb(), (unsigned)UiPrefs_WebAccentRgb());
+    if (Row(req, "Accent colors", buf, "Settings (NVS radar/acc_radar, acc_web; independent)") != ESP_OK)
+        return ESP_FAIL;
+    return Send(req, "</table>");
+}
+
 // ---- Recurring operations (step 7) ----
 static esp_err_t OpsSection(httpd_req_t *req)
 {
@@ -933,6 +1004,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     if (Send(req, "<h3>Identity</h3><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK ||
         Row(req, "Firmware Build", fwEsc, "Compiled in from src/VERSION at build time (always shown, not an Advanced Diagnostic)") != ESP_OK ||
         Row(req, "Uptime", uptimeText, "Measured (esp_timer_get_time)") != ESP_OK ||
+        LocalTimeRow(req) != ESP_OK ||
         SendFormat(req, "<tr><td>Radar center</td><td>%.4f, %.4f</td><td class='ev'>Measured (current setting)</td></tr>",
                    GetRadarLat(), GetRadarLon()) != ESP_OK)
         return ESP_FAIL;
@@ -1109,6 +1181,23 @@ static esp_err_t DiagPage(httpd_req_t *req)
     } else if (Row(req, "SPIFFS used / total", "unavailable", "Unknown without runtime measurement (esp_spiffs_info failed - not mounted?)") != ESP_OK) {
         return ESP_FAIL;
     }
+    /* NVS (settings) partition usage (0.0.32): NVS writes a changed blob's new copy
+     * before erasing the old one, so a blob save needs at least its own size free. */
+    {
+        nvs_stats_t ns;
+        if (nvs_get_stats(NULL, &ns) == ESP_OK && ns.total_entries > 0) {
+            snprintf(buf, sizeof(buf), "%u used / %u free / %u total entries (%u%% used, 32 B each)",
+                     (unsigned)ns.used_entries, (unsigned)ns.free_entries, (unsigned)ns.total_entries,
+                     (unsigned)((ns.used_entries * 100u) / ns.total_entries));
+            if (Row(req, "NVS (settings) entries", buf, "Measured (nvs_get_stats, default nvs partition; includes Wi-Fi/PHY data)") != ESP_OK)
+                return ESP_FAIL;
+        } else if (Row(req, "NVS (settings) entries", "unavailable", "nvs_get_stats failed") != ESP_OK) {
+            return ESP_FAIL;
+        }
+        snprintf(buf, sizeof(buf), "%u bytes (%u location(s))", (unsigned)Airports_StoredBlobBytes(), (unsigned)Airports_Count());
+        if (Row(req, "Saved locations blob", buf, "Calculated (4-byte header + 52 B per used location; NVS needs this much free to save a change)") != ESP_OK)
+            return ESP_FAIL;
+    }
     if (Send(req, "</table>") != ESP_OK)
         return ESP_FAIL;
 
@@ -1129,7 +1218,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     if (Row(req, "gAircraft[] static allocation", buf, "Calculated (MAX_AIRCRAFT * sizeof(Aircraft))") != ESP_OK) return ESP_FAIL;
     if (Send(req, "</table>") != ESP_OK)
         return ESP_FAIL;
-    if (OpsSection(req) != ESP_OK)
+    if (OpsSection(req) != ESP_OK || NorthRefSection(req) != ESP_OK)
         return ESP_FAIL;
 
     if (GroupClose(req) != ESP_OK)

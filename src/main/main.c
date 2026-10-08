@@ -45,6 +45,10 @@
 #include "expert_debug.h"
 #include "fr_lv_pool.h"
 #include "idle_maint.h"
+#include "north_ref.h" // 0.0.32: radar north reference / magnetic variation
+#include "ui_prefs.h"  // 0.0.32: accent colors, device clock format
+#include "web_style.h"
+#include "fw_version.h"
 #include "esp_timer.h"
 
 // Build-time A/B switch: flip to 0 and reflash to test whether TF/SD mount
@@ -171,6 +175,11 @@ bool wifiConnectedState = false;
 static uint32_t lastApiUpdateMs = 0;
 static lv_obj_t *rateLimitUiLabel = NULL;
 static lv_obj_t *idleStatusLabel = NULL; // zero-aircraft status, a child of the radar image
+/* 0.0.32 bottom status bar: the device clock (centre) and a small version / uptime
+ * line left of the settings gear. Both updated from RadarPredictTick, text set
+ * only when the shown minute changes. */
+static lv_obj_t *clockUiLabel = NULL;
+static lv_obj_t *buildUiLabel = NULL;
 // Idle-maintenance phase for the display (IdleMaintPhase), written by RadarTask only, read by the UI.
 static volatile uint8_t idleMaintPhase = IDLE_MAINT_PHASE_NONE;
 
@@ -454,11 +463,17 @@ void UpdateSelectedAircraftUI(void)
         uic_LabelCraftAlt,
         buf);
 
-    snprintf(
-        buf,
-        sizeof(buf),
-        "%.0f°",
-        a->heading);
+    /* 0.0.32: the track in the radar's resolved reference (T = true, M = magnetic,
+     * derived from the raw true track; the provider value is not changed). */
+    if (!isfinite(a->trackTrueDeg))
+        snprintf(buf, sizeof(buf), "---");
+    else
+        snprintf(
+            buf,
+            sizeof(buf),
+            "%d°%c",
+            (int)lroundf(NorthRef_TrueToDisplay(a->trackTrueDeg)) % 360,
+            NorthRef_Resolved() == NORTH_RESOLVED_MAGNETIC ? 'M' : 'T');
 
     lv_label_set_text(
         uic_LabelCraftHeading,
@@ -535,6 +550,59 @@ static void CreateSelectedInfoRow(void)
     lv_obj_add_flag(selInfoCard, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* 0.0.32: device clock (system time, configured zone/DST via time_util, format
+ * from Setup) and the version / uptime line. Callers hold the LVGL lock. */
+static void UpdateStatusBarUI(void)
+{
+    static char shownClock[24] = "?";
+    static uint32_t shownUpMin = UINT32_MAX;
+    if (clockUiLabel) {
+        char text[24] = "";
+        const UiClockFormat fmt = UiPrefs_ClockFormat();
+        TimeLocal tl;
+        if (fmt != UI_CLOCK_OFF) {
+            if (TimeUtil_ToLocal((int64_t)time(NULL), &tl))
+                UiPrefs_FormatClock(fmt, tl.hour, tl.minute, text, sizeof(text));
+            else
+                snprintf(text, sizeof(text), "--:--");
+        }
+        if (strcmp(text, shownClock) != 0) {
+            snprintf(shownClock, sizeof(shownClock), "%s", text);
+            lv_label_set_text(clockUiLabel, text);
+            if (text[0])
+                lv_obj_clear_flag(clockUiLabel, LV_OBJ_FLAG_HIDDEN);
+            else
+                lv_obj_add_flag(clockUiLabel, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (buildUiLabel) {
+        const uint32_t upMin = (uint32_t)(esp_timer_get_time() / 60000000LL);
+        if (upMin != shownUpMin) {
+            shownUpMin = upMin;
+            if (upMin < 60)
+                lv_label_set_text_fmt(buildUiLabel, "v" FW_VERSION_STRING "\nup %lum", (unsigned long)upMin);
+            else if (upMin < 48 * 60)
+                lv_label_set_text_fmt(buildUiLabel, "v" FW_VERSION_STRING "\nup %luh %02lum",
+                                      (unsigned long)(upMin / 60), (unsigned long)(upMin % 60));
+            else
+                lv_label_set_text_fmt(buildUiLabel, "v" FW_VERSION_STRING "\nup %lud %luh",
+                                      (unsigned long)(upMin / 1440), (unsigned long)((upMin / 60) % 24));
+        }
+    }
+}
+
+/* 0.0.32: Setup display settings saved (rotation / accent changed): redraw the
+ * radar once even while it is frozen, and restyle the idle label. */
+static void OnAppearanceChanged(void)
+{
+    if (lvgl_port_lock(-1)) {
+        if (idleStatusLabel)
+            lv_obj_set_style_text_color(idleStatusLabel, lv_color_hex(UiPrefs_RadarAccentRgb()), LV_PART_MAIN);
+        lvgl_port_unlock();
+    }
+    Radar_RequestRedraw();
+}
+
 /* HOSTTEST:BEGIN idleui (extracted verbatim by host_tests/display_idle_test.c) */
 // Callers hold the LVGL lock. Static on-radar status for zero-aircraft periods (no timer, no animation):
 // the text/colour/visibility are touched only when the selected status changes, so a static radar stays
@@ -559,7 +627,7 @@ static void UpdateIdleStatusUI(void)
         lv_label_set_text_static(idleStatusLabel, IdleStatus_Text(s));
         // Warnings in amber (non-alarming), everything else in the radar's own green.
         lv_obj_set_style_text_color(idleStatusLabel,
-                                    s == IDLE_STATUS_MAINT_WARN ? lv_color_hex(0xFFB000) : lv_palette_main(LV_PALETTE_GREEN),
+                                    s == IDLE_STATUS_MAINT_WARN ? lv_color_hex(0xFFB000) : lv_color_hex(UiPrefs_RadarAccentRgb()),
                                     LV_PART_MAIN);
         if (shown == IDLE_STATUS_NONE)
             lv_obj_clear_flag(idleStatusLabel, LV_OBJ_FLAG_HIDDEN);
@@ -1484,6 +1552,11 @@ void SetRadarSettings(
         radarLon,
         radarRangeKm);
 
+    // 0.0.32: the old location's magnetic variation stops applying at once;
+    // the new one is computed locally (or reused from the cache) before the
+    // radar redraws with the new centre.
+    NorthRef_OnLocationChanged(radarLat, radarLon);
+
     Radar_SetCenter(
         radarLat,
         radarLon,
@@ -2263,6 +2336,9 @@ static void OnSuccessfulPoll(AircraftProviderType provider)
     {
         IdleMaint_Drain(&idleMaint, TF_HISTORY_ENABLED != 0, esp_timer_get_time());
         idleMaintPhase = (uint8_t)IdleMaint_Phase(&idleMaint);
+        // 0.0.32: the same zero-aircraft window refreshes a stale (>1 year)
+        // magnetic variation. Local WMM computation, no network request.
+        NorthRef_Service(true);
     }
 }
 
@@ -2367,6 +2443,10 @@ static void radar_update_timer_cb(void *pvParameters)
         HistoryManager_FlushIfDue((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000);
 #endif
 
+        // 0.0.32: flag tests only, except once after the clock first syncs when
+        // the magnetic variation was computed with an estimated date.
+        NorthRef_Service(false);
+
         // Completes a pending idle-maintenance attempt from its real History
         // result (served just above). Only a flag test when nothing is pending.
         if (idleMaint.resultPending && IdleMaint_PollResult(&idleMaint, esp_timer_get_time()))
@@ -2443,6 +2523,7 @@ static void RadarPredictTick(void)
                 }
             }
             UpdateIdleStatusUI(); // compare-only unless the status changed
+            UpdateStatusBarUI();  // 0.0.32: clock + version/uptime, text only when the minute changes
 
             if (!displayIdle)
             {
@@ -2538,6 +2619,17 @@ void app_main()
     // the defaults (all features ON, light theme). Must precede CustomRules_Init
     // consumers, the radar task and the web server.
     Features_Init();
+    UiPrefs_Init(); // 0.0.32: accent colors + clock format (NVS "radar"), before any UI is drawn
+    if (UiPrefs_ScreenRot180()) // 0.1.2: saved Rotated 180; applied before ui_init() so the first real UI is rotated
+    {
+        const esp_err_t rotErr = lvgl_port_set_rotation_180(true);
+        if (rotErr == ESP_OK)
+            ESP_LOGI("SCREENROT", "Screen orientation: rotated 180 (saved setting); PSRAM free %u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        else
+            ESP_LOGE("SCREENROT", "Saved Rotated 180 could not be applied (%s); staying Normal", esp_err_to_name(rotErr));
+    }
+    WebStyle_SetAppearanceChangedHook(OnAppearanceChanged);
 
     if (!CustomRules_Init())
         ESP_LOGW("CRAFT_RULES", "Could not load one or more saved craft lists; built-in classification remains active");
@@ -2611,13 +2703,31 @@ void app_main()
         lv_obj_align(idleStatusLabel, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(idleStatusLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
         lv_obj_set_style_text_font(idleStatusLabel, &lv_font_montserrat_14, LV_PART_MAIN);
-        lv_obj_set_style_text_color(idleStatusLabel, lv_palette_main(LV_PALETTE_GREEN), LV_PART_MAIN);
+        lv_obj_set_style_text_color(idleStatusLabel, lv_color_hex(UiPrefs_RadarAccentRgb()), LV_PART_MAIN);
         lv_obj_set_style_bg_color(idleStatusLabel, lv_color_hex(0x000000), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(idleStatusLabel, LV_OPA_80, LV_PART_MAIN);
         lv_obj_set_style_pad_all(idleStatusLabel, 8, LV_PART_MAIN);
         lv_obj_set_style_radius(idleStatusLabel, 6, LV_PART_MAIN);
         lv_obj_clear_flag(idleStatusLabel, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(idleStatusLabel, LV_OBJ_FLAG_HIDDEN);
+
+        // 0.0.32: bottom-bar clock (true centre) + version/uptime (left of the gear).
+        // The SSID is capped so a long network name can never run under the clock.
+        lv_obj_set_style_max_width(uic_LabelWifiName, 90, LV_PART_MAIN);
+        lv_label_set_long_mode(uic_LabelWifiName, LV_LABEL_LONG_DOT);
+        clockUiLabel = lv_label_create(uic_PanelBottom);
+        lv_obj_align(clockUiLabel, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_font(clockUiLabel, &lv_font_montserrat_26, LV_PART_MAIN);
+        lv_obj_set_style_text_color(clockUiLabel, lv_color_white(), LV_PART_MAIN);
+        lv_label_set_text_static(clockUiLabel, "");
+        lv_obj_clear_flag(clockUiLabel, LV_OBJ_FLAG_CLICKABLE);
+        buildUiLabel = lv_label_create(uic_PanelBottom);
+        lv_obj_align(buildUiLabel, LV_ALIGN_RIGHT_MID, -55, 0);
+        lv_obj_set_style_text_font(buildUiLabel, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(buildUiLabel, lv_color_hex(0x9AA3AB), LV_PART_MAIN);
+        lv_obj_set_style_text_align(buildUiLabel, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+        lv_label_set_text_static(buildUiLabel, "");
+        lv_obj_clear_flag(buildUiLabel, LV_OBJ_FLAG_CLICKABLE);
 
         lv_timer_create(
             radar_sweep_timer_cb,
@@ -2641,6 +2751,10 @@ void app_main()
         radarLon = 77.7067f;
         radarRangeKm = 100.0f;
     }
+
+    // 0.0.32: north reference + magnetic variation (SPIFFS is mounted by
+    // CustomRules_Init above). Cache first; local WMM computation otherwise.
+    NorthRef_Init(radarLat, radarLon);
 
     Radar_SetCenter(
         radarLat,

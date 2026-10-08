@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
 
@@ -37,4 +38,8 @@ esp_err_t WebStyle_SendHelpDialog(httpd_req_t *req, const char *dialogId, const 
  * redirect pages): " class='dk'" when Dark Mode is on, else "". Pair with
  * WEBSTYLE_MINI_CSS inside their own <style>. */
 const char *WebStyle_HtmlAttr(void);
+/* 0.0.32: local time for the nav bar ("6:32 PM PDT"; "time not synced"). */
+void WebStyle_FormatNowShort(char *out, size_t cap);
+/* 0.0.32: called after the Setup display settings are saved (main.c: radar redraw). */
+void WebStyle_SetAppearanceChangedHook(void (*hook)(void));
 #define WEBSTYLE_MINI_CSS "html.dk{background:#14171a;color:#e4e6e8}html.dk a{color:#7fd37f}"

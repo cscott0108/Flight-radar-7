@@ -52,7 +52,7 @@ typedef struct
     char callsign[16];
     /* 0.0.27: 64 -> 52 bytes to make room for `registration` without growing
      * the 200-entry list (the longest OpenSky country name is ~41 chars). */
-    char originCountry[52];
+    char originCountry[48]; /* 0.0.32: 52 -> 48 for the two raw heading fields below (alignment; longest OpenSky name ~41) */
     /* Registration (tail number) when the provider sends one (adsb.lol "r";
      * OpenSky never does). Upper-case letters, digits and '-'; "" = unknown.
      * Same width as the TF History record field it is written to. */
@@ -67,7 +67,12 @@ typedef struct
 
     float altitude;
     float velocity;
-    float heading;
+    /* Ground track over the ground, degrees clockwise from TRUE north, exactly as
+     * the provider reported it (0.0.32 name; was `heading`). Both providers send
+     * true track: OpenSky state vector index 10 `true_track`, adsb.lol (readsb)
+     * `track`. Raw provider value: never rewritten for display. Any magnetic or
+     * display-rotated bearing is derived from it at display time (north_ref.h). */
+    float trackTrueDeg;
 
     bool valid;
     /* AIRCRAFT_VIS_* (visibility_policy.h): why this aircraft is in the list.
@@ -98,6 +103,14 @@ typedef struct
      * actually sent (a missing value is stored as 0 above, as before). Display
      * only; filtering, ground detection and classification never read it. */
     uint8_t dataFlags;
+    /* 0.0.32: raw aircraft HEADING (where the nose points, not the track) when
+     * the provider sends it: adsb.lol `mag_heading` (magnetic) and
+     * `true_heading` (true), in 0.1 degree; valid only with AIRCRAFT_DATA_MAG_HDG /
+     * AIRCRAFT_DATA_TRUE_HDG. Kept as reported (never converted into each
+     * other). OpenSky sends neither. Retained for diagnostics; the radar draws
+     * the track. */
+    int16_t magHeadingDeci;
+    int16_t trueHeadingDeci;
 
     /* Operator/owner name as supplied by the provider (empty when the
      * provider gives none - OpenSky never does). Plain printable ASCII with
@@ -141,6 +154,8 @@ static inline void AircraftText_Sanitize(char *dst, size_t cap, const char *src)
 
 #define AIRCRAFT_DATA_VELOCITY 0x01 /* velocity was reported */
 #define AIRCRAFT_DATA_VRATE 0x02    /* verticalRateFpm was reported */
+#define AIRCRAFT_DATA_MAG_HDG 0x04  /* magHeadingDeci was reported (adsb.lol mag_heading) */
+#define AIRCRAFT_DATA_TRUE_HDG 0x08 /* trueHeadingDeci was reported (adsb.lol true_heading) */
 _Static_assert(sizeof(Aircraft) == 180, "Aircraft must stay 180 bytes (200-entry list in internal RAM)");
 
 /* ft/min from a provider value, clamped to the int16 field. */

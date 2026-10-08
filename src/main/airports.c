@@ -1,6 +1,7 @@
 #include "airports.h"
 
 #include <ctype.h>
+#include <stddef.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,15 +277,36 @@ static bool ValidMarker(const AirportMarker *marker)
            ValidRunwayText(marker->runway);
 }
 
+/* Bytes of the v3 blob for `count` locations: the {version,count} header plus
+ * only the used markers (0.0.32). Until 0.0.31 every save wrote the whole
+ * 100-slot array (4 + 100 x 52 = 5,204 B) whatever the count; NVS writes the
+ * new copy before erasing the old one, so each save needed ~5.2 KB free in the
+ * 24 KB nvs partition and failed with "storage error" on a nearly full
+ * partition even with 7 locations. Both lengths load (see Airports_Init). */
+static size_t StoredBlobSize(size_t count)
+{
+    return offsetof(StoredAirports, markers) + count * sizeof(AirportMarker);
+}
+
+/* Last Save/Delete failure, for an accurate WebUI message (guarded by airportsLock). */
+static esp_err_t s_lastError = ESP_OK;
+
 static bool SaveStored(const StoredAirports *next)
 {
     nvs_handle_t handle;
-    if (nvs_open(AIRPORT_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
+    esp_err_t err = nvs_open(AIRPORT_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        s_lastError = err;
         return false;
-    esp_err_t err = nvs_set_blob(handle, AIRPORT_KEY, next, sizeof(*next));
+    }
+    err = nvs_set_blob(handle, AIRPORT_KEY, next, StoredBlobSize(next->count));
     if (err == ESP_OK)
         err = nvs_commit(handle);
     nvs_close(handle);
+    s_lastError = err;
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Saving %u location(s) (%u bytes) failed: %s", (unsigned)next->count,
+                 (unsigned)StoredBlobSize(next->count), esp_err_to_name(err));
     return err == ESP_OK;
 }
 
@@ -524,8 +546,11 @@ bool Airports_Init(void)
         return ok;
     }
 
-    bool ok = size == sizeof(StoredAirports) && scratch->v3.version == AIRPORT_VERSION &&
-               scratch->v3.count <= MAX_AIRPORTS;
+    /* v3: the used markers only (0.0.32) or, as written up to 0.0.31, the full
+     * 100-slot array. Neither length can be mistaken for v1 (404 B) or v2 (444 B),
+     * and the version field must match as well. */
+    bool ok = scratch->v3.version == AIRPORT_VERSION && scratch->v3.count <= MAX_AIRPORTS &&
+              (size == StoredBlobSize(scratch->v3.count) || size == sizeof(StoredAirports));
     for (size_t i = 0; ok && i < scratch->v3.count; i++)
         if (!ValidMarker(&scratch->v3.markers[i]))
             ok = false;
@@ -534,6 +559,21 @@ bool Airports_Init(void)
     userRevision++;
     free(scratch);
     return ok;
+}
+
+esp_err_t Airports_LastError(void)
+{
+    if (!airportsLock)
+        return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(airportsLock, portMAX_DELAY);
+    esp_err_t e = s_lastError;
+    xSemaphoreGive(airportsLock);
+    return e;
+}
+
+size_t Airports_StoredBlobBytes(void)
+{
+    return StoredBlobSize(Airports_Count());
 }
 
 size_t Airports_Count(void)
@@ -560,9 +600,14 @@ bool Airports_Get(size_t index, AirportMarker *out)
 
 bool Airports_Save(int index, const AirportMarker *marker)
 {
-    if (!airportsLock || !ValidMarker(marker) || index < -1 || index >= MAX_AIRPORTS)
+    if (!airportsLock)
         return false;
     xSemaphoreTake(airportsLock, portMAX_DELAY);
+    if (!ValidMarker(marker) || index < -1 || index >= MAX_AIRPORTS) {
+        s_lastError = ESP_ERR_INVALID_ARG;
+        xSemaphoreGive(airportsLock);
+        return false;
+    }
     /* Heap/PSRAM scratch buffer, not a permanent static - see AllocScratch().
      * This runs on the HTTPD task in response to an infrequent admin edit, so
      * a transient allocation costs nothing that matters, unlike a static
@@ -571,6 +616,7 @@ bool Airports_Save(int index, const AirportMarker *marker)
      * fully overwritten (`= stored`) before use on every call. */
     StoredAirportsUnion *scratch = AllocScratch();
     if (!scratch) {
+        s_lastError = ESP_ERR_NO_MEM;
         xSemaphoreGive(airportsLock);
         return false;
     }
@@ -578,12 +624,14 @@ bool Airports_Save(int index, const AirportMarker *marker)
     *next = stored;
     if (index == -1) {
         if (next->count == MAX_AIRPORTS) {
+            s_lastError = ESP_ERR_INVALID_STATE; /* the 100-location limit */
             free(scratch);
             xSemaphoreGive(airportsLock);
             return false;
         }
         index = next->count++;
     } else if (index >= next->count) {
+        s_lastError = ESP_ERR_NOT_FOUND; /* edited entry no longer exists */
         free(scratch);
         xSemaphoreGive(airportsLock);
         return false;
@@ -605,6 +653,7 @@ bool Airports_Delete(size_t index)
         return false;
     xSemaphoreTake(airportsLock, portMAX_DELAY);
     if (index >= stored.count) {
+        s_lastError = ESP_ERR_NOT_FOUND;
         xSemaphoreGive(airportsLock);
         return false;
     }
@@ -612,6 +661,7 @@ bool Airports_Delete(size_t index)
      * and the identical reasoning in Airports_Save() above. */
     StoredAirportsUnion *scratch = AllocScratch();
     if (!scratch) {
+        s_lastError = ESP_ERR_NO_MEM;
         xSemaphoreGive(airportsLock);
         return false;
     }
@@ -725,6 +775,30 @@ bool Airport_ParseRunwayAxis(const char *runwayText, float *axisDegOut)
      * which end is named - is the heading modulo 180: */
     long axis = (number % 18) * 10; /* 0, 10, ..., 170 */
     *axisDegOut = (float)axis;
+    return true;
+}
+
+bool Airport_DisplayAxisDeg(const AirportMarker *marker, const AirportBuiltinView *view, float declDeg,
+                            float rotationDeg, float *displayAxisOut)
+{
+    if (!marker || !displayAxisOut)
+        return false;
+    float axis = 0.0f;
+    if (Airport_EffectiveShape(marker, &axis) != AIRPORT_MARKER_DIRECTIONAL)
+        return false;
+    float trueAxis;
+    if (view && view->hasAxis && (view->overrideFields & AIRPORT_OVR_ROTATION))
+        trueAxis = view->axisDeg;                 /* exact true geometry set by the user */
+    else if (view && view->hasAxis)
+        trueAxis = view->axisDeg + declDeg;       /* database axis: designator (magnetic) */
+    else
+        trueAxis = axis + declDeg;                /* user location: designator (magnetic) */
+    float d = fmodf(trueAxis - rotationDeg, 360.0f);
+    if (d < 0.0f)
+        d += 360.0f;
+    if (!isfinite(d))
+        return false;
+    *displayAxisOut = d;
     return true;
 }
 
