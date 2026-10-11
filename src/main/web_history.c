@@ -16,6 +16,16 @@
 #include "web_style.h"
 #include "web_util.h"
 
+#if defined(HIST_TEST_ALLOC) /* host tests only: lets a test make the PSRAM allocations fail */
+void *HistTestAlloc(size_t n);
+#define HIST_PSRAM_ALLOC(n) HistTestAlloc(n)
+#elif defined(ESP_PLATFORM)
+#include "esp_heap_caps.h"
+#define HIST_PSRAM_ALLOC(n) heap_caps_malloc((n), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
+#define HIST_PSRAM_ALLOC(n) malloc(n)
+#endif
+
 #define HISTORY_PAGE_ROWS 50u
 
 static esp_err_t SendChunk(httpd_req_t *req, const char *text)
@@ -46,7 +56,15 @@ static esp_err_t SendFormat(httpd_req_t *req, const char *format, ...)
  * /history?q=TEXT              search: exact ICAO24 through the index when TEXT
  *                              is hex; call sign / registration scan otherwise
  * /history?q=TEXT&m=t[&sb=FP&si=N]  call sign / registration scan (resumable)
- * Old links ?b=FP[&o=N][&only=1] open group FP expanded at N. */
+ * Old links ?b=FP[&o=N][&only=1] open group FP expanded at N.
+ * 0.1.4:
+ * /history?q=ICAO&sf=i[&sb=FP&si=N]  every record of that exact ICAO24 in every group
+ *                              (scan, resumable), with call signs summarized per group
+ * /history?q=CS&sf=c&ex=1      exact call sign (whole value, not case-sensitive)
+ * /history?s=d|a[&p=N]         groups ordered by record count (d = most first,
+ *                              a = fewest first; ties by fingerprint), N = position
+ * &x=1 on an expanded group    also check the page's aircraft for other call signs
+ *                              in this group and records in other groups (bounded scan) */
 
 typedef struct {
     bool haveAfter;
@@ -61,6 +79,11 @@ typedef struct {
     bool haveScanCursor;
     uint32_t scanFp;
     uint32_t scanIdx;
+    bool icaoAll;            /* 0.1.4 "sf=i": every record of this exact ICAO24 */
+    bool exact;              /* 0.1.4 "ex=1": exact call sign / registration */
+    char sort;               /* 0.1.4 "s": 0 = default order, 'd' / 'a' = record count */
+    uint32_t sortPos;        /* 0.1.4 "p": first group shown in a sorted list */
+    bool check;              /* 0.1.4 "x=1": cross-check the expanded page's aircraft */
 } HistQuery;
 static bool ParseHex8(const char *s, uint32_t *out)
 {
@@ -125,15 +148,25 @@ static void ParseQuery(httpd_req_t *req, HistQuery *q)
     char value[32];
     if (httpd_query_key_value(query, "q", value, sizeof(value)) == ESP_OK) {
         WebUtil_UrlDecodeInPlace(value);
+        char ex[4];
+        /* 0.1.4: an exact search (a clicked stored value) keeps every printable character;
+         * typed searches keep the original filter. Always escaped/encoded on output. */
+        const bool exactQ = httpd_query_key_value(query, "ex", ex, sizeof(ex)) == ESP_OK && !strcmp(ex, "1");
         size_t used = 0;
         for (const char *p = value; *p && used < sizeof(q->text) - 1; p++)
-            if (isalnum((unsigned char)*p) || *p == '-' || *p == '~' || *p == '?' || *p == '*')
+            if (isalnum((unsigned char)*p) || *p == '-' || *p == '~' || *p == '?' || *p == '*' ||
+                (exactQ && (unsigned char)*p > ' ' && (unsigned char)*p < 0x7F))
                 q->text[used++] = *p;
         q->text[used] = '\0';
+        if (httpd_query_key_value(query, "s", value, sizeof(value)) == ESP_OK && (!strcmp(value, "d") || !strcmp(value, "a")))
+            q->sort = value[0]; /* kept so "All groups" links return to the chosen order */
         if (q->text[0]) {
             q->textMode = httpd_query_key_value(query, "m", value, sizeof(value)) == ESP_OK && !strcmp(value, "t");
-            if (httpd_query_key_value(query, "sf", value, sizeof(value)) == ESP_OK)
+            if (httpd_query_key_value(query, "sf", value, sizeof(value)) == ESP_OK) {
+                q->icaoAll = !strcmp(value, "i");
                 q->field = SearchField_FromToken(value);
+            }
+            q->exact = httpd_query_key_value(query, "ex", value, sizeof(value)) == ESP_OK && !strcmp(value, "1");
             q->patternMode = httpd_query_key_value(query, "pm", value, sizeof(value)) == ESP_OK && !strcmp(value, "1");
             if (httpd_query_key_value(query, "sb", value, sizeof(value)) == ESP_OK && ParseHex8(value, &q->scanFp)) {
                 char idx[16];
@@ -143,7 +176,13 @@ static void ParseQuery(httpd_req_t *req, HistQuery *q)
             return; /* search mode ignores the browse cursor */
         }
     }
-    if (httpd_query_key_value(query, "a", value, sizeof(value)) == ESP_OK && ParseHex8(value, &q->after))
+    if (httpd_query_key_value(query, "s", value, sizeof(value)) == ESP_OK && (!strcmp(value, "d") || !strcmp(value, "a"))) {
+        q->sort = value[0];
+        if (httpd_query_key_value(query, "p", value, sizeof(value)) == ESP_OK)
+            (void)ParseU32(value, &q->sortPos);
+    }
+    q->check = httpd_query_key_value(query, "x", value, sizeof(value)) == ESP_OK && !strcmp(value, "1");
+    if (!q->sort && httpd_query_key_value(query, "a", value, sizeof(value)) == ESP_OK && ParseHex8(value, &q->after))
         q->haveAfter = true;
     if ((httpd_query_key_value(query, "g", value, sizeof(value)) == ESP_OK ||
          httpd_query_key_value(query, "b", value, sizeof(value)) == ESP_OK) && ParseHex8(value, &q->group))
@@ -208,7 +247,7 @@ static const char *StateBadge(uint8_t state)
 {
     switch (state) {
     case TF_REC_SUPERSEDED:
-        return "<span class='bd' title='A newer record for this aircraft exists (it changed group). "
+        return "<span class='bd' title='A newer record for this aircraft exists (it changed call sign or group). "
                "This older record is kept as history and is not used for lookups.'>Superseded</span>";
     case TF_REC_NOT_INDEXED:
         return "<span class='bd' title='The index has no entry for this aircraft (for example the index was rebuilt "
@@ -221,7 +260,9 @@ static const char *StateBadge(uint8_t state)
     }
 }
 
-static esp_err_t SendRow(httpd_req_t *req, const TfBrowseRecord *r, uint32_t fp, uint32_t idx, const BucketLabel *bl)
+/* extra: optional HTML (already escaped) added under the call sign (0.1.4 cross-check). */
+static esp_err_t SendRow(httpd_req_t *req, const TfBrowseRecord *r, uint32_t fp, uint32_t idx, const BucketLabel *bl,
+                         const char *extra)
 {
     if (r->state == TF_REC_CORRUPT)
         return SendFormat(req,
@@ -232,6 +273,20 @@ static esp_err_t SendRow(httpd_req_t *req, const TfBrowseRecord *r, uint32_t fp,
     WebUtil_EscapeHtml(eIcao, sizeof(eIcao), r->rec.icao24);
     WebUtil_EscapeHtml(eCs, sizeof(eCs), r->rec.callsign);
     WebUtil_EscapeHtml(eReg, sizeof(eReg), r->rec.registry);
+    /* 0.1.4: the ICAO24 opens every record of that aircraft; each call sign runs an exact
+     * call-sign search. Values are URL-encoded for the link and HTML-escaped for the text. */
+    char uIcao[TF_ICAO_MAX * 3 + 1], uCs[TF_CALLSIGN_MAX * 3 + 1];
+    WebUtil_UrlEncode(uIcao, sizeof(uIcao), r->rec.icao24);
+    WebUtil_UrlEncode(uCs, sizeof(uCs), r->rec.callsign);
+    char icaoCell[sizeof(uIcao) + sizeof(eIcao) + 96], csCell[sizeof(uCs) + sizeof(eCs) + 96];
+    if (r->rec.icao24[0])
+        snprintf(icaoCell, sizeof(icaoCell), "<a href='/history?q=%s&amp;sf=i' title='Every record of this aircraft'>%s</a>", uIcao, eIcao);
+    else
+        snprintf(icaoCell, sizeof(icaoCell), "%s", eIcao);
+    if (r->rec.callsign[0])
+        snprintf(csCell, sizeof(csCell), "<a href='/history?q=%s&amp;sf=c&amp;ex=1' title='Search this call sign'>%s</a>", uCs, eCs);
+    else
+        snprintf(csCell, sizeof(csCell), "&mdash;");
 
     const char *ac = AircraftType_IsValid(r->rec.aircraftType) ? AircraftType_Name((AircraftType)r->rec.aircraftType) : "Unknown";
     const char *ct = CraftType_IsValid(r->rec.craftType) ? CraftType_Name((CraftType)r->rec.craftType) : "Unknown";
@@ -240,15 +295,35 @@ static esp_err_t SendRow(httpd_req_t *req, const TfBrowseRecord *r, uint32_t fp,
     TimeUtil_FormatLocal((int64_t)r->rec.firstSeen, first, sizeof(first));
     TimeUtil_FormatLocal((int64_t)r->rec.lastSeen, last, sizeof(last));
 
+    /* Sent in two parts with the optional note between them, so neither part can
+     * outgrow SendFormat's buffer. */
+    if (SendFormat(req,
+            "<tr%s><td>%s%s<small><a href='/history?g=%08" PRIX32 "&amp;o=%" PRIu32 "#g%08" PRIX32 "'>group %08" PRIX32 "</a> #%" PRIu32 "</small></td>"
+            "<td>%s%s%s%s",
+            r->state == TF_REC_SUPERSEDED ? " class='sup'" : "", icaoCell, StateBadge(r->state), fp,
+            idx - idx % HISTORY_PAGE_ROWS, fp, fp, idx,
+            csCell,
+            r->rec.registry[0] ? "<br><small>reg " : "", r->rec.registry[0] ? eReg : "", r->rec.registry[0] ? "</small>" : "") != ESP_OK ||
+        (extra && extra[0] && SendChunk(req, extra) != ESP_OK))
+        return ESP_FAIL;
     return SendFormat(req,
-        "<tr%s><td>%s%s<small><a href='/history?g=%08" PRIX32 "&amp;o=%" PRIu32 "#g%08" PRIX32 "'>group %08" PRIX32 "</a> #%" PRIu32 "</small></td>"
-        "<td>%s%s%s%s</td><td title='Classified by: %s'>%s / %s</td><td>%s</td><td>%s</td><td>%s</td><td>%" PRIu32 "</td></tr>",
-        r->state == TF_REC_SUPERSEDED ? " class='sup'" : "", eIcao, StateBadge(r->state), fp,
-        idx - idx % HISTORY_PAGE_ROWS, fp, fp, idx,
-        r->rec.callsign[0] ? eCs : "&mdash;",
-        r->rec.registry[0] ? "<br><small>reg " : "", r->rec.registry[0] ? eReg : "", r->rec.registry[0] ? "</small>" : "",
+        "</td><td title='Classified by: %s'>%s / %s</td><td>%s</td><td>%s</td><td>%s</td><td>%" PRIu32 "</td></tr>",
         CraftSource_Name((CraftSource)r->rec.classificationSource), ac, ct,
         bl->html, first, last, r->rec.seenCount);
+}
+
+/* Query text that keeps the group list where it is: default order "a=FP"
+ * (list cursor) or 0.1.4 sorted order "s=d|a&p=N". withAmp ends in "&amp;"
+ * (for links that add more parameters), bare does not; both "" at the start. */
+static void ListState(const HistQuery *q, char *withAmp, size_t capA, char *bare, size_t capB)
+{
+    if (q->sort)
+        snprintf(bare, capB, "s=%c&amp;p=%" PRIu32, q->sort, q->sortPos);
+    else if (q->haveAfter)
+        snprintf(bare, capB, "a=%08" PRIX32, q->after);
+    else
+        bare[0] = '\0';
+    snprintf(withAmp, capA, "%s%s", bare, bare[0] ? "&amp;" : "");
 }
 
 /* One fingerprint group row: collapsed (link expands it) or expanded (link
@@ -257,12 +332,8 @@ static esp_err_t SendGroupRow(httpd_req_t *req, const HistQuery *q, uint32_t fp,
                               bool expanded, const BucketLabel *bl)
 {
     const bool plain = (fp == TF_BUCKET_UNASSIGNED || fp == TF_BUCKET_REGISTRY_DEFINED);
-    char cursor[24] = "";
-    if (q->haveAfter)
-        snprintf(cursor, sizeof(cursor), "a=%08" PRIX32 "&amp;", q->after);
-    char collapse[16] = "";
-    if (q->haveAfter)
-        snprintf(collapse, sizeof(collapse), "a=%08" PRIX32, q->after);
+    char cursor[40], collapse[36];
+    ListState(q, cursor, sizeof(cursor), collapse, sizeof(collapse));
     char countText[48];
     if (countKnown)
         snprintf(countText, sizeof(countText), "%" PRIu32 " record%s", count, count == 1 ? "" : "s");
@@ -356,9 +427,72 @@ static esp_err_t IcaoLookup(httpd_req_t *req, const HistQuery *q, bool *found)
     BucketLabel bl;
     BuildBucketLabel(&bl, fp);
     if (SendChunk(req, "<h2>ICAO24 match</h2>") != ESP_OK || SendChunk(req, kTableHead) != ESP_OK ||
-        SendRow(req, &rec, fp, idx, &bl) != ESP_OK || SendChunk(req, "</table></div>") != ESP_OK)
+        SendRow(req, &rec, fp, idx, &bl, NULL) != ESP_OK || SendChunk(req, "</table></div>") != ESP_OK)
         return ESP_FAIL;
     return ESP_OK;
+}
+
+/* 0.1.4: whole-value comparison, not case-sensitive, trailing spaces ignored
+ * (call signs can be space-padded) - for "exact" clicks and ICAO24 matches. */
+static bool SameValue(const char *value, const char *text)
+{
+    size_t n = strlen(value), m = strlen(text);
+    while (n && value[n - 1] == ' ')
+        n--;
+    if (n != m || n == 0)
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (tolower((unsigned char)value[i]) != tolower((unsigned char)text[i]))
+            return false;
+    return true;
+}
+
+/* 0.1.4: call signs actually found in the matched records of an ICAO24 scan,
+ * kept per fingerprint (never merged across groups), in the order found. */
+typedef struct {
+    uint32_t fp;
+    char cs[TF_CALLSIGN_MAX];
+} CsHit;
+
+static esp_err_t SendCallsignSummary(httpd_req_t *req, const char *eText, const CsHit *hits, size_t n, bool complete)
+{
+    if (SendFormat(req, "<h3>Call signs recorded for %s, by fingerprint</h3>"
+                        "<p class='meta'>Only call signs stored in the records above; each group is listed separately%s.</p><ul>",
+                   eText, complete ? "" : " (records found in this pass only - continue the search for more)") != ESP_OK)
+        return ESP_FAIL;
+    BucketLabel bl = {.valid = false};
+    for (size_t i = 0; i < n; i++) {
+        bool seenFp = false;
+        for (size_t j = 0; j < i; j++)
+            seenFp |= hits[j].fp == hits[i].fp;
+        if (seenFp)
+            continue; /* this group's line was already written */
+        BuildBucketLabel(&bl, hits[i].fp);
+        const bool plain = (hits[i].fp == TF_BUCKET_UNASSIGNED || hits[i].fp == TF_BUCKET_REGISTRY_DEFINED);
+        if (SendFormat(req, "<li><a href='/history?g=%08" PRIX32 "#g%08" PRIX32 "'>%08" PRIX32 "</a> %s%s%s: ",
+                       hits[i].fp, hits[i].fp, hits[i].fp, BucketTitle(hits[i].fp), plain ? "" : " &middot; ",
+                       plain ? "" : bl.html) != ESP_OK)
+            return ESP_FAIL;
+        size_t shown = 0;
+        for (size_t k = i; k < n; k++) {
+            if (hits[k].fp != hits[i].fp || !hits[k].cs[0])
+                continue;
+            bool dup = false;
+            for (size_t j = i; j < k; j++)
+                dup |= hits[j].fp == hits[k].fp && !strcmp(hits[j].cs, hits[k].cs);
+            if (dup)
+                continue;
+            char e[TF_CALLSIGN_MAX * 6 + 1], u[TF_CALLSIGN_MAX * 3 + 1];
+            WebUtil_EscapeHtml(e, sizeof(e), hits[k].cs);
+            WebUtil_UrlEncode(u, sizeof(u), hits[k].cs);
+            if (SendFormat(req, "%s<a href='/history?q=%s&amp;sf=c&amp;ex=1'>%s</a>", shown ? " &middot; " : "", u, e) != ESP_OK)
+                return ESP_FAIL;
+            shown++;
+        }
+        if (SendChunk(req, shown ? "</li>" : "<i>no call sign recorded</i></li>") != ESP_OK)
+            return ESP_FAIL;
+    }
+    return SendChunk(req, "</ul>");
 }
 
 /* Call sign / registration: a bounded, resumable scan of the bucket files in
@@ -373,10 +507,21 @@ static esp_err_t TextScan(httpd_req_t *req, const HistQuery *q)
     char eUrl[sizeof(q->text) * 3 + 1]; /* '?' and '*' must be URL-encoded in links */
     WebUtil_UrlEncode(eUrl, sizeof(eUrl), q->text);
     const PatternMode mode = q->patternMode ? PATTERN_MODE_PATTERN : PATTERN_MODE_NORMAL;
-    if (mode == PATTERN_MODE_NORMAL && !Pattern_HasWildcards(q->text) && strlen(q->text) < 2)
+    if (q->icaoAll && !LooksLikeIcao(q->text))
+        return SendNotice(req, "meta", "That is not an ICAO24 address (up to 6 hex digits, optionally starting with ~).");
+    if (!q->icaoAll && !q->exact && mode == PATTERN_MODE_NORMAL && !Pattern_HasWildcards(q->text) && strlen(q->text) < 2)
         return SendNotice(req, "meta", "Enter at least 2 characters to search call signs and registrations.");
-    if (SendFormat(req, "<h2>Call sign / registration matches for <b>%s</b></h2>", eText) != ESP_OK)
+    if (q->icaoAll) {
+        if (SendFormat(req, "<h2>Every record of ICAO24 <b>%s</b></h2><p class='meta'>All groups (fingerprints) are "
+                            "searched; each record is its own row with its own first seen, last seen and Seen count. "
+                            "Superseded rows are older records kept as history.</p>", eText) != ESP_OK)
+            return ESP_FAIL;
+    } else if (SendFormat(req, "<h2>%s matches for <b>%s</b></h2>",
+                          q->exact ? (q->field == SEARCH_FIELD_REGISTRATION ? "Exact registration" : "Exact call sign")
+                                   : "Call sign / registration", eText) != ESP_OK)
         return ESP_FAIL;
+    CsHit hits[HISTORY_SEARCH_MAX_MATCHES];
+    size_t nHits = 0;
 
     uint32_t fps[TF_LIST_MAX];
     size_t nFps = 0;
@@ -439,11 +584,24 @@ static esp_err_t TextScan(httpd_req_t *req, const HistQuery *q)
             }
             /* One shared matcher (pattern_match.h); registrations are recorded
              * from adsb.lol since 0.0.27, older records have none. */
-            const bool csHit = q->field != SEARCH_FIELD_REGISTRATION && Pattern_Match(r->rec.callsign, q->text, mode);
-            const bool regHit = !csHit && q->field != SEARCH_FIELD_CALLSIGN && r->rec.registry[0] &&
-                                Pattern_Match(r->rec.registry, q->text, mode);
-            if (!csHit && !regHit)
+            bool hit;
+            if (q->icaoAll) {
+                hit = SameValue(r->rec.icao24, q->text);
+            } else if (q->exact) {
+                hit = (q->field != SEARCH_FIELD_REGISTRATION && SameValue(r->rec.callsign, q->text)) ||
+                      (q->field != SEARCH_FIELD_CALLSIGN && r->rec.registry[0] && SameValue(r->rec.registry, q->text));
+            } else {
+                const bool csHit = q->field != SEARCH_FIELD_REGISTRATION && Pattern_Match(r->rec.callsign, q->text, mode);
+                hit = csHit || (q->field != SEARCH_FIELD_CALLSIGN && r->rec.registry[0] &&
+                                Pattern_Match(r->rec.registry, q->text, mode));
+            }
+            if (!hit)
                 continue;
+            if (q->icaoAll && nHits < HISTORY_SEARCH_MAX_MATCHES) {
+                hits[nHits].fp = fp;
+                snprintf(hits[nHits].cs, sizeof(hits[nHits].cs), "%s", r->rec.callsign);
+                nHits++;
+            }
             TfBrowseRecord shown = *r;
             if (TfHistory_IsLive(r->rec.icao24, fp, idx + (uint32_t)i, &shown.state) != TF_BR_OK)
                 shown.state = TF_REC_INDEX_UNKNOWN;
@@ -454,7 +612,7 @@ static esp_err_t TextScan(httpd_req_t *req, const HistQuery *q)
                     return ESP_FAIL;
                 tableOpen = true;
             }
-            if (SendRow(req, &shown, fp, idx + (uint32_t)i, &bl) != ESP_OK)
+            if (SendRow(req, &shown, fp, idx + (uint32_t)i, &bl, NULL) != ESP_OK)
                 return ESP_FAIL;
             matches++;
         }
@@ -465,8 +623,11 @@ static esp_err_t TextScan(httpd_req_t *req, const HistQuery *q)
         return ESP_FAIL;
     if (aborted)
         return SendStatusNotice(req, st);
-    if (!matches && SendFormat(req, "<p class='meta'>No call sign or registration matching <b>%s</b>%s.</p>",
+    if (!matches && SendFormat(req, "<p class='meta'>No %s <b>%s</b>%s.</p>",
+                               q->icaoAll ? "record for ICAO24" : "call sign or registration matching",
                                eText, finished ? "" : " in the records searched so far") != ESP_OK)
+        return ESP_FAIL;
+    if (q->icaoAll && nHits && SendCallsignSummary(req, eText, hits, nHits, finished) != ESP_OK)
         return ESP_FAIL;
     if (unreadable && SendFormat(req, "<p class='meta'>%" PRIu32 " unreadable record%s skipped "
                                       "(checksum mismatch, empty or truncated slot).</p>",
@@ -474,30 +635,183 @@ static esp_err_t TextScan(httpd_req_t *req, const HistQuery *q)
         return ESP_FAIL;
     if (finished)
         return SendFormat(req, "<p class='meta'>End of search: %" PRIu32 " match%s in this pass. "
-                               "<a href='/history'>All groups</a></p>", matches, matches == 1 ? "" : "es");
+                               "<a href='/history%s'>All groups</a></p>", matches, matches == 1 ? "" : "es",
+                          q->sort == 'd' ? "?s=d" : q->sort == 'a' ? "?s=a" : "");
     return SendFormat(req,
-        "<p class='meta'>Searched %" PRIu32 " records. <a href='/history?q=%s&amp;m=t&amp;sf=%s%s&amp;sb=%08" PRIX32 "&amp;si=%" PRIu32 "'>"
-        "Continue search &raquo;</a></p>", scanned, eUrl, SearchField_Token(q->field), q->patternMode ? "&amp;pm=1" : "", fp, idx);
+        "<p class='meta'>Searched %" PRIu32 " records. <a href='/history?q=%s&amp;m=t&amp;sf=%s%s%s%s&amp;sb=%08" PRIX32 "&amp;si=%" PRIu32 "'>"
+        "Continue search &raquo;</a></p>", scanned, eUrl, q->icaoAll ? "i" : SearchField_Token(q->field),
+        q->patternMode ? "&amp;pm=1" : "", q->exact ? "&amp;ex=1" : "",
+        q->sort == 'd' ? "&amp;s=d" : q->sort == 'a' ? "&amp;s=a" : "", fp, idx);
 }
 
 static esp_err_t SearchMode(httpd_req_t *req, const HistQuery *q)
 {
     char eText[sizeof(q->text) * 6 + 1];
     WebUtil_EscapeHtml(eText, sizeof(eText), q->text);
-    if (!q->textMode && !q->patternMode && q->field == SEARCH_FIELD_EITHER && LooksLikeIcao(q->text)) {
+    if (!q->textMode && !q->patternMode && !q->icaoAll && !q->exact && q->field == SEARCH_FIELD_EITHER && LooksLikeIcao(q->text)) {
         bool found = false;
         if (IcaoLookup(req, q, &found) != ESP_OK)
             return ESP_FAIL;
         if (!found && SendFormat(req, "<p class='meta'>No history record for ICAO24 <b>%s</b> in the index.</p>", eText) != ESP_OK)
             return ESP_FAIL;
-        /* Hex text can also be a call sign: offer the scan explicitly. */
-        return SendFormat(req, "<p><a href='/history?q=%s&amp;m=t&amp;sf=e'>Search call signs and registrations for %s</a> "
-                               "<small>(scans the card; slower than the ICAO24 index)</small></p>", eText, eText);
+        /* Hex text can also be a call sign: offer the scan explicitly. 0.1.4: and every record of the aircraft. */
+        return SendFormat(req, "<p><a href='/history?q=%s&amp;sf=i'>Every record of ICAO24 %s in all groups</a> &middot; "
+                               "<a href='/history?q=%s&amp;m=t&amp;sf=e'>Search call signs and registrations for %s</a> "
+                               "<small>(both scan the card; slower than the ICAO24 index)</small></p>", eText, eText, eText, eText);
     }
     return TextScan(req, q);
 }
 
 /* ---- browse: collapsed fingerprint groups, one expanded on demand ---- */
+
+/* 0.1.4 cross-check (&x=1) of the aircraft on one expanded page: for each
+ * distinct ICAO24 on the page, the call signs of ITS records in THIS group and
+ * how many of its records are in OTHER groups - from the stored records only
+ * (one bounded scan of the card, HISTORY_CHECK_RECORD_BUDGET records, TF lock
+ * per chunk, nothing sent while scanning). Table in PSRAM (CPU-only, freed). */
+#ifndef HISTORY_CHECK_RECORD_BUDGET
+#define HISTORY_CHECK_RECORD_BUDGET 4000u /* host tests override it */
+#endif
+#define HISTORY_CHECK_CS_MAX 6u
+typedef struct {
+    char icao[TF_ICAO_MAX];
+    uint8_t nCs;
+    bool moreCs;
+    bool annotated;
+    uint16_t other;              /* records of this ICAO24 in other groups */
+    char cs[HISTORY_CHECK_CS_MAX][TF_CALLSIGN_MAX];
+} PageAircraft;
+typedef struct {
+    PageAircraft ac[HISTORY_PAGE_ROWS];
+    size_t n;
+    uint32_t scanned;
+    bool complete;
+    bool failed;
+    char note[2048]; /* one row's note, built here instead of on the httpd stack */
+    uint32_t fps[TF_LIST_MAX];          /* scan state kept here, not on the httpd stack */
+    TfBrowseRecord recs[TF_BROWSE_CHUNK_MAX];
+} PageCheck;
+
+static PageAircraft *FindAc(PageCheck *pc, const char *icao)
+{
+    for (size_t i = 0; i < pc->n; i++)
+        if (SameValue(pc->ac[i].icao, icao))
+            return &pc->ac[i];
+    return NULL;
+}
+
+static void RunPageCheck(PageCheck *pc, uint32_t fp, uint32_t first, uint32_t count)
+{
+    memset(pc, 0, sizeof(*pc));
+    TfBrowseRecord *recs = pc->recs;
+    uint32_t *fps = pc->fps;
+    /* 1. the page's aircraft */
+    for (uint32_t idx = first; idx < count && idx < first + HISTORY_PAGE_ROWS;) {
+        size_t got = 0;
+        uint32_t want = first + HISTORY_PAGE_ROWS - idx;
+        if (want > TF_BROWSE_CHUNK_MAX)
+            want = TF_BROWSE_CHUNK_MAX;
+        TfBrowseStatus st = TfHistory_ScanChunk(fp, idx, want, recs, &got, &count);
+        if (st != TF_BR_OK || got == 0) {
+            pc->failed = st != TF_BR_END;
+            break;
+        }
+        for (size_t i = 0; i < got; i++)
+            if (recs[i].state != TF_REC_CORRUPT && recs[i].rec.icao24[0] && !FindAc(pc, recs[i].rec.icao24) &&
+                pc->n < HISTORY_PAGE_ROWS)
+                snprintf(pc->ac[pc->n++].icao, TF_ICAO_MAX, "%s", recs[i].rec.icao24);
+        idx += (uint32_t)got;
+    }
+    if (pc->failed || pc->n == 0)
+        return;
+    /* 2. every group, in fingerprint order, within the record budget */
+    size_t nFps = 0;
+    bool more = false, afterValid = false;
+    uint32_t after = 0;
+    for (;;) {
+        TfBrowseStatus st = TfHistory_ListBuckets(afterValid, after, TF_LIST_MAX, fps, &nFps, NULL, &more);
+        if (st == TF_BR_END)
+            break;
+        if (st != TF_BR_OK) {
+            pc->failed = true;
+            return;
+        }
+        for (size_t g = 0; g < nFps; g++) {
+            for (uint32_t idx = 0;;) {
+                if (pc->scanned >= HISTORY_CHECK_RECORD_BUDGET)
+                    return; /* complete stays false */
+                size_t got = 0;
+                uint32_t n = 0;
+                st = TfHistory_ScanChunk(fps[g], idx, TF_BROWSE_CHUNK_MAX, recs, &got, &n);
+                if (st == TF_BR_UNAVAILABLE || st == TF_BR_BUSY || st == TF_BR_IO) {
+                    pc->failed = true;
+                    return;
+                }
+                if (st == TF_BR_END || got == 0)
+                    break;
+                for (size_t i = 0; i < got; i++) {
+                    PageAircraft *a = recs[i].state == TF_REC_CORRUPT ? NULL : FindAc(pc, recs[i].rec.icao24);
+                    if (!a)
+                        continue;
+                    if (fps[g] != fp) {
+                        if (a->other < UINT16_MAX)
+                            a->other++;
+                        continue;
+                    }
+                    if (!recs[i].rec.callsign[0])
+                        continue;
+                    bool dup = false;
+                    for (size_t k = 0; k < a->nCs; k++)
+                        dup |= !strcmp(a->cs[k], recs[i].rec.callsign);
+                    if (dup)
+                        continue;
+                    if (a->nCs < HISTORY_CHECK_CS_MAX)
+                        snprintf(a->cs[a->nCs++], TF_CALLSIGN_MAX, "%s", recs[i].rec.callsign);
+                    else
+                        a->moreCs = true;
+                }
+                pc->scanned += (uint32_t)got;
+                idx += (uint32_t)got;
+            }
+        }
+        if (!more || nFps == 0)
+            break;
+        afterValid = true;
+        after = fps[nFps - 1];
+    }
+    pc->complete = true;
+}
+
+/* The note under a row's call sign: only on the first row of that aircraft on the
+ * page, only when there is something to say. */
+static void CheckNote(PageCheck *pc, const TfBrowseRecord *r, char *out, size_t cap)
+{
+    out[0] = '\0';
+    PageAircraft *a = (pc && r->state != TF_REC_CORRUPT) ? FindAc(pc, r->rec.icao24) : NULL;
+    if (!a || a->annotated)
+        return;
+    a->annotated = true;
+    size_t n = 0;
+    if (a->nCs > 1 || a->moreCs) {
+        n += (size_t)snprintf(out + n, cap - n, "<small>Call signs in this group: ");
+        for (size_t k = 0; k < a->nCs && n < cap; k++) {
+            char e[TF_CALLSIGN_MAX * 6 + 1], u[TF_CALLSIGN_MAX * 3 + 1];
+            WebUtil_EscapeHtml(e, sizeof(e), a->cs[k]);
+            WebUtil_UrlEncode(u, sizeof(u), a->cs[k]);
+            n += (size_t)snprintf(out + n, cap - n, "%s<a href='/history?q=%s&amp;sf=c&amp;ex=1'>%s</a>", k ? " &middot; " : "", u, e);
+        }
+        if (n < cap)
+            n += (size_t)snprintf(out + n, cap - n, "%s</small>", a->moreCs ? " &middot; &hellip;" : "");
+    }
+    if (a->other && n < cap) {
+        char u[TF_ICAO_MAX * 3 + 1];
+        WebUtil_UrlEncode(u, sizeof(u), a->icao);
+        n += (size_t)snprintf(out + n, cap - n, "<small><a href='/history?q=%s&amp;sf=i'>Additional history in other fingerprints (%u) &raquo;</a></small>",
+                              u, (unsigned)a->other);
+    }
+    if (n >= cap)
+        out[0] = '\0'; /* never send a cut tag (cannot happen with valid call signs) */
+}
 
 static esp_err_t SendExpandedGroup(httpd_req_t *req, const HistQuery *q, uint32_t fp, uint32_t count,
                                    const BucketLabel *bl)
@@ -505,6 +819,30 @@ static esp_err_t SendExpandedGroup(httpd_req_t *req, const HistQuery *q, uint32_
     uint32_t first = q->offset;
     if (first >= count)
         first = count ? (count - 1) - (count - 1) % HISTORY_PAGE_ROWS : 0;
+    char cursor[40], bare[36];
+    ListState(q, cursor, sizeof(cursor), bare, sizeof(bare));
+    PageCheck *pc = NULL;
+    if (q->check) {
+        pc = (PageCheck *)HIST_PSRAM_ALLOC(sizeof(PageCheck));
+        if (!pc && SendChunk(req, "<tr><td colspan='7'>Not enough free memory for the cross-check; showing the records only.</td></tr>") != ESP_OK)
+            return ESP_FAIL;
+    }
+    if (pc) {
+        RunPageCheck(pc, fp, first, count);
+        esp_err_t e = ESP_OK;
+        if (pc->failed)
+            e = SendChunk(req, "<tr><td colspan='7'>The cross-check could not read the card (busy or unavailable); "
+                               "no other-call-sign or other-fingerprint notes are shown.</td></tr>");
+        else if (!pc->complete)
+            e = SendFormat(req, "<tr><td colspan='7'>Cross-check stopped after %" PRIu32 " records: the notes below may be "
+                                "incomplete. An ICAO24 link lists every record of that aircraft.</td></tr>", pc->scanned);
+        if (e != ESP_OK || pc->failed) {
+            free(pc);
+            pc = NULL;
+            if (e != ESP_OK)
+                return ESP_FAIL;
+        }
+    }
     uint32_t idx = first, shown = 0;
     while (shown < HISTORY_PAGE_ROWS && idx < count) {
         TfBrowseRecord recs[TF_BROWSE_CHUNK_MAX];
@@ -515,6 +853,7 @@ static esp_err_t SendExpandedGroup(httpd_req_t *req, const HistQuery *q, uint32_
         /* The TF mutex is held only inside this call; the rows are sent after it returns. */
         TfBrowseStatus st = TfHistory_BrowseChunk(fp, idx, want, recs, &got, &count);
         if (st == TF_BR_UNAVAILABLE || st == TF_BR_BUSY || st == TF_BR_IO) {
+            free(pc);
             char row[400];
             snprintf(row, sizeof(row), "<tr><td colspan='7'>%s</td></tr>",
                      st == TF_BR_BUSY ? "The card is busy with history writes. Reload the page in a moment."
@@ -523,16 +862,23 @@ static esp_err_t SendExpandedGroup(httpd_req_t *req, const HistQuery *q, uint32_
         }
         if (st == TF_BR_END || got == 0)
             break;
-        for (size_t i = 0; i < got; i++)
-            if (SendRow(req, &recs[i], fp, idx + (uint32_t)i, bl) != ESP_OK)
+        for (size_t i = 0; i < got; i++) {
+            if (pc)
+                CheckNote(pc, &recs[i], pc->note, sizeof(pc->note));
+            if (SendRow(req, &recs[i], fp, idx + (uint32_t)i, bl, pc ? pc->note : NULL) != ESP_OK) {
+                free(pc);
                 return ESP_FAIL;
+            }
+        }
         idx += (uint32_t)got;
         shown += (uint32_t)got;
     }
-    char cursor[24] = "";
-    if (q->haveAfter)
-        snprintf(cursor, sizeof(cursor), "a=%08" PRIX32 "&amp;", q->after);
-    char prev[160] = "", next[160] = "";
+    free(pc);
+    char prev[160] = "", next[160] = "", check[320] = "";
+    if (!q->check && shown)
+        snprintf(check, sizeof(check), " &nbsp; <a href='/history?%sg=%08" PRIX32 "&amp;o=%" PRIu32 "&amp;x=1#g%08" PRIX32 "' "
+                 "title='Reads the card once (bounded)'>Check these aircraft for other call signs and other groups</a>",
+                 cursor, fp, first, fp);
     if (first > 0)
         snprintf(prev, sizeof(prev), "<a href='/history?%sg=%08" PRIX32 "&amp;o=%" PRIu32 "#g%08" PRIX32 "'>&laquo; Previous</a> ",
                  cursor, fp, first >= HISTORY_PAGE_ROWS ? first - HISTORY_PAGE_ROWS : 0, fp);
@@ -541,12 +887,134 @@ static esp_err_t SendExpandedGroup(httpd_req_t *req, const HistQuery *q, uint32_
                  cursor, fp, idx, fp);
     if (shown == 0)
         return SendChunk(req, "<tr><td colspan='7'>No records in this group.</td></tr>");
-    return SendFormat(req, "<tr><td colspan='7'>Showing %" PRIu32 "&ndash;%" PRIu32 " of %" PRIu32 " &nbsp; %s%s</td></tr>",
-                      first + 1, first + shown, count, prev, next);
+    return SendFormat(req, "<tr><td colspan='7'>Showing %" PRIu32 "&ndash;%" PRIu32 " of %" PRIu32 " &nbsp; %s%s%s</td></tr>",
+                      first + 1, first + shown, count, prev, next, check);
+}
+
+/* 0.1.4 order control for the group list (plain links, no script). */
+static esp_err_t SendOrderLinks(httpd_req_t *req, char sort)
+{
+    return SendFormat(req, "<p class='meta'>Order: %s &middot; %s &middot; %s</p>",
+                      sort == 0 ? "<b>Default (fingerprint)</b>" : "<a href='/history'>Default (fingerprint)</a>",
+                      sort == 'd' ? "<b>Most records first</b>" : "<a href='/history?s=d'>Most records first</a>",
+                      sort == 'a' ? "<b>Fewest records first</b>" : "<a href='/history?s=a'>Fewest records first</a>");
+}
+
+/* 0.1.4: groups ordered by their record count (the bucket header count shown in
+ * each group row - the number of records in the group, not distinct aircraft or
+ * call signs). Every group is listed by repeated directory passes, then one
+ * header read per group (separate TF lock each, as on the default list) into a
+ * transient PSRAM table of (fingerprint, count) only - no record is read.
+ * Ties: fingerprint ascending (the default order), so equal counts never move.
+ * Any group whose count cannot be read, or more groups than the table holds,
+ * stops with an error instead of showing a wrong order. */
+#define HISTORY_SORT_MAX_GROUPS 1024u
+typedef struct {
+    uint32_t fp;
+    uint32_t count;
+} GroupCount;
+
+static char s_sortDir; /* qsort has no context argument; set right before qsort (httpd runs one request at a time) */
+static int CmpGroupCount(const void *pa, const void *pb)
+{
+    const GroupCount *a = pa, *b = pb;
+    if (a->count != b->count)
+        return (s_sortDir == 'd') == (a->count > b->count) ? -1 : 1;
+    return a->fp < b->fp ? -1 : a->fp > b->fp ? 1 : 0;
+}
+
+/* Pure: sorts the (fingerprint, count) table in place. */
+static void SortGroupCounts(GroupCount *g, size_t n, char dir)
+{
+    s_sortDir = dir;
+    qsort(g, n, sizeof(*g), CmpGroupCount);
+}
+
+static esp_err_t SortedBrowse(httpd_req_t *req, const HistQuery *q)
+{
+    GroupCount *g = (GroupCount *)HIST_PSRAM_ALLOC(sizeof(GroupCount) * HISTORY_SORT_MAX_GROUPS);
+    if (!g)
+        return SendNotice(req, "er", "Not enough free memory to sort the groups. <a href='/history'>Default order</a>");
+    size_t n = 0;
+    uint32_t total = 0, fps[TF_LIST_MAX];
+    size_t got = 0;
+    bool more = true, afterValid = false;
+    uint32_t after = 0;
+    TfBrowseStatus st = TF_BR_OK;
+    while (more) {
+        st = TfHistory_ListBuckets(afterValid, after, TF_LIST_MAX, fps, &got, &total, &more);
+        if (st != TF_BR_OK || got == 0)
+            break;
+        if (n + got > HISTORY_SORT_MAX_GROUPS) {
+            free(g);
+            return SendFormat(req, "<p class='er'>There are more than %u groups; sorting by record count is not available. "
+                                   "<a href='/history'>Default order</a></p>", (unsigned)HISTORY_SORT_MAX_GROUPS);
+        }
+        for (size_t i = 0; i < got; i++)
+            g[n++].fp = fps[i];
+        afterValid = true;
+        after = fps[got - 1];
+    }
+    if (st == TF_BR_END && n == 0) {
+        free(g);
+        return SendNotice(req, "meta", "No history records have been stored on the card yet.");
+    }
+    if (st != TF_BR_OK && st != TF_BR_END) {
+        free(g);
+        return SendStatusNotice(req, st);
+    }
+    for (size_t i = 0; i < n; i++) {
+        st = TfHistory_BucketInfo(g[i].fp, &g[i].count);
+        if (st == TF_BR_OK)
+            continue;
+        const uint32_t badFp = g[i].fp;
+        free(g);
+        if (st == TF_BR_UNAVAILABLE || st == TF_BR_BUSY)
+            return SendStatusNotice(req, st);
+        return SendFormat(req, "<p class='er'>The record count of group %08" PRIX32 " could not be read (header unreadable), "
+                               "so the groups cannot be sorted by record count. <a href='/history'>Default order</a> &middot; "
+                               "<a href='/diag#tf'>Diagnostics</a></p>", badFp);
+    }
+    SortGroupCounts(g, n, q->sort);
+
+    uint32_t pos = q->sortPos;
+    if (pos >= n)
+        pos = n ? (uint32_t)((n - 1) - (n - 1) % TF_LIST_MAX) : 0;
+    HistQuery eq = *q;
+    eq.sortPos = pos;
+    if (SendFormat(req, "<h2>Fingerprints</h2><p class='meta'>%u group%s on the card, ordered by record count (%s; equal "
+                        "counts in fingerprint order). Groups %u&ndash;%u.</p>",
+                   (unsigned)n, n == 1 ? "" : "s", q->sort == 'd' ? "most first" : "fewest first",
+                   (unsigned)(pos + 1), (unsigned)(pos + TF_LIST_MAX < n ? pos + TF_LIST_MAX : n)) != ESP_OK ||
+        SendOrderLinks(req, q->sort) != ESP_OK || SendChunk(req, kTableHead) != ESP_OK) {
+        free(g);
+        return ESP_FAIL;
+    }
+    BucketLabel bl;
+    esp_err_t err = ESP_OK;
+    for (size_t i = pos; i < n && i < pos + TF_LIST_MAX && err == ESP_OK; i++) {
+        BuildBucketLabel(&bl, g[i].fp);
+        const bool expanded = eq.haveGroup && eq.group == g[i].fp;
+        err = SendGroupRow(req, &eq, g[i].fp, true, g[i].count, expanded, &bl);
+        if (err == ESP_OK && expanded)
+            err = SendExpandedGroup(req, &eq, g[i].fp, g[i].count, &bl);
+    }
+    const size_t shownEnd = pos + TF_LIST_MAX;
+    free(g);
+    if (err != ESP_OK || SendChunk(req, "</table></div>") != ESP_OK)
+        return ESP_FAIL;
+    if (pos > 0 && SendFormat(req, "<p><a href='/history?s=%c&amp;p=%u'>&laquo; Previous groups</a></p>",
+                              q->sort, (unsigned)(pos >= TF_LIST_MAX ? pos - TF_LIST_MAX : 0)) != ESP_OK)
+        return ESP_FAIL;
+    if (shownEnd < n)
+        return SendFormat(req, "<p><a href='/history?s=%c&amp;p=%u'>Next groups &raquo;</a></p>", q->sort, (unsigned)shownEnd);
+    return SendNotice(req, "meta", "End of groups.");
 }
 
 static esp_err_t BrowseMode(httpd_req_t *req, const HistQuery *q)
 {
+    if (q->sort)
+        return SortedBrowse(req, q);
     HistQuery eq = *q;
     /* A group link without a list cursor (search result, old ?b= link) starts the
      * list at that group so it is visible and expanded. */
@@ -576,7 +1044,7 @@ static esp_err_t BrowseMode(httpd_req_t *req, const HistQuery *q)
     if (SendFormat(req, "<h2>Fingerprints</h2><p class='meta'>%u group%s on the card. Groups are collapsed: "
                         "expanding one reads only that group's records, 50 at a time.</p>",
                    (unsigned)total, total == 1 ? "" : "s") != ESP_OK ||
-        SendChunk(req, kTableHead) != ESP_OK)
+        SendOrderLinks(req, 0) != ESP_OK || SendChunk(req, kTableHead) != ESP_OK)
         return ESP_FAIL;
     BucketLabel bl;
     for (size_t i = 0; i < n; i++) {
@@ -637,14 +1105,17 @@ static esp_err_t HistoryPage(httpd_req_t *req)
                 "<form method='get' action='/history'><label>Search <input name='q' value='%s' maxlength='%d' "
                 "placeholder='ICAO24, call sign or registration'></label> "
                 "<label>In <select name='sf'><option value='e'%s>Either</option><option value='c'%s>Call sign</option>"
-                "<option value='r'%s>Registration</option></select></label> "
-                "<label><input type='checkbox' name='pm' value='1'%s> Pattern mode</label> <button>Search</button> "
-                "<a href='/history'>All groups</a></form>",
+                "<option value='r'%s>Registration</option><option value='i'%s>ICAO24 (every record)</option></select></label> "
+                "<label><input type='checkbox' name='pm' value='1'%s> Pattern mode</label>%s <button>Search</button> "
+                "<a href='/history%s'>All groups</a></form>",
                 eq, (int)(sizeof(q.text) - 1),
-                q.field == SEARCH_FIELD_EITHER ? " selected" : "",
+                q.field == SEARCH_FIELD_EITHER && !q.icaoAll ? " selected" : "",
                 q.field == SEARCH_FIELD_CALLSIGN ? " selected" : "",
                 q.field == SEARCH_FIELD_REGISTRATION ? " selected" : "",
-                q.patternMode ? " checked" : "") != ESP_OK ||
+                q.icaoAll ? " selected" : "",
+                q.patternMode ? " checked" : "",
+                q.sort == 'd' ? "<input type='hidden' name='s' value='d'>" : q.sort == 'a' ? "<input type='hidden' name='s' value='a'>" : "",
+                q.sort == 'd' ? "?s=d" : q.sort == 'a' ? "?s=a" : "") != ESP_OK ||
             SendChunk(req,
                 "<p class='meta'><small>Search: plain text matches anywhere in the value. <b>?</b> = exactly one "
                 "character, <b>*</b> = any number of characters (wildcards match the whole value, e.g. "
@@ -661,9 +1132,11 @@ static esp_err_t HistoryPage(httpd_req_t *req)
         err = q.text[0] ? SearchMode(req, &q) : BrowseMode(req, &q);
         if (err == ESP_OK)
             err = SendChunk(req,
-                "<p><small>Each row is a record physically stored in a group file. <b>Superseded</b> = the aircraft has a "
-                "newer record elsewhere (it changed operator/registry group); the old record is kept and shown, never "
-                "deleted. <b>Not indexed</b> = the index has no entry for it. The operator is derived from the group's "
+                "<p><small>Each row is a record physically stored in a group file, with its own first seen, last seen and "
+                "Seen count. <b>Superseded</b> = the aircraft has a newer record: it changed operator/registry group, or "
+                "(since 0.1.4) its call sign; the old record is kept and shown, never deleted. Click an ICAO24 for every "
+                "record of that aircraft, grouped by fingerprint; click a call sign to search it. Call signs that changed "
+                "before 0.1.4 were overwritten and cannot be recovered. <b>Not indexed</b> = the index has no entry for it. The operator is derived from the group's "
                 "fingerprint and the current operator list, so a group whose operator was removed shows as unknown. "
                 "Times are shown in the zone set on the setup page. This page is read-only.</small></p>");
     }

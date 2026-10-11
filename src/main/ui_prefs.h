@@ -12,7 +12,12 @@
  *  - WebUI accent color (key "acc_web", default 0x4CAF50 = the stylesheet's
  *    --acc): navigation highlight, heading underlines. Independent of the radar
  *    color: changing one never changes the other.
- *  - Device clock (key "clockfmt": 0 off, 1 = 12-hour (default), 2 = 24-hour).
+ *  - Device clock format (key "clockfmt", u8: 1 = 12-hour (default), 2 = 24-hour; also used by the
+ *    WebUI clock). Stored 0 is the pre-0.1.6 "Off" choice: read as 12-hour + hidden.
+ *  - Device clock visibility (0.1.6, key "clockshow", u8: 1 = shown (default, also when the key is
+ *    missing), 0 = hidden). Display only: time keeping, time zone and DST are unaffected, and the
+ *    format is kept while the clock is hidden. A pre-0.1.6 "Off" (clockfmt 0) with no clockshow key
+ *    loads as hidden, so upgraded devices look exactly as before.
  *  - Screen orientation (0.1.2, key "screenrot", u8: 0 = Normal (default, also
  *    when the key is missing), 1 = Rotated 180 degrees). The display itself is
  *    switched by lvgl_port_set_rotation_180(); this module only stores the
@@ -24,7 +29,7 @@
 #define UI_ACCENT_DEFAULT_RGB 0x4CAF50u
 
 typedef enum {
-    UI_CLOCK_OFF = 0,
+    UI_CLOCK_OFF = 0, /* legacy (pre-0.1.6) value only: UiPrefs_ClockFormat() never returns it */
     UI_CLOCK_12H = 1,
     UI_CLOCK_24H = 2,
     UI_CLOCK_FORMAT_COUNT
@@ -38,7 +43,12 @@ UiClockFormat UiPrefs_ClockFormat(void);
  * error (the in-RAM value is still applied for an NVS error). */
 bool UiPrefs_SetRadarAccentRgb(uint32_t rgb);
 bool UiPrefs_SetWebAccentRgb(uint32_t rgb);
+/* UI_CLOCK_12H / UI_CLOCK_24H set the format; UI_CLOCK_OFF (an older form) hides the clock and keeps
+ * the format, exactly like UiPrefs_SetClockVisible(false). */
 bool UiPrefs_SetClockFormat(UiClockFormat fmt);
+/* 0.1.6 device-screen clock visibility (default true). */
+bool UiPrefs_ClockVisible(void);
+bool UiPrefs_SetClockVisible(bool visible);
 /* Saved screen orientation (true = Rotated 180). The setter writes NVS first and
  * changes the in-RAM value only if the write succeeded (false = not saved). */
 bool UiPrefs_ScreenRot180(void);
@@ -50,3 +60,6 @@ uint32_t UiPrefs_Revision(void);
 bool UiPrefs_ParseColor(const char *text, uint32_t *rgbOut);
 /* Device clock text for local time `tl`-equivalent fields; "" for UI_CLOCK_OFF. */
 void UiPrefs_FormatClock(UiClockFormat fmt, int hour, int minute, char *out, unsigned cap);
+/* 0.1.6 device-screen clock text: "" when hidden (the label is then hidden), "--:--" while the local
+ * time is not known yet, otherwise UiPrefs_FormatClock. */
+void UiPrefs_DeviceClockText(bool visible, UiClockFormat fmt, bool timeKnown, int hour, int minute, char *out, unsigned cap);

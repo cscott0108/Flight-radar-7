@@ -66,6 +66,8 @@ idf_component_register(
         "diag_telemetry.c"
         "web_airports.c"
         "web_diag.c"
+        "web_access.c"
+        "provider_poll_diag.c"
         "web_seen.c"
         "web_history.c"
         "web_util.c"
@@ -86,6 +88,9 @@ idf_component_register(
         "expert_debug.c"
         "north_ref.c"
         "ui_prefs.c"
+        "diag_export.c"
+        "log_capture_core.c"
+        "log_capture.c"
         ${SRC_UI}
     INCLUDE_DIRS 
         "."

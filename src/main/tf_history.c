@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifndef ESP_PLATFORM
+#include <sys/statvfs.h>
+#endif
 
 #ifdef ESP_PLATFORM
 #include "esp_timer.h"
@@ -132,14 +135,62 @@ static void Unlock(void)
 {
     xSemaphoreGiveRecursive(s_lock);
 }
+static bool HeldByMe(void)
+{
+    return s_lock && xSemaphoreGetMutexHolder(s_lock) == xTaskGetCurrentTaskHandle();
+}
 #else
-static void LockInit(void) {}
+/* Host builds (tests): a real recursive mutex with owner tracking (0.1.8), so concurrency tests exercise the same
+ * mutual exclusion as the device. The owner word is written only by the holder; a thread reading it for itself
+ * gets an exact answer. */
+#include <pthread.h>
+#include <time.h>
+static pthread_mutex_t s_hlock;
+static pthread_once_t s_hlockOnce = PTHREAD_ONCE_INIT;
+static unsigned long s_hOwner; /* (unsigned long)pthread_self() of the holder, 0 = free; atomic access only */
+static int s_hDepth;           /* changed only by the holder */
+static void HostLockMake(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s_hlock, &a);
+    pthread_mutexattr_destroy(&a);
+}
+static void LockInit(void) { pthread_once(&s_hlockOnce, HostLockMake); }
 static bool Lock(uint32_t ms)
 {
-    (void)ms;
+    LockInit();
+    int rc;
+    if (ms == TF_LOCK_FOREVER) {
+        rc = pthread_mutex_lock(&s_hlock);
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (time_t)(ms / 1000u);
+        ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        rc = pthread_mutex_timedlock(&s_hlock, &ts);
+    }
+    if (rc != 0)
+        return false;
+    s_hDepth++;
+    __atomic_store_n(&s_hOwner, (unsigned long)pthread_self(), __ATOMIC_RELAXED);
     return true;
 }
-static void Unlock(void) {}
+static void Unlock(void)
+{
+    if (--s_hDepth == 0)
+        __atomic_store_n(&s_hOwner, 0ul, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&s_hlock);
+}
+static bool HeldByMe(void)
+{
+    return __atomic_load_n(&s_hOwner, __ATOMIC_RELAXED) == (unsigned long)pthread_self();
+}
 #endif
 
 static void SetAvailable(bool v)
@@ -1530,6 +1581,53 @@ bool TfHistory_IsAvailable(void)
     return s_available;
 }
 
+/* ---- 0.1.8: storage access for the console-log writer (see tf_history.h) ---- */
+bool TfHistory_StorageLock(uint32_t ms)
+{
+    LockInit();
+    return Lock(ms == UINT32_MAX ? TF_LOCK_FOREVER : ms);
+}
+
+void TfHistory_StorageUnlock(void)
+{
+    Unlock();
+}
+
+bool TfHistory_StorageLockHeldByMe(void)
+{
+    return HeldByMe();
+}
+
+bool TfHistory_IsMounted(void)
+{
+    return s_stats.mounted;
+}
+
+const char *TfHistory_MountPoint(void)
+{
+    return TF_MOUNT_POINT;
+}
+
+bool TfHistory_GetFreeBytes(uint64_t *out)
+{
+    if (!out || !s_stats.mounted)
+        return false;
+#ifdef ESP_PLATFORM
+    FATFS *fs = NULL;
+    DWORD freeClusters = 0;
+    if (!s_card || f_getfree("0:", &freeClusters, &fs) != FR_OK || !fs)
+        return false;
+    *out = (uint64_t)freeClusters * fs->csize * 512u; /* same sector size as GetSpace() */
+    return true;
+#else
+    struct statvfs v;
+    if (statvfs(TF_MOUNT_POINT, &v) != 0)
+        return false;
+    *out = (uint64_t)v.f_bavail * (uint64_t)v.f_frsize;
+    return true;
+#endif
+}
+
 static bool LookupLocked(const char *icao24, TfHistoryRecord *out, uint32_t *bucketOut)
 {
     if (!s_available || !icao24 || !icao24[0])
@@ -1583,7 +1681,27 @@ static bool LookupLocked(const char *icao24, TfHistoryRecord *out, uint32_t *buc
     return true;
 }
 
-static bool UpsertLocked(uint32_t bucketFingerprint, const TfHistoryRecord *rec)
+/* 0.1.4: call-sign text without trailing spaces (OpenSky pads to 8; adsb.lol trims). */
+static size_t CallsignLen(const char *cs)
+{
+    size_t n = strnlen(cs, TF_CALLSIGN_MAX);
+    while (n && cs[n - 1] == ' ')
+        n--;
+    return n;
+}
+
+static bool SameCallsign(const char *a, const char *b)
+{
+    const size_t n = CallsignLen(a);
+    if (n != CallsignLen(b))
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i]))
+            return false;
+    return true;
+}
+
+static bool UpsertLocked(uint32_t bucketFingerprint, const TfHistoryRecord *rec, bool newRecord)
 {
     if (!s_available || !rec || !rec->icao24[0] || bucketFingerprint == TF_BUCKET_RESERVED)
         return false;
@@ -1636,14 +1754,26 @@ static bool UpsertLocked(uint32_t bucketFingerprint, const TfHistoryRecord *rec)
     od.pub = *rec;
     od.crc32 = Crc32(&od.pub, sizeof(od.pub));
 
+    /* 0.1.4 safety net: an in-place update must not replace a stored record whose
+     * (non-blank) call sign differs from the new one - e.g. the caller could not
+     * restore the aircraft (TF paused, failed lookup) and so did not ask for a new
+     * record. One extra read of that record; unreadable = previous behavior. */
+    if (found && pr.slot.bucketFingerprint == bucketFingerprint && !newRecord && CallsignLen(rec->callsign)) {
+        TfOnDiskRecord cur;
+        if (ReadRecordAt(path, pr.slot.recordOffset, &cur) && cur.crc32 == Crc32(&cur.pub, sizeof(cur.pub)) &&
+            CallsignLen(cur.pub.callsign) && !SameCallsign(cur.pub.callsign, rec->callsign))
+            newRecord = true;
+    }
+
     bool ok;
-    if (found && pr.slot.bucketFingerprint == bucketFingerprint) {
+    if (found && pr.slot.bucketFingerprint == bucketFingerprint && !newRecord) {
         ok = WriteRecordAt(path, pr.slot.recordOffset, &od);
         if (ok) s_stats.updates++;
     } else {
-        /* New aircraft, or its classification moved it to a different Universal
-         * Value bucket: append (the old bucket's record is superseded, never
-         * deleted) and write the reserved/existing index slot. If this exact
+        /* New aircraft, its classification moved it to a different Universal
+         * Value bucket, or (0.1.4, newRecord) its call sign changed within the
+         * same bucket: append (the previous record is superseded, never
+         * deleted or rewritten) and write the reserved/existing index slot. If this exact
          * record was appended earlier but its slot write failed, rewrite that
          * record in place instead of appending a duplicate. */
         uint32_t newOffset = 0;
@@ -1712,7 +1842,18 @@ bool TfHistory_Upsert(uint32_t bucketFingerprint, const TfHistoryRecord *rec)
         return false;
     if (!Lock(TF_LOCK_FOREVER))
         return false;
-    bool r = UpsertLocked(bucketFingerprint, rec);
+    bool r = UpsertLocked(bucketFingerprint, rec, false);
+    Unlock();
+    return r;
+}
+
+bool TfHistory_UpsertRecord(uint32_t bucketFingerprint, const TfHistoryRecord *rec, bool newRecord)
+{
+    if (!s_available)
+        return false;
+    if (!Lock(TF_LOCK_FOREVER))
+        return false;
+    bool r = UpsertLocked(bucketFingerprint, rec, newRecord);
     Unlock();
     return r;
 }

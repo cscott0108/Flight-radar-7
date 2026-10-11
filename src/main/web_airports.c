@@ -241,9 +241,30 @@ static esp_err_t SendOverrideActions(httpd_req_t *req, const char *icao)
         "<button type='submit'>Reset to Default</button></form>", icao);
 }
 
+/* 0.1.6: index of the stored override for `icao`, or -1. */
+static int OverrideIndexOf(const char *icao)
+{
+    const size_t n = Airports_OverrideCount();
+    for (size_t i = 0; i < n; i++) {
+        AirportBuiltinOverride o;
+        char id[5];
+        if (!Airports_GetOverride(i, &o))
+            continue;
+        memcpy(id, o.icao, 4); /* NUL-padded, as in the stored-overrides list */
+        id[4] = '\0';
+        if (!strcmp(id, icao))
+            return (int)i;
+    }
+    return -1;
+}
+
 /* The override editor (opened by an Override button) and the list of every
- * stored override, including airports outside the current radar area. */
-static esp_err_t SendOverrideEditor(httpd_req_t *req)
+ * stored override, including airports outside the current radar area.
+ * 0.1.6: an override whose airport is already listed under "Built-in airports active now" (listedAbove,
+ * one bit per stored-override index) gets a link to that row instead of a second, identical
+ * Edit Override / Reset to Default pair; overrides of airports outside the radar area keep both here,
+ * where they are the only way to reach them. */
+static esp_err_t SendOverrideEditor(httpd_req_t *req, const uint8_t *listedAbove)
 {
     if (Send(req,
         "<div id='ovrEditor' hidden><h3>Override built-in airport <span id='ovrName'></span></h3>"
@@ -286,7 +307,10 @@ static esp_err_t SendOverrideEditor(httpd_req_t *req)
             Send(req, "</td><td>") != ESP_OK || SendOverrideState(req, o.fields) != ESP_OK ||
             Send(req, "</td><td>") != ESP_OK)
             return ESP_FAIL;
-        if (known ? SendOverrideActions(req, icao) != ESP_OK
+        if (known && (listedAbove[i / 8] & (1u << (i % 8)))) {
+            if (SendFormat(req, "<a href='#bi-%s'>Edit or reset in the list above</a>", icao) != ESP_OK)
+                return ESP_FAIL;
+        } else if (known ? SendOverrideActions(req, icao) != ESP_OK
                   : SendFormat(req, "<form class='inline' method='post' action='/airports/override'>"
                                     "<input type='hidden' name='icao' value='%s'><input type='hidden' name='action' value='reset'>"
                                     "<button type='submit'>Reset to Default</button></form>", icao) != ESP_OK)
@@ -583,10 +607,12 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         "<option value='2'>H (heliport / helicopter location)</option>"
         "<option value='1'>Directional (airport, runway axis)</option>"
         "<option value='3'>Square (special aviation-interest location)</option></select></label>"
-        "<label>Primary runway <input id='runway' name='runway' maxlength='3' placeholder='e.g. 09L' "
-        "pattern='[0-9]{1,2}[LCRlcr]?' title='1-2 digit runway number (01-36), optional L/C/R'> "
-        "<small>Only used in Directional mode. Reciprocal ends (09/27, 18/36, ...) point the same way. "
-        "Left blank or unrecognized falls back to the dot automatically.</small></label>"
+        "<label>Primary runway / direction <input id='runway' name='runway' maxlength='3' placeholder='e.g. 09L or 095' "
+        "pattern='[0-9]{1,2}[LCRlcr]?|[0-9]{3}' title='Runway number 01-36 (optional L/C/R), or direction 000-360 degrees true (3 digits)'> "
+        "<small>Only used in Directional mode. Runway number 01&ndash;36, optional L/C/R (magnetic, like the runway "
+        "sign), or a <b>direction 0&ndash;360&deg; true written with 3 digits</b> (000&ndash;360; 000 and 360 are the same, "
+        "as for a built-in airport's Rotation override). Reciprocal ends (09/27, 090/270) point the same way. "
+        "Left blank falls back to the dot.</small></label>"
         "<button type='submit'>Save location</button><button type='button' onclick='newAirport()'>New location</button>"
         "</form><h2>User-defined locations</h2><table><tr><th>Name</th><th>Position</th><th>Size</th><th>Color</th><th>Marker</th><th></th></tr>") != ESP_OK)
         return ESP_FAIL;
@@ -611,8 +637,11 @@ static esp_err_t AirportsPage(httpd_req_t *req)
                 airportLat, airportLon, (unsigned)marker.diameter, colorHex, colorHex) != ESP_OK)
             return ESP_FAIL;
         if (marker.markerMode == AIRPORT_MARKER_DIRECTIONAL) {
-            if (SendFormat(req, "<td>Directional, runway %s%s</td>",
+            float trueDir;
+            if (SendFormat(req, "<td>Directional, %s %s%s%s</td>",
+                           Airport_ParseTrueDirection(marker.runway, &trueDir) ? "direction" : "runway",
                            marker.runway[0] ? marker.runway : "(none)",
+                           Airport_ParseTrueDirection(marker.runway, &trueDir) ? "&deg; true" : "",
                            showsDirectional ? "" : " &mdash; unrecognized, showing dot") != ESP_OK)
                 return ESP_FAIL;
         } else if (SendFormat(req, "<td>%s</td>", Airport_MarkerTypeName(marker.markerMode)) != ESP_OK) {
@@ -645,6 +674,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
         return ESP_FAIL;
     if (!builtinCount && Send(req, "<tr><td colspan='6'>No built-in airport within the current radius</td></tr>") != ESP_OK)
         return ESP_FAIL;
+    uint8_t listedAbove[(AIRPORT_OVERRIDE_MAX + 7) / 8] = {0}; /* 0.1.6: stored overrides with a row in this table */
     for (size_t i = 0; i < builtinCount; i++) {
         AirportMarker marker;
         AirportBuiltinView view;
@@ -661,7 +691,10 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             snprintf(markerText, sizeof(markerText), "Directional %ld&deg;", lroundf(view.axisDeg));
         else
             snprintf(markerText, sizeof(markerText), "Dot");
-        if (Send(req, "<tr><td>") != ESP_OK || SendEscaped(req, marker.name) != ESP_OK ||
+        const int ovrIndex = OverrideIndexOf(icao);
+        if (ovrIndex >= 0 && ovrIndex < AIRPORT_OVERRIDE_MAX)
+            listedAbove[ovrIndex / 8] |= (uint8_t)(1u << (ovrIndex % 8));
+        if (SendFormat(req, "<tr id='bi-%s'><td>", icao) != ESP_OK || SendEscaped(req, marker.name) != ESP_OK ||
             SendFormat(req, "</td><td>%s</td><td>%ld km</td><td>%s</td><td>",
                        tier == 1 ? "Major" : "Regional", lroundf(distanceKm), markerText) != ESP_OK ||
             SendOverrideState(req, view.overrideFields) != ESP_OK ||
@@ -670,7 +703,7 @@ static esp_err_t AirportsPage(httpd_req_t *req)
             Send(req, "</td></tr>") != ESP_OK)
             return ESP_FAIL;
     }
-    if (Send(req, "</table>") != ESP_OK || SendOverrideEditor(req) != ESP_OK || SendVisibilitySection(req) != ESP_OK)
+    if (Send(req, "</table>") != ESP_OK || SendOverrideEditor(req, listedAbove) != ESP_OK || SendVisibilitySection(req) != ESP_OK)
         return ESP_FAIL;
     if (Send(req,
         "<script>"
@@ -851,6 +884,13 @@ static esp_err_t SaveAirport(httpd_req_t *req)
         mode < 0 || !Airport_MarkerTypeValid((unsigned)mode) ||
         strlen(runwayText) > AIRPORT_RUNWAY_LENGTH)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid location details");
+    /* 0.1.3: in Directional mode a non-blank value must be a runway number (01-36,
+     * optional L/C/R) or a 3-digit direction 000-360 (true); anything else is rejected
+     * instead of being stored and silently drawn as a dot. */
+    if (mode == AIRPORT_MARKER_DIRECTIONAL && !Airport_DirectionTextValid(runwayText))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Primary runway / direction must be a runway number 01-36 (optional L/C/R) "
+                                   "or a direction 000-360 degrees true written with 3 digits");
     /* A runway that doesn't parse (empty, out of range, malformed) is not a
      * rejected submission - it just means this airport falls back to the
      * dot at render time, the same as if directional mode were never picked.

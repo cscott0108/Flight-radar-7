@@ -23,6 +23,7 @@
 #include "main.h"
 #include "radar.h" // for selectedIcao24, so debug logging can target the selected aircraft
 #include "visibility_policy.h" // VisPolicy_Admit: the shared on-ground / visibility decision
+#include "provider_http_diag.h" // 0.1.9: transport-failure kind for /diag
 
 #define OPENSKY_NAMESPACE "opensky"
 #define RATE_LIMIT_KEY "rate_until"
@@ -44,6 +45,11 @@ static volatile uint32_t rateLimitUntil = 0;
 static char *responseBuffer = NULL;
 static size_t responseLength = 0;
 static size_t responseCapacity = 0;
+/* 0.1.9: see adsblol_client.c. esp_http_client ignores the handler's ESP_FAIL, so after the first chunk that does
+ * not fit nothing more is stored (the kept prefix stays contiguous). OpenSky's flow is otherwise unchanged: the
+ * cut-off body still reaches the parser (which then fails) and /diag records the poll as truncated. */
+static bool responseTruncated = false;
+static size_t responseReceived = 0;
 
 uint32_t OpenSky_GetRateLimitSeconds(void)
 {
@@ -183,12 +189,29 @@ bool OpenSky_ParseAircraft(
     // response leaves the previous poll's aircraft in place.
     int rawCount = 0;
     int rejectedCount = 0;
+    /* 0.1.9: stage counts (aircraft_provider.h); observation only, nothing below depends on them */
+    ProviderParseStats st;
+    memset(&st, 0, sizeof(st));
+    int examined0 = 0, samples = 0, admittedSamples = 0;
+    const bool rawDiag = AircraftProvider_GetDebugLevel() >= PROVIDER_DEBUG_RAW;
 
     cJSON *root =
         cJSON_Parse(json);
 
     if (!root)
+    {
+        // 0.1.9: this case used to return silently (adsb.lol already warned).
+        const char *at = cJSON_GetErrorPtr();
+        const size_t len = json ? strlen(json) : 0;
+        // cJSON's error pointer is process-global: use it only when it points into this body.
+        const int off = (at && json && at >= json && at <= json + len) ? (int)(at - json) : -1;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "JSON parse failed near byte %d of %u", off, (unsigned)len);
+        ProviderDiag_Warning("OpenSky", msg);
+        ProviderDiag_ParseResult("OpenSky", false, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_OPENSKY, PPOLL_JSON_INVALID, NULL, off);
         return false;
+    }
 
     cJSON *states =
         cJSON_GetObjectItem(
@@ -206,6 +229,7 @@ bool OpenSky_ParseAircraft(
         cJSON_Delete(root);
         ProviderDiag_Warning("OpenSky", "response has no \"states\" field");
         ProviderDiag_ParseResult("OpenSky", false, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_OPENSKY, PPOLL_UNEXPECTED_SHAPE, NULL, -1);
         return false;
     }
 
@@ -214,6 +238,7 @@ bool OpenSky_ParseAircraft(
         gAircraftCount = 0;
         cJSON_Delete(root);
         ProviderDiag_ParseResult("OpenSky", true, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_OPENSKY, PPOLL_OK_EMPTY, &st, -1);
         return true;
     }
 
@@ -222,11 +247,13 @@ bool OpenSky_ParseAircraft(
         cJSON_Delete(root);
         ProviderDiag_Warning("OpenSky", "\"states\" field was present but not an array/null");
         ProviderDiag_ParseResult("OpenSky", false, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_OPENSKY, PPOLL_UNEXPECTED_SHAPE, NULL, -1);
         return false;
     }
 
     int count =
         cJSON_GetArraySize(states);
+    st.entries = count;
 
     gAircraftCount = 0; // the response is valid: replace the previous list
 
@@ -248,8 +275,14 @@ bool OpenSky_ParseAircraft(
                 states,
                 i);
 
+        if (pass == 0)
+            examined0++;
         if (!cJSON_IsArray(state))
+        {
+            if (pass == 0)
+                st.malformed++;
             continue;
+        }
 
         if (pass == 0)
             rawCount++;
@@ -303,7 +336,21 @@ bool OpenSky_ParseAircraft(
             !Aircraft_IsValidPosition(lat->valuedouble, lon->valuedouble))
         {
             if (pass == 0)
+            {
                 rejectedCount++;
+                const char *why;
+                if (!cJSON_IsString(icao)) { st.missingId++; why = "missing icao24"; }
+                else if (!cJSON_IsNumber(lat) || !cJSON_IsNumber(lon)) { st.missingPosition++; why = "missing lat/lon"; }
+                else { st.invalidPosition++; why = "lat/lon out of range"; }
+                if (rawDiag && samples < PROVIDER_DIAG_SAMPLES_MAX - 3) /* up to 5 rejected + 3 admitted */
+                {
+                    samples++;
+                    ProviderDiag_Sample("OpenSky", "#%d rejected (%s): icao24=%.12s lat=%s%.4f lon=%s%.4f", i, why,
+                                        cJSON_IsString(icao) ? icao->valuestring : "-",
+                                        cJSON_IsNumber(lat) ? "" : "n/a ", cJSON_IsNumber(lat) ? lat->valuedouble : 0.0,
+                                        cJSON_IsNumber(lon) ? "" : "n/a ", cJSON_IsNumber(lon) ? lon->valuedouble : 0.0);
+                }
+            }
             continue;
         }
 
@@ -374,8 +421,28 @@ bool OpenSky_ParseAircraft(
         if (!VisPolicy_Admit(a, reportedOnGround, pass))
         {
             if (pass == 0)
+            {
                 rejectedCount++;
+                st.onGround++;
+                if (rawDiag && samples < PROVIDER_DIAG_SAMPLES_MAX - 3)
+                {
+                    samples++;
+                    ProviderDiag_Sample("OpenSky", "#%d on ground (hidden in the airborne pass): icao24=%s on_ground=%s geo_alt=%.1f m vel=%.1f m/s",
+                                        i, a->icao24, reportedOnGround ? "true" : "false/null", (double)a->altitude,
+                                        (double)a->velocity);
+                }
+            }
             continue;
+        }
+        if (pass == 1)
+            st.groundShown++;
+        else if (rawDiag && admittedSamples < 3)
+        {
+            admittedSamples++;
+            ProviderDiag_Sample("OpenSky", "#%d admitted: icao24=%s geo_altitude=%s%.1f m, velocity=%s%.2f m/s, true_track=%s%.1f deg (stored as reported)",
+                                i, a->icao24, cJSON_IsNumber(alt) ? "" : "n/a ", (double)a->altitude,
+                                cJSON_IsNumber(vel) ? "" : "n/a ", (double)a->velocity,
+                                cJSON_IsNumber(hdg) ? "" : "n/a ", (double)a->trackTrueDeg);
         }
 
         a->valid = true;
@@ -425,6 +492,10 @@ bool OpenSky_ParseAircraft(
     cJSON_Delete(root);
 
     ProviderDiag_ParseResult("OpenSky", true, rawCount, gAircraftCount, rejectedCount);
+    st.notExamined = count - examined0;
+    st.admitted = gAircraftCount;
+    ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_OPENSKY,
+                            st.notExamined > 0 ? PPOLL_OK_PARTIAL : (count ? PPOLL_OK : PPOLL_OK_EMPTY), &st, -1);
 
     return true;
 }
@@ -436,8 +507,12 @@ static esp_err_t HttpEventHandler(esp_http_client_event_t *evt)
     {
     case HTTP_EVENT_ON_DATA:
         // REMOVED the strict non-chunked check because chunked responses are common!
+        responseReceived += (size_t)evt->data_len;
+        if (responseTruncated)
+            return ESP_FAIL;
         if (responseLength + evt->data_len + 1 > responseCapacity)
         {
+            responseTruncated = true;
             ESP_LOGE(TAG, "OpenSky response exceeds %u-byte buffer", (unsigned)responseCapacity);
             return ESP_FAIL;
         }
@@ -521,6 +596,8 @@ static bool RequestTokenImpl(void)
 
     responseLength = 0;
     responseBuffer[0] = '\0';
+    responseTruncated = false; // 0.1.9: same buffer/handler as the aircraft request; never inherit its truncation
+    responseReceived = 0;
 
     char postBody[512];
 
@@ -732,6 +809,8 @@ bool OpenSky_GetAircraftJson(
 
     responseLength = 0;
     responseBuffer[0] = '\0';
+    responseTruncated = false;
+    responseReceived = 0;
 
     // OpenSky's states/all endpoint wants a lat/lon bounding box rather than
     // a point+radius; this is an OpenSky-specific query shape and stays
@@ -758,10 +837,15 @@ bool OpenSky_GetAircraftJson(
         maxLon);
 
     ESP_LOGI(TAG, "Request URL: %s", url);
+    // 0.1.9: request number / timing / outcome for /diag (no allocation; before the heap workaround below).
+    ProviderFetch fetch;
+    const uint32_t seq = ProviderDiag_FetchStart(&fetch, AIRCRAFT_PROVIDER_OPENSKY, url);
+    char what[40];
+    snprintf(what, sizeof(what), "aircraft request #%u", (unsigned)seq);
     // The bounding box is not sensitive, so it's fine to show in full at
     // Normal diagnostics (unlike the OAuth request, which never logs its
     // body/headers - see RequestToken()).
-    ProviderDiag_RequestStart("OpenSky", "aircraft request", url);
+    ProviderDiag_RequestStart("OpenSky", what, url);
     if (AdvDiag_Active())
         ESP_LOGW(TAG, "JWT accessToken strlen=%u", (unsigned)strlen(accessToken));
     LogHttpMemory("Before aircraft TLS");
@@ -799,6 +883,7 @@ bool OpenSky_GetAircraftJson(
     {
         ESP_LOGE(TAG, "Could not allocate aircraft HTTP client");
         AdvDiag_AircraftTraceEnd(true);
+        ProviderDiag_FetchEnd(&fetch, PPOLL_CLIENT_INIT);
         return false;
     }
 
@@ -845,9 +930,17 @@ ESP_LOGI(TAG, "RequestToken start");
             "HTTP GET failed: %s",
             esp_err_to_name(err));
 
-        ProviderDiag_RequestDone("OpenSky", "aircraft request", 0, 0, false);
+        ProviderDiag_RequestDone("OpenSky", what, 0, 0, false, DiagTelemetry_NowMs() - fetch.t0Ms);
         AdvDiag_AircraftTraceEnd(true); // dump what the failed attempt still holds
+        fetch.espErr = err;
+        fetch.transport = ProviderHttp_TransportKind(err);
+        (void)esp_http_client_get_and_clear_last_tls_error(client, &fetch.tlsErr, &fetch.tlsFlags);
+        fetch.httpStatus = esp_http_client_get_status_code(client);
+        fetch.bytes = (uint32_t)responseLength;
+        fetch.received = (uint32_t)responseReceived;
+        fetch.truncated = responseTruncated;
         esp_http_client_cleanup(client);
+        ProviderDiag_FetchEnd(&fetch, PPOLL_TRANSPORT);
         return false;
     }
 
@@ -861,14 +954,21 @@ ESP_LOGI(TAG, "RequestToken start");
         (unsigned)responseLength);
 
     AdvDiag_AircraftTraceEnd(status != 200);
+    fetch.httpStatus = status;
+    fetch.contentLength = esp_http_client_get_content_length(client);
+    fetch.complete = esp_http_client_is_complete_data_received(client);
     esp_http_client_cleanup(client);
+    fetch.bytes = (uint32_t)responseLength;
+    fetch.received = (uint32_t)responseReceived;
+    fetch.truncated = responseTruncated;
 
-    ProviderDiag_RequestDone("OpenSky", "aircraft request", status, responseLength, status == 200);
+    ProviderDiag_RequestDone("OpenSky", what, status, responseLength, status == 200, DiagTelemetry_NowMs() - fetch.t0Ms);
     ProviderDiag_RawPreview("OpenSky", responseBuffer, responseLength);
 
     if (status == 429)
     {
         PauseAfterRateLimit("Aircraft states request");
+        ProviderDiag_FetchEnd(&fetch, PPOLL_RATE_LIMITED);
         return false;
     }
 
@@ -879,9 +979,13 @@ ESP_LOGI(TAG, "RequestToken start");
             "Unexpected HTTP status: %d",
             status);
         ESP_LOGE(TAG, "Missing access_token");
+        ProviderDiag_FetchEnd(&fetch, PPOLL_HTTP_STATUS);
         return false;
     }
 
+    /* A truncated body is still handed to the parser as before (it fails there); the fetch is recorded with
+     * truncated=yes so /diag reports the poll as "response truncated" rather than "invalid JSON". */
+    ProviderDiag_FetchEnd(&fetch, PPOLL_FETCHED);
     *json = responseBuffer;
 
     return true;

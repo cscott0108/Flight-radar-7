@@ -36,6 +36,13 @@ static const char kCss[] =
     "a{color:var(--lnk)}h1{margin:.2em 0;font-size:1.5em}"
     "h2{border-bottom:2px solid var(--acc);padding-bottom:3px;margin:1em 0 .5em;font-size:1.25em}"
     "nav.nv{display:flex;flex-wrap:wrap;gap:.3em;margin:.3em 0 .7em}"
+    /* 0.1.4: the header (navigation + clock; on Setup also its title and section links) stays at
+     * the top while scrolling. Sticky keeps it in the flow, so nothing is covered at the top of a
+     * page; the opaque background hides what scrolls underneath. scroll-padding-top keeps anchor
+     * targets (#features, #tf, #g<fp>, ...) clear of it (a wrapped header on a narrow screen is taller). */
+    "header.sk{position:sticky;top:0;z-index:20;background:var(--bg);margin:0 -.8em;padding:.1em .8em .1em;"
+    "border-bottom:1px solid var(--bd)}header.sk nav.nv{margin:.3em 0}"
+    "html{scroll-padding-top:4.5em}@media(max-width:640px){html{scroll-padding-top:8em}}"
     "nav.nv a,nav.nv span{padding:.15em .65em;border:1px solid var(--bd);border-radius:6px;"
     "text-decoration:none;background:var(--card)}"
     "nav.nv span{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:bold}"
@@ -103,7 +110,36 @@ static bool NavVisible(WebPageId id, WebPageId current)
     }
 }
 
+/* HOSTTEST:BEGIN clockjs (extracted and run under node by host_tests/web_clock_test.js) */
+/* 0.1.3: advances the nav clock (#nt) in the browser from the device instant and
+ * offsets in its data attributes, using only the browser's elapsed time (never its
+ * clock or time zone). Updates on each minute boundary; touches only #nt; no
+ * requests. Same text as WebStyle_FormatAt: "h:mm AM PDT" or "HH:mm PDT". */
+static const char kClockJs[] =
+    "<script>(function(){var e=document.getElementById('nt');if(!e||!e.dataset.t)return;"
+    "var d=e.dataset,t0=+d.t,n=+d.n,end=+d.e,h24=d.f=='1',p0=Date.now();"
+    "function f(){var u=t0+Math.floor((Date.now()-p0)/1000);"
+    "if(u>=end){e.title='Reload the page for the current device time';return 0}"
+    "var nx=n&&u>=n,o=nx?+d.p:+d.o,a=nx?d.b:d.a,l=u+o*60,m=Math.floor(l/60),mi=((m%60)+60)%60,"
+    "h=((Math.floor(m/60)%24)+24)%24;"
+    "e.textContent=(h24?(h<10?'0':'')+h:(h%12||12))+':'+(mi<10?'0':'')+mi+(h24?'':(h<12?' AM':' PM'))+' '+a;"
+    "return (60-(((l%60)+60)%60))*1000+50}"
+    "function s(){var w=f();if(w)setTimeout(s,w)}s()})();</script>";
+/* HOSTTEST:END clockjs */
+
+static esp_err_t SendHeadImpl(httpd_req_t *req, const char *title, WebPageId page, const char *extraCss, bool keepOpen);
+
 esp_err_t WebStyle_SendHead(httpd_req_t *req, const char *title, WebPageId page, const char *extraCss)
+{
+    return SendHeadImpl(req, title, page, extraCss, false);
+}
+
+esp_err_t WebStyle_SendHeadOpen(httpd_req_t *req, const char *title, WebPageId page, const char *extraCss)
+{
+    return SendHeadImpl(req, title, page, extraCss, true);
+}
+
+static esp_err_t SendHeadImpl(httpd_req_t *req, const char *title, WebPageId page, const char *extraCss, bool keepOpen)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
 
@@ -129,7 +165,7 @@ esp_err_t WebStyle_SendHead(httpd_req_t *req, const char *title, WebPageId page,
             return ESP_FAIL;
     }
 
-    n = snprintf(buf, sizeof(buf), "</style></head><body><nav class='nv'>");
+    n = snprintf(buf, sizeof(buf), "</style></head><body><header class='sk'><nav class='nv'>");
     for (size_t i = 0; i < sizeof(kNav) / sizeof(kNav[0]) && n > 0 && n < (int)sizeof(buf); i++) {
         int w;
         if (!NavVisible(kNav[i].id, page))
@@ -144,23 +180,37 @@ esp_err_t WebStyle_SendHead(httpd_req_t *req, const char *title, WebPageId page,
     }
     if (n <= 0 || n >= (int)sizeof(buf) - 8)
         return ESP_FAIL;
-    /* 0.0.32: the device's local time when this page was generated (server-side,
-     * configured zone/DST; no browser timer - reload for a new value). */
-    char now[40];
-    WebStyle_FormatNowShort(now, sizeof(now));
-    const int w = snprintf(buf + n, sizeof(buf) - n, "<small class='nt' title='Device time when this page loaded'>%s</small></nav>", now);
-    if (w <= 0 || w >= (int)sizeof(buf) - n)
+    if (httpd_resp_send_chunk(req, buf, n) != ESP_OK)
         return ESP_FAIL;
-    n += w;
-    return httpd_resp_send_chunk(req, buf, n);
+    /* 0.0.32: the device's local time (server-side, configured zone/DST and 12h/24h).
+     * 0.1.3: kept current in the browser by kClockJs from the instant, UTC offset and
+     * next DST change embedded here - the device is never contacted again for it. */
+    const int64_t nowUtc = (int64_t)time(NULL);
+    char now[40];
+    WebStyle_FormatAt(nowUtc, now, sizeof(now));
+    WebClockData cd;
+    const bool live = WebStyle_ClockData(nowUtc, &cd);
+    if (!live)
+        n = snprintf(buf, sizeof(buf), "<small class='nt'>%s</small></nav>", now); /* not synced: as before, no script */
+    else
+        n = snprintf(buf, sizeof(buf),
+                     "<small class='nt' id='nt' title='Device local time (configured time zone), kept current by this page' "
+                     "data-t='%lld' data-o='%d' data-a='%s' data-n='%lld' data-p='%d' data-b='%s' data-e='%lld' data-f='%d'>%s</small></nav>",
+                     (long long)cd.utc, cd.offMin, cd.abbr, (long long)cd.nextUtc, cd.nextOffMin, cd.nextAbbr,
+                     (long long)cd.validUntil, UiPrefs_ClockFormat() == UI_CLOCK_24H ? 1 : 0, now);
+    if (n <= 0 || n >= (int)sizeof(buf) || httpd_resp_send_chunk(req, buf, n) != ESP_OK)
+        return ESP_FAIL;
+    if (live && httpd_resp_send_chunk(req, kClockJs, sizeof(kClockJs) - 1) != ESP_OK)
+        return ESP_FAIL;
+    return keepOpen ? ESP_OK : httpd_resp_send_chunk(req, "</header>", HTTPD_RESP_USE_STRLEN);
 }
 
-void WebStyle_FormatNowShort(char *out, size_t cap)
+void WebStyle_FormatAt(int64_t utcSeconds, char *out, size_t cap)
 {
     if (!out || !cap)
         return;
     TimeLocal tl;
-    if (!TimeUtil_ToLocal((int64_t)time(NULL), &tl)) {
+    if (!TimeUtil_ToLocal(utcSeconds, &tl)) {
         snprintf(out, cap, "time not synced");
         return;
     }
@@ -168,6 +218,61 @@ void WebStyle_FormatNowShort(char *out, size_t cap)
     UiClockFormat fmt = UiPrefs_ClockFormat();
     UiPrefs_FormatClock(fmt == UI_CLOCK_24H ? UI_CLOCK_24H : UI_CLOCK_12H, tl.hour, tl.minute, hm, sizeof(hm));
     snprintf(out, cap, "%s %s", hm, tl.abbr);
+}
+
+void WebStyle_FormatNowShort(char *out, size_t cap)
+{
+    WebStyle_FormatAt((int64_t)time(NULL), out, cap);
+}
+
+/* 0.1.3: data for the nav clock script. The configured zone's UTC offset now and
+ * at its next change (DST), found by an hourly scan of the next WEB_CLOCK_HORIZON_SEC
+ * and a bisection to the second (about 200 pure conversions, once per page). The
+ * script stops at validUntil (horizon end, or a second change inside it). */
+bool WebStyle_ClockData(int64_t nowUtc, WebClockData *out)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    TimeZoneConfig cfg;
+    TimeUtil_GetConfig(&cfg);
+    TimeLocal a, b;
+    if (!TimeUtil_IsSynced(nowUtc) || !TimeUtil_Convert(&cfg, nowUtc, &a))
+        return false;
+    out->utc = nowUtc;
+    out->offMin = a.utcOffsetMinutes;
+    snprintf(out->abbr, sizeof(out->abbr), "%s", a.abbr);
+    out->validUntil = nowUtc + WEB_CLOCK_HORIZON_SEC;
+    int changes = 0;
+    int64_t prev = nowUtc;
+    int prevOff = a.utcOffsetMinutes;
+    for (int64_t t = nowUtc + 3600; t <= nowUtc + WEB_CLOCK_HORIZON_SEC && changes < 2; t += 3600) {
+        if (!TimeUtil_Convert(&cfg, t, &b))
+            break;
+        if (b.utcOffsetMinutes != prevOff) {
+            int64_t lo = prev, hi = t; /* offset(lo) == prevOff, offset(hi) != prevOff */
+            while (hi - lo > 1) {
+                const int64_t mid = lo + (hi - lo) / 2;
+                TimeLocal m;
+                if (TimeUtil_Convert(&cfg, mid, &m) && m.utcOffsetMinutes == prevOff)
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            if (changes == 0) {
+                TimeUtil_Convert(&cfg, hi, &b);
+                out->nextUtc = hi;
+                out->nextOffMin = b.utcOffsetMinutes;
+                snprintf(out->nextAbbr, sizeof(out->nextAbbr), "%s", b.abbr);
+            } else {
+                out->validUntil = hi; /* a second change: stop there (reload) */
+            }
+            changes++;
+            prevOff = b.utcOffsetMinutes;
+        }
+        prev = t;
+    }
+    return true;
 }
 
 const char *WebStyle_HtmlAttr(void)
@@ -224,13 +329,17 @@ esp_err_t WebStyle_SendFeatureControls(httpd_req_t *req)
         "<label>Radar accent color <input type='color' name='acc_radar' value='#%06X'></label>"
         "<label>WebUI accent color <input type='color' name='acc_web' value='#%06X'></label>"
         "<small>Independent of each other; default #4CAF50 (green).</small>"
-        "<label>Device clock <select name='clockfmt'><option value='0'%s>Off</option>"
+        "<input type='hidden' name='c_form' value='1'>"
+        "<label><input type='checkbox' name='clockshow' value='1'%s> Show clock on the device screen</label>"
+        "<label>Clock format <select name='clockfmt'>"
         "<option value='1'%s>12-hour</option><option value='2'%s>24-hour</option></select></label>"
+        "<small>The format is kept while the clock is hidden and is also used by the WebUI clock. "
+        "Hiding the clock does not change time keeping, time zone or DST.</small>"
         "</fieldset><button type='submit'>Save features</button></form>",
         mode == NORTH_REF_AUTO ? " selected" : "", mode == NORTH_REF_MAGNETIC ? " selected" : "",
         mode == NORTH_REF_TRUE ? " selected" : "", resolved,
         (unsigned)(UiPrefs_RadarAccentRgb() & 0xFFFFFFu), (unsigned)(UiPrefs_WebAccentRgb() & 0xFFFFFFu),
-        cf == UI_CLOCK_OFF ? " selected" : "", cf == UI_CLOCK_12H ? " selected" : "", cf == UI_CLOCK_24H ? " selected" : "");
+        UiPrefs_ClockVisible() ? " checked" : "", cf != UI_CLOCK_24H ? " selected" : "", cf == UI_CLOCK_24H ? " selected" : "");
     if (n <= 0 || n >= (int)sizeof(buf))
         return ESP_FAIL;
     return httpd_resp_send_chunk(req, buf, n);
@@ -314,8 +423,18 @@ static esp_err_t FeaturesPost(httpd_req_t *req)
             ok = UiPrefs_ParseColor(v, &rgb) && UiPrefs_SetRadarAccentRgb(rgb) && ok;
         if (FormValue(body, "acc_web", v, sizeof(v)))
             ok = UiPrefs_ParseColor(v, &rgb) && UiPrefs_SetWebAccentRgb(rgb) && ok;
-        if (FormValue(body, "clockfmt", v, sizeof(v)))
-            ok = UiPrefs_SetClockFormat((UiClockFormat)atoi(v)) && ok;
+        /* 0.1.6: "Show clock" checkbox + 12/24-hour format (c_form marks this form). An older form
+         * (Off / 12-hour / 24-hour select, no c_form) still works: Off hides the clock and keeps the
+         * format, 12/24-hour shows it in that format. */
+        const bool clockForm = HasKey(body, "c_form");
+        if (FormValue(body, "clockfmt", v, sizeof(v))) {
+            const UiClockFormat fmt = (UiClockFormat)atoi(v);
+            ok = UiPrefs_SetClockFormat(fmt) && ok;
+            if (!clockForm && fmt != UI_CLOCK_OFF && (unsigned)fmt < UI_CLOCK_FORMAT_COUNT)
+                ok = UiPrefs_SetClockVisible(true) && ok;
+        }
+        if (clockForm)
+            ok = UiPrefs_SetClockVisible(HasKey(body, "clockshow")) && ok;
         if (s_appearanceHook)
             s_appearanceHook(); /* radar redraw (rotation / accent) even while frozen */
     }

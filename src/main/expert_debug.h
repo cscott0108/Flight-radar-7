@@ -57,3 +57,6 @@ uint32_t ExpertDebug_LastFailedSize(void);
 uint32_t ExpertDebug_LastFailedCaps(void);
 // Name of the task whose allocation failed most recently ("" if none, "ISR").
 const char *ExpertDebug_LastFailedTask(void);
+// 0.1.6: uptime (esp_timer, microseconds since boot) of the most recent failure. False when no time
+// was stored or no consistent value could be read ("unavailable"; not the same as "no failures").
+bool ExpertDebug_LastFailedUptimeUs(int64_t *uptimeUs);

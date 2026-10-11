@@ -64,6 +64,15 @@ typedef struct {
     uint32_t shadowSlotsUsed;
     uint32_t shadowSlotsCap;
     uint32_t dirtyNow;
+    /* 0.1.5: shadow-table evictions (since boot). Unsaved history is never dropped:
+     * a dirty slot is reused only after its record was written; if that is not
+     * possible the NEW aircraft is not admitted (admitSkipped) and every pending
+     * record stays in RAM for the next flush. */
+    uint32_t evictClean;      /* clean slot reused (its state was already on the card) */
+    uint32_t evictAfterWrite; /* all slots dirty: oldest written first, then reused */
+    uint32_t evictWriteFail;  /* that write failed: nothing reused or cleared */
+    uint32_t admitSkipped;    /* new aircraft not tracked by History this time (still in Hot Seen; offered again next poll) */
+    bool evictWriteBlocked;   /* a failed eviction write: no further one until the next flush pass */
 } HistoryManagerStats;
 
 void HistoryManager_GetStats(HistoryManagerStats *out);

@@ -259,6 +259,7 @@ void AircraftProvider_SetDebugLevel(ProviderDebugLevel level)
 
 void AircraftProvider_Init(void)
 {
+    ProviderPollDiag_Init(); /* 0.1.9: one-time PSRAM record (provider_poll_diag.c) */
     LoadSelection();
     if (haveStoredMask)
         SyncActiveFromMask();
@@ -339,22 +340,30 @@ bool AircraftProvider_GetAircraftJson(float centerLat, float centerLon, float ra
     return AircraftProvider_GetAircraftJsonFor(activeProvider, centerLat, centerLon, radiusKm, json);
 }
 
+/* HOSTTEST:BEGIN fetchdiag (extracted verbatim by host_tests/provider_diag_test.c) */
 bool AircraftProvider_GetAircraftJsonFor(AircraftProviderType type, float centerLat, float centerLon, float radiusKm,
                                          const char **json)
 {
     bool backoff = AircraftProvider_GetRateLimitSecondsFor(type) > 0;
     uint32_t t0 = DiagTelemetry_NowMs();
     bool ok = GetAircraftJsonRaw(type, centerLat, centerLon, radiusKm, json);
-    if (!ok && backoff)
+    /* 0.1.6: the same measurement is also kept per provider (no extra serial events: OpDone, not OpEnd). */
+    const DiagOp perProvider = type == AIRCRAFT_PROVIDER_ADSBLOL ? DT_OP_FETCH_ADSBLOL
+                             : type == AIRCRAFT_PROVIDER_OPENSKY ? DT_OP_FETCH_OPENSKY : DT_OP_COUNT;
+    if (!ok && backoff) {
         DiagTelemetry_OpDone(DT_OP_PROVIDER_REFRESH, DT_RES_SKIPPED, 0, NULL);
-    else
-        DiagTelemetry_OpEnd(DT_OP_PROVIDER_REFRESH, t0, ok,
-                            AircraftProvider_GetRateLimitSecondsFor(type) > 0
-                                ? (type == AIRCRAFT_PROVIDER_ADSBLOL ? "adsb.lol rate limited (429)" : "OpenSky rate limited (429)")
-                                : (type == AIRCRAFT_PROVIDER_ADSBLOL ? "adsb.lol request or response failed"
-                                                                     : "OpenSky request or response failed"));
+        DiagTelemetry_OpDone(perProvider, DT_RES_SKIPPED, 0, NULL);
+    } else {
+        const char *reason = AircraftProvider_GetRateLimitSecondsFor(type) > 0
+                                 ? (type == AIRCRAFT_PROVIDER_ADSBLOL ? "adsb.lol rate limited (429)" : "OpenSky rate limited (429)")
+                                 : (type == AIRCRAFT_PROVIDER_ADSBLOL ? "adsb.lol request or response failed"
+                                                                      : "OpenSky request or response failed");
+        DiagTelemetry_OpDone(perProvider, ok ? DT_RES_OK : DT_RES_FAIL, DiagTelemetry_NowMs() - t0, ok ? NULL : reason);
+        DiagTelemetry_OpEnd(DT_OP_PROVIDER_REFRESH, t0, ok, reason);
+    }
     return ok;
 }
+/* HOSTTEST:END fetchdiag */
 
 /* HOSTTEST:BEGIN dispatch (extracted verbatim by host_tests/visibility_test.c) */
 bool AircraftProvider_ParseAircraft(const char *json)
@@ -425,11 +434,11 @@ void ProviderDiag_RequestStart(const char *provider, const char *what, const cha
     ESP_LOGI(TAG, "[%s] %s starting: %s", provider, what, urlRedacted ? urlRedacted : "");
 }
 
-void ProviderDiag_RequestDone(const char *provider, const char *what, int httpStatus, size_t bytes, bool ok)
+void ProviderDiag_RequestDone(const char *provider, const char *what, int httpStatus, size_t bytes, bool ok, uint32_t elapsedMs)
 {
     if (debugLevel < PROVIDER_DEBUG_NORMAL) return;
-    ESP_LOGI(TAG, "[%s] %s done: status=%d bytes=%u result=%s",
-             provider, what, httpStatus, (unsigned)bytes, ok ? "ok" : "failed");
+    ESP_LOGI(TAG, "[%s] %s done: status=%d bytes=%u result=%s elapsed=%u ms",
+             provider, what, httpStatus, (unsigned)bytes, ok ? "ok" : "failed", (unsigned)elapsedMs);
 }
 
 void ProviderDiag_ParseResult(const char *provider, bool parseOk, int rawCount, int normalizedCount, int rejectedCount)
@@ -536,3 +545,4 @@ void ProviderDiag_RawPreview(const char *provider, const char *body, size_t body
              provider, (unsigned)previewLen, (unsigned)bodyLen,
              bodyLen > previewLen ? " [truncated]" : "", preview);
 }
+

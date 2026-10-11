@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #define REBOOT_HISTORY_WAIT_MS 10000u
+#define REBOOT_LOG_WAIT_MS 2000u /* 0.1.8: console-log capture final write */
 #define REBOOT_HISTORY_POLL_MS 100u
 
 typedef struct {

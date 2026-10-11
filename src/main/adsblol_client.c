@@ -20,6 +20,8 @@
 #include "cJSON.h"
 
 #include "custom_rules.h" /* AircraftType, ResolveAircraftWithHint (diagnostics only) */
+#include "diag_telemetry.h"   /* DiagTelemetry_NowMs (request elapsed time) */
+#include "provider_http_diag.h"
 #include "visibility_policy.h" /* VisPolicy_Admit: the shared on-ground / visibility decision */
 
 #define ADSBLOL_NAMESPACE "adsblol"
@@ -38,6 +40,11 @@ static const char *TAG = "AdsbLol";
 static char *responseBuffer = NULL;
 static size_t responseLength = 0;
 static size_t responseCapacity = 0;
+/* 0.1.9: esp_http_client ignores the event handler's return value (http_on_body), so a full buffer does NOT
+ * stop the request and perform() still reports HTTP 200. Once a chunk does not fit, nothing more is stored (no
+ * gaps from a later, smaller chunk) and the request is reported as truncated instead of successful. */
+static bool responseTruncated = false;
+static size_t responseReceived = 0;
 
 static volatile uint32_t rateLimitUntil = 0;
 
@@ -112,8 +119,12 @@ static esp_err_t HttpEventHandler(esp_http_client_event_t *evt)
     switch (evt->event_id)
     {
     case HTTP_EVENT_ON_DATA:
+        responseReceived += (size_t)evt->data_len;
+        if (responseTruncated)
+            return ESP_FAIL; /* already cut off: keep the stored prefix contiguous */
         if (responseLength + evt->data_len + 1 > responseCapacity)
         {
+            responseTruncated = true;
             ESP_LOGE(TAG, "adsb.lol response exceeds %u-byte bounded buffer; dropping remainder",
                      (unsigned)responseCapacity);
             return ESP_FAIL;
@@ -146,6 +157,8 @@ bool AdsbLol_GetAircraftJson(
 
     responseLength = 0;
     responseBuffer[0] = '\0';
+    responseTruncated = false;
+    responseReceived = 0;
 
     float radiusNm = radiusKm * KM_TO_NM;
     if (radiusNm > ADSBLOL_MAX_RADIUS_NM)
@@ -157,7 +170,13 @@ bool AdsbLol_GetAircraftJson(
     snprintf(url, sizeof(url), "https://api.adsb.lol/v2/point/%.6f/%.6f/%.0f",
              centerLat, centerLon, radiusNm);
 
-    ProviderDiag_RequestStart("adsb.lol", "aircraft request", url);
+    /* 0.1.9: request number, the exact URL handed to the client, timing and outcome for /diag and the log. */
+    ProviderFetch fetch;
+    const uint32_t seq = ProviderDiag_FetchStart(&fetch, AIRCRAFT_PROVIDER_ADSBLOL, url);
+    char what[40];
+    snprintf(what, sizeof(what), "aircraft request #%u", (unsigned)seq);
+    ProviderDiag_RequestStart("adsb.lol", what, url);
+    ProviderDiag_HeapBeforeTls("adsb.lol"); /* Normal and above: the figures OpenSky logs before its TLS session */
 
     esp_http_client_config_t config = {
         .url = url,
@@ -174,6 +193,7 @@ bool AdsbLol_GetAircraftJson(
     if (!client)
     {
         ESP_LOGE(TAG, "Could not allocate aircraft HTTP client");
+        ProviderDiag_FetchEnd(&fetch, PPOLL_CLIENT_INIT);
         return false;
     }
 
@@ -184,29 +204,55 @@ bool AdsbLol_GetAircraftJson(
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "HTTP GET failed: %s", esp_err_to_name(err));
-        ProviderDiag_RequestDone("adsb.lol", "aircraft request", 0, 0, false);
+        fetch.espErr = err;
+        fetch.transport = ProviderHttp_TransportKind(err);
+        (void)esp_http_client_get_and_clear_last_tls_error(client, &fetch.tlsErr, &fetch.tlsFlags);
+        fetch.httpStatus = esp_http_client_get_status_code(client); /* 0 unless a response header arrived */
+        fetch.bytes = (uint32_t)responseLength;
+        fetch.received = (uint32_t)responseReceived;
+        fetch.truncated = responseTruncated;
+        ProviderDiag_RequestDone("adsb.lol", what, 0, 0, false, DiagTelemetry_NowMs() - fetch.t0Ms);
         esp_http_client_cleanup(client);
+        ProviderDiag_FetchEnd(&fetch, PPOLL_TRANSPORT);
         return false;
     }
 
     int status = esp_http_client_get_status_code(client);
+    fetch.httpStatus = status;
+    fetch.contentLength = esp_http_client_get_content_length(client);
+    fetch.complete = esp_http_client_is_complete_data_received(client);
     esp_http_client_cleanup(client);
+    fetch.bytes = (uint32_t)responseLength;
+    fetch.received = (uint32_t)responseReceived;
+    fetch.truncated = responseTruncated;
 
-    ProviderDiag_RequestDone("adsb.lol", "aircraft request", status, responseLength, status == 200);
+    ProviderDiag_RequestDone("adsb.lol", what, status, responseLength, status == 200 && !responseTruncated,
+                             DiagTelemetry_NowMs() - fetch.t0Ms);
     ProviderDiag_RawPreview("adsb.lol", responseBuffer, responseLength);
 
     if (status == 429 || status == 503)
     {
         PauseAfterRateLimit("Aircraft point request");
+        ProviderDiag_FetchEnd(&fetch, PPOLL_RATE_LIMITED);
         return false;
     }
 
     if (status != 200)
     {
         ESP_LOGE(TAG, "Unexpected HTTP status: %d", status);
+        ProviderDiag_FetchEnd(&fetch, PPOLL_HTTP_STATUS);
         return false;
     }
 
+    if (responseTruncated)
+    {
+        /* HTTP 200 is not a complete response: the body did not fit the bounded buffer (0.1.9). The handler's
+         * existing error line already printed; FetchEnd logs "response truncated" at Normal and records it. */
+        ProviderDiag_FetchEnd(&fetch, PPOLL_TRUNCATED);
+        return false;
+    }
+
+    ProviderDiag_FetchEnd(&fetch, PPOLL_FETCHED);
     *json = responseBuffer;
     return true;
 }
@@ -220,12 +266,24 @@ bool AdsbLol_ParseAircraft(const char *json)
      * place - the same stale-data behavior a failed HTTP request has. */
     int rawCount = 0;
     int rejectedCount = 0;
+    /* 0.1.9: stage counts (aircraft_provider.h); observation only, nothing below depends on them */
+    ProviderParseStats st;
+    memset(&st, 0, sizeof(st));
+    int examined0 = 0, samples = 0, admittedSamples = 0;
+    const bool rawDiag = AircraftProvider_GetDebugLevel() >= PROVIDER_DEBUG_RAW;
 
     cJSON *root = cJSON_Parse(json);
     if (!root)
     {
-        ProviderDiag_Warning("adsb.lol", "JSON parse failed");
+        const char *at = cJSON_GetErrorPtr();
+        const size_t len = json ? strlen(json) : 0;
+        /* cJSON's error pointer is process-global: use it only when it points into this body. */
+        const int off = (at && json && at >= json && at <= json + len) ? (int)(at - json) : -1;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "JSON parse failed near byte %d of %u", off, (unsigned)len);
+        ProviderDiag_Warning("adsb.lol", msg);
         ProviderDiag_ParseResult("adsb.lol", false, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_ADSBLOL, PPOLL_JSON_INVALID, NULL, off);
         return false;
     }
 
@@ -237,6 +295,7 @@ bool AdsbLol_ParseAircraft(const char *json)
         cJSON_Delete(root);
         ProviderDiag_Warning("adsb.lol", "response has no \"ac\" field");
         ProviderDiag_ParseResult("adsb.lol", false, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_ADSBLOL, PPOLL_UNEXPECTED_SHAPE, NULL, -1);
         return false;
     }
 
@@ -246,6 +305,7 @@ bool AdsbLol_ParseAircraft(const char *json)
         gAircraftCount = 0;
         cJSON_Delete(root);
         ProviderDiag_ParseResult("adsb.lol", true, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_ADSBLOL, PPOLL_OK_EMPTY, &st, -1);
         return true;
     }
 
@@ -254,10 +314,12 @@ bool AdsbLol_ParseAircraft(const char *json)
         cJSON_Delete(root);
         ProviderDiag_Warning("adsb.lol", "\"ac\" field was present but not an array/null");
         ProviderDiag_ParseResult("adsb.lol", false, 0, 0, 0);
+        ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_ADSBLOL, PPOLL_UNEXPECTED_SHAPE, NULL, -1);
         return false;
     }
 
     int count = cJSON_GetArraySize(ac);
+    st.entries = count;
 
     gAircraftCount = 0; /* the response is valid: replace the previous list */
 
@@ -272,8 +334,14 @@ bool AdsbLol_ParseAircraft(const char *json)
     for (int i = 0; i < count && (gAircraftCount < MAX_AIRCRAFT || pass == 1); i++)
     {
         cJSON *entry = cJSON_GetArrayItem(ac, i);
+        if (pass == 0)
+            examined0++;
         if (!cJSON_IsObject(entry))
+        {
+            if (pass == 0)
+                st.malformed++;
             continue;
+        }
 
         if (pass == 0)
             rawCount++;
@@ -291,7 +359,21 @@ bool AdsbLol_ParseAircraft(const char *json)
             !Aircraft_IsValidPosition(lat->valuedouble, lon->valuedouble))
         {
             if (pass == 0)
+            {
                 rejectedCount++;
+                const char *why;
+                if (!cJSON_IsString(hex)) { st.missingId++; why = "missing hex"; }
+                else if (!cJSON_IsNumber(lat) || !cJSON_IsNumber(lon)) { st.missingPosition++; why = "missing lat/lon"; }
+                else { st.invalidPosition++; why = "lat/lon out of range"; }
+                if (rawDiag && samples < PROVIDER_DIAG_SAMPLES_MAX - 3) /* up to 5 rejected + 3 admitted */
+                {
+                    samples++;
+                    ProviderDiag_Sample("adsb.lol", "#%d rejected (%s): hex=%.12s lat=%s%.4f lon=%s%.4f", i, why,
+                                        cJSON_IsString(hex) ? hex->valuestring : "-",
+                                        cJSON_IsNumber(lat) ? "" : "n/a ", cJSON_IsNumber(lat) ? lat->valuedouble : 0.0,
+                                        cJSON_IsNumber(lon) ? "" : "n/a ", cJSON_IsNumber(lon) ? lon->valuedouble : 0.0);
+                }
+            }
             continue;
         }
 
@@ -401,8 +483,29 @@ bool AdsbLol_ParseAircraft(const char *json)
         if (!VisPolicy_Admit(a, reportedOnGround, pass))
         {
             if (pass == 0)
+            {
                 rejectedCount++;
+                st.onGround++;
+                if (rawDiag && samples < PROVIDER_DIAG_SAMPLES_MAX - 3)
+                {
+                    samples++;
+                    ProviderDiag_Sample("adsb.lol", "#%d on ground (hidden in the airborne pass): hex=%s alt_baro=%s gs=%.1f m/s",
+                                        i, a->icao24, reportedOnGround ? "\"ground\"" : "low", (double)a->velocity);
+                }
+            }
             continue;
+        }
+        if (pass == 1)
+            st.groundShown++;
+        else if (rawDiag && admittedSamples < 3)
+        {
+            admittedSamples++;
+            ProviderDiag_Sample("adsb.lol", "#%d admitted: hex=%s alt_baro=%s%.0f ft -> %.1f m, gs=%s%.1f kn -> %.2f m/s, "
+                                "track=%s%.1f deg true (stored as reported)",
+                                i, a->icao24, cJSON_IsNumber(altBaro) ? "" : "n/a ",
+                                cJSON_IsNumber(altBaro) ? altBaro->valuedouble : 0.0, (double)a->altitude,
+                                cJSON_IsNumber(gs) ? "" : "n/a ", cJSON_IsNumber(gs) ? gs->valuedouble : 0.0,
+                                (double)a->velocity, cJSON_IsNumber(track) ? "" : "n/a ", (double)a->trackTrueDeg);
         }
 
         a->valid = true;
@@ -426,6 +529,10 @@ bool AdsbLol_ParseAircraft(const char *json)
     cJSON_Delete(root);
 
     ProviderDiag_ParseResult("adsb.lol", true, rawCount, gAircraftCount, rejectedCount);
+    st.notExamined = count - examined0;
+    st.admitted = gAircraftCount;
+    ProviderDiag_ParseStats(AIRCRAFT_PROVIDER_ADSBLOL,
+                            st.notExamined > 0 ? PPOLL_OK_PARTIAL : (count ? PPOLL_OK : PPOLL_OK_EMPTY), &st, -1);
 
     return true;
 }

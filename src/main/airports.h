@@ -202,10 +202,23 @@ void Airport_HeliportSegments(int diameter, int seg[3][4]);
  * orientation" and fall back to the plain dot - never draw a guessed axis. */
 bool Airport_ParseRunwayAxis(const char *runwayText, float *axisDegOut);
 
+/* 0.1.3: a user location's "Primary runway / direction" may instead hold a
+ * direction in TRUE degrees, written with exactly 3 digits 000-360 (000 and 360
+ * are the same direction). Same meaning as a built-in airport's Rotation
+ * override: an exact true axis, no magnetic variation added. The axis is the
+ * line through it, so the result is degrees % 180 (090 and 270 give 90).
+ * 1-2 digit text stays a (magnetic) runway designator - see above. False for
+ * anything else (axisDegOut left unchanged). */
+bool Airport_ParseTrueDirection(const char *text, float *axisDegOut);
+/* Form check: empty, a runway designator, or a 3-digit true direction. */
+bool Airport_DirectionTextValid(const char *text);
+
 /* 0.0.32: the runway axis to DRAW, in display degrees (0 = screen up). One
  * rule for the radar and the /airports preview:
  *   - a 1-degree rotation override (view->overrideFields & AIRPORT_OVR_ROTATION)
  *     is an exact TRUE axis;
+ *   - a user location's 3-digit direction (0.1.3, Airport_ParseTrueDirection)
+ *     is also an exact TRUE axis;
  *   - otherwise the axis comes from the runway designator (built-in database
  *     axis / user "Primary runway"), which is MAGNETIC: true = axis + declDeg;
  *   - display = true - rotationDeg (rotationDeg = declination when the radar is

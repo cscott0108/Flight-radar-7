@@ -705,7 +705,7 @@ AirportMarkerMode Airport_EffectiveShape(const AirportMarker *marker, float *axi
     switch (marker->markerMode) {
     case AIRPORT_MARKER_DIRECTIONAL: {
         float axis;
-        if (Airport_ParseRunwayAxis(marker->runway, &axis)) {
+        if (Airport_ParseRunwayAxis(marker->runway, &axis) || Airport_ParseTrueDirection(marker->runway, &axis)) {
             if (axisDegOut)
                 *axisDegOut = axis;
             return AIRPORT_MARKER_DIRECTIONAL;
@@ -778,6 +778,24 @@ bool Airport_ParseRunwayAxis(const char *runwayText, float *axisDegOut)
     return true;
 }
 
+bool Airport_ParseTrueDirection(const char *text, float *axisDegOut)
+{
+    if (!text || !axisDegOut || strlen(text) != 3 || !isdigit((unsigned char)text[0]) ||
+        !isdigit((unsigned char)text[1]) || !isdigit((unsigned char)text[2]))
+        return false;
+    const int deg = (text[0] - '0') * 100 + (text[1] - '0') * 10 + (text[2] - '0');
+    if (deg > 360)
+        return false;
+    *axisDegOut = (float)(deg % 180); /* a runway axis: 000, 180 and 360 are the same line, as are 090 and 270 */
+    return true;
+}
+
+bool Airport_DirectionTextValid(const char *text)
+{
+    float axis;
+    return text && (text[0] == '\0' || Airport_ParseRunwayAxis(text, &axis) || Airport_ParseTrueDirection(text, &axis));
+}
+
 bool Airport_DisplayAxisDeg(const AirportMarker *marker, const AirportBuiltinView *view, float declDeg,
                             float rotationDeg, float *displayAxisOut)
 {
@@ -791,6 +809,8 @@ bool Airport_DisplayAxisDeg(const AirportMarker *marker, const AirportBuiltinVie
         trueAxis = view->axisDeg;                 /* exact true geometry set by the user */
     else if (view && view->hasAxis)
         trueAxis = view->axisDeg + declDeg;       /* database axis: designator (magnetic) */
+    else if (Airport_ParseTrueDirection(marker->runway, &trueAxis))
+        ;                                         /* user location: 3-digit direction (true), as the Rotation override */
     else
         trueAxis = axis + declDeg;                /* user location: designator (magnetic) */
     float d = fmodf(trueAxis - rotationDeg, 360.0f);

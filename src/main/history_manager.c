@@ -1,5 +1,6 @@
 #include "history_manager.h"
 
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -34,6 +35,13 @@ typedef struct {
     uint32_t bucketFingerprint;
     TfHistoryRecord rec;
     bool dirty;
+    /* 0.1.4 call-sign history: a record for this aircraft is stored on the card
+     * (restored by lookup or written by a flush), and the in-RAM record is a NEW
+     * record to append because the call sign changed since then. */
+    bool stored;
+    bool newRecord;
+    char storedCallsign[TF_CALLSIGN_MAX]; /* call sign of the record on the card */
+    uint32_t bkFirstSeen, bkLastSeen, bkSeenCount; /* that record's statistics while a new one is pending */
 } HmSlot;
 
 /* Allocated from PSRAM at Init() time, not declared `static`: a plain
@@ -57,6 +65,13 @@ static _Atomic uint32_t s_flushReq = 0;
 static _Atomic uint32_t s_flushServed = 0;
 static _Atomic uint32_t s_resOk = 0, s_resWritten = 0, s_resFailed = 0, s_resRemaining = 0, s_resReason = 0;
 
+/* 0.1.5 eviction bookkeeping (poll task only; /diag reads it unlocked, informational). */
+static uint32_t s_evictClean, s_evictAfterWrite, s_evictWriteFail, s_admitSkipped;
+/* After a failed eviction write no further synchronous write is attempted until the
+ * next flush pass (which retries every dirty slot anyway): bounds the extra TF work
+ * to one attempt per pass while the card is failing. */
+static bool s_evictWriteBlocked;
+
 bool HistoryManager_Init(void)
 {
     if (!s_slots) {
@@ -69,6 +84,8 @@ bool HistoryManager_Init(void)
         memset(s_slots, 0, sizeof(HmSlot) * HM_CAP);
     }
     s_haveLastSync = false;
+    s_evictClean = s_evictAfterWrite = s_evictWriteFail = s_admitSkipped = 0;
+    s_evictWriteBlocked = false;
 
     UniversalValue_Init(); /* degrades to "no Universal Values" internally on its own PSRAM failure */
 
@@ -81,6 +98,34 @@ bool HistoryManager_Init(void)
     return s_tfReady;
 }
 
+/* 0.1.4: call signs compared without trailing spaces (OpenSky pads to 8 characters,
+ * adsb.lol trims) and not case-sensitive; all-blank = no call sign. */
+static size_t CsLen(const char *cs)
+{
+    size_t n = cs ? strnlen(cs, TF_CALLSIGN_MAX - 1) : 0;
+    while (n && cs[n - 1] == ' ')
+        n--;
+    return n;
+}
+
+static bool SameCs(const char *a, const char *b)
+{
+    const size_t n = CsLen(a);
+    if (n != CsLen(b))
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i]))
+            return false;
+    return true;
+}
+
+static void NoteStored(HmSlot *s)
+{
+    s->stored = true;
+    s->newRecord = false;
+    memcpy(s->storedCallsign, s->rec.callsign, sizeof(s->storedCallsign));
+}
+
 static HmSlot *FindSlot(const char *icao24)
 {
     if (!s_slots)
@@ -91,16 +136,21 @@ static HmSlot *FindSlot(const char *icao24)
     return NULL;
 }
 
-/* Flushes one slot immediately (used when evicting a dirty slot to make
- * room - see AllocSlot). Best-effort: a failure here just means that one
- * update is lost, same as any other unflushed dirty record on power loss
- * (PROMPT.md section 23-24). */
-static void FlushSlotNow(HmSlot *s)
+/* Writes one dirty slot immediately (eviction path - see AllocSlot). True only when
+ * the record is on the card, so the caller may reuse the slot. Nothing is changed on
+ * failure: the slot stays dirty and is retried by the next flush. */
+static bool FlushSlotNow(HmSlot *s)
 {
-    if (s->dirty && s->haveTf && s->bucketFingerprint != TF_BUCKET_RESERVED) {
-        if (TfHistory_Upsert(s->bucketFingerprint, &s->rec))
-            s->dirty = false;
-    }
+    if (!s->dirty)
+        return true;
+    if (s->bucketFingerprint == TF_BUCKET_RESERVED)
+        return false;
+    if (!TfHistory_UpsertRecord(s->bucketFingerprint, &s->rec, s->newRecord))
+        return false;
+    s->dirty = false;
+    s->haveTf = true;
+    NoteStored(s);
+    return true;
 }
 
 static HmSlot *AllocSlot(const char *icao24)
@@ -115,17 +165,40 @@ static HmSlot *AllocSlot(const char *icao24)
             return &s_slots[i];
         }
     }
-    /* Table full: evict the least-recently-seen slot (flushing it first if
-     * dirty) rather than refusing a new, currently-visible aircraft. */
-    size_t oldestIdx = 0;
+    /* Table full (0.1.5). Unsaved history is never dropped to make room:
+     * 1. reuse the least-recently-seen CLEAN slot (its latest state is already on
+     *    the card; a later sighting restores it by lookup);
+     * 2. only if every slot holds unsaved changes, write the least-recently-seen one
+     *    now and reuse it if - and only if - that write succeeded;
+     * 3. otherwise (write failed, TF paused/unavailable) keep every slot and do not
+     *    admit the new aircraft this time: NULL makes Observe skip it; it is still in
+     *    Hot Seen and is offered again on its next poll. */
+    size_t oldestIdx = HM_CAP;
     uint32_t oldestSeen = UINT32_MAX;
     for (size_t i = 0; i < HM_CAP; i++) {
-        if (s_slots[i].rec.lastSeen < oldestSeen) {
+        if (!s_slots[i].dirty && (oldestIdx == HM_CAP || s_slots[i].rec.lastSeen < oldestSeen)) {
             oldestSeen = s_slots[i].rec.lastSeen;
             oldestIdx = i;
         }
     }
-    FlushSlotNow(&s_slots[oldestIdx]);
+    if (oldestIdx < HM_CAP) {
+        s_evictClean++;
+    } else {
+        oldestIdx = 0;
+        for (size_t i = 1; i < HM_CAP; i++)
+            if (s_slots[i].rec.lastSeen < s_slots[oldestIdx].rec.lastSeen)
+                oldestIdx = i;
+        const bool canWrite = !s_evictWriteBlocked && s_tfReady && TfHistory_IsAvailable();
+        if (!canWrite || !FlushSlotNow(&s_slots[oldestIdx])) {
+            if (canWrite) {
+                s_evictWriteFail++;
+                s_evictWriteBlocked = true;
+            }
+            s_admitSkipped++;
+            return NULL; /* every pending record kept */
+        }
+        s_evictAfterWrite++;
+    }
     memset(&s_slots[oldestIdx], 0, sizeof(s_slots[oldestIdx]));
     s_slots[oldestIdx].used = true;
     strncpy(s_slots[oldestIdx].icao24, icao24, TF_ICAO_MAX - 1);
@@ -205,6 +278,7 @@ void HistoryManager_Observe(
                 s->rec = existing; /* restores true firstSeen/seenCount - PROMPT.md section 19 */
                 s->bucketFingerprint = existingBucket;
                 s->haveTf = true;
+                NoteStored(s);
                 restored = true;
             }
         }
@@ -215,6 +289,36 @@ void HistoryManager_Observe(
             s->rec.seenCount = 0;
             s->haveTf = s_tfReady; /* eligible to be created on next flush, even though nothing exists yet */
             s->bucketFingerprint = bucket;
+        }
+    }
+
+    /* 0.1.4 call-sign history: a different (non-empty) call sign than the
+     * record being kept starts a NEW record once a record for this aircraft is
+     * stored, so the stored one is never overwritten with another call sign.
+     * The new record gets its own first seen and Seen count (the stored record
+     * keeps its own; nothing is carried over or merged). Only the call sign
+     * present at a flush is written: several changes within one flush interval
+     * keep the last. A bucket change with the same call sign (reclassification,
+     * or the boot-time UNASSIGNED fallback before Universal Values sync) keeps
+     * the existing move semantics. */
+    if (s->stored && CsLen(callsign) && CsLen(s->storedCallsign)) {
+        if (!SameCs(callsign, s->storedCallsign)) {
+            if (!s->newRecord || !SameCs(callsign, s->rec.callsign)) {
+                if (!s->newRecord) { /* keep the stored record's figures in case it comes back before a flush */
+                    s->bkFirstSeen = s->rec.firstSeen;
+                    s->bkLastSeen = s->rec.lastSeen;
+                    s->bkSeenCount = s->rec.seenCount;
+                }
+                s->rec.firstSeen = (nowUtc > 0) ? (uint32_t)nowUtc : 0;
+                s->rec.lastSeen = 0; /* the visit below counts as this record's first */
+                s->rec.seenCount = 0;
+                s->newRecord = true;
+            }
+        } else if (s->newRecord) { /* A -> B -> A before a flush: still the stored record, no new one */
+            s->rec.firstSeen = s->bkFirstSeen;
+            s->rec.lastSeen = s->bkLastSeen;
+            s->rec.seenCount = s->bkSeenCount;
+            s->newRecord = false;
         }
     }
 
@@ -232,8 +336,10 @@ void HistoryManager_Observe(
     if (s->rec.firstSeen == 0 && nowUtc > 0)
         s->rec.firstSeen = (uint32_t)nowUtc;
 
-    if (callsign && callsign[0])
+    if (CsLen(callsign)) { /* 0.1.4: an all-blank call sign no longer replaces a real one */
+        memset(s->rec.callsign, 0, sizeof(s->rec.callsign));
         strncpy(s->rec.callsign, callsign, TF_CALLSIGN_MAX - 1);
+    }
     s->rec.craftType = (uint8_t)resolution.type;
     s->rec.aircraftType = (uint8_t)resolution.aircraftType;
     s->rec.classificationSource = (uint8_t)resolution.source;
@@ -250,6 +356,7 @@ void HistoryManager_Observe(
 static bool FlushDirtySlots(uint32_t *written, uint32_t *failed, uint32_t *remaining)
 {
     bool wroteAny = false;
+    s_evictWriteBlocked = false; /* this pass retries everything; eviction may try again after it */
     uint32_t t0 = DiagTelemetry_NowMs();
     *written = *failed = *remaining = 0;
     for (size_t i = 0; i < HM_CAP; i++) {
@@ -258,9 +365,10 @@ static bool FlushDirtySlots(uint32_t *written, uint32_t *failed, uint32_t *remai
             continue;
         if (s->bucketFingerprint == TF_BUCKET_RESERVED)
             continue;
-        if (TfHistory_Upsert(s->bucketFingerprint, &s->rec)) {
+        if (TfHistory_UpsertRecord(s->bucketFingerprint, &s->rec, s->newRecord)) {
             s->dirty = false;
             s->haveTf = true;
+            NoteStored(s);
             wroteAny = true;
             (*written)++;
         } else {
@@ -356,6 +464,7 @@ void HistoryManager_TfResume(void)
 {
     /* Ready again only if a TF (re)init really made history available. */
     s_tfReady = (s_slots != NULL) && TfHistory_IsAvailable();
+    s_evictWriteBlocked = false;
 }
 
 bool HistoryManager_IsTfReady(void)
@@ -370,6 +479,11 @@ void HistoryManager_GetStats(HistoryManagerStats *out)
     out->shadowSlotsCap = HM_CAP;
     out->shadowSlotsUsed = 0;
     out->dirtyNow = 0;
+    out->evictClean = s_evictClean;
+    out->evictAfterWrite = s_evictAfterWrite;
+    out->evictWriteFail = s_evictWriteFail;
+    out->admitSkipped = s_admitSkipped;
+    out->evictWriteBlocked = s_evictWriteBlocked;
     if (!s_slots)
         return; /* degraded: no shadow table allocated */
     for (size_t i = 0; i < HM_CAP; i++) {

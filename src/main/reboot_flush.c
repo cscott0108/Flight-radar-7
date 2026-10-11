@@ -6,6 +6,7 @@
 #include "diag_telemetry.h"
 #include "history_manager.h"
 #include "seen_aircraft.h"
+#include "log_capture.h"
 
 static const char *TAG = "REBOOT";
 
@@ -40,6 +41,9 @@ void RebootFlush_BeforeRestart(RebootFlushResult *out)
     }
     if (!r.seenOk)
         ESP_LOGW(TAG, "Seen flush before reboot failed");
+
+    /* 4. 0.1.8: console-log capture (if active this boot): buffered lines + a clean end marker, bounded wait. */
+    LogCapture_Shutdown(REBOOT_LOG_WAIT_MS, "reboot requested");
 
     if (out)
         *out = r;

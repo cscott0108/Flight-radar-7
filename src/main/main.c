@@ -43,6 +43,7 @@
 #include "boot_warmup.h"
 #include "diag_telemetry.h"
 #include "expert_debug.h"
+#include "log_capture.h"
 #include "fr_lv_pool.h"
 #include "idle_maint.h"
 #include "north_ref.h" // 0.0.32: radar north reference / magnetic variation
@@ -550,31 +551,39 @@ static void CreateSelectedInfoRow(void)
     lv_obj_add_flag(selInfoCard, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* HOSTTEST:BEGIN devclock (extracted verbatim by host_tests/clock_ui_test.c) */
+/* 0.1.6: the bottom-bar clock label shows the local time when "Show clock" is on and is hidden
+ * (LV_OBJ_FLAG_HIDDEN: not drawn, takes no space; the label is aligned to the panel centre, so no
+ * other object moves) when it is off. Only the label changes: time keeping, zone and DST are not
+ * touched. The text is compared first, so LVGL is only called when something changed (a minute,
+ * the format or the visibility), and a change from Setup applies on the next UI pass, no reboot. */
+static void ApplyDeviceClock(lv_obj_t *label, char *shown, size_t shownCap, int64_t nowUtc)
+{
+    char text[24];
+    TimeLocal tl;
+    const bool visible = UiPrefs_ClockVisible();
+    const bool known = visible && TimeUtil_ToLocal(nowUtc, &tl);
+    UiPrefs_DeviceClockText(visible, UiPrefs_ClockFormat(), known, known ? tl.hour : 0, known ? tl.minute : 0,
+                            text, sizeof(text));
+    if (strcmp(text, shown) != 0) {
+        snprintf(shown, shownCap, "%s", text);
+        lv_label_set_text(label, text);
+        if (text[0])
+            lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+/* HOSTTEST:END devclock */
+
 /* 0.0.32: device clock (system time, configured zone/DST via time_util, format
  * from Setup) and the version / uptime line. Callers hold the LVGL lock. */
 static void UpdateStatusBarUI(void)
 {
     static char shownClock[24] = "?";
     static uint32_t shownUpMin = UINT32_MAX;
-    if (clockUiLabel) {
-        char text[24] = "";
-        const UiClockFormat fmt = UiPrefs_ClockFormat();
-        TimeLocal tl;
-        if (fmt != UI_CLOCK_OFF) {
-            if (TimeUtil_ToLocal((int64_t)time(NULL), &tl))
-                UiPrefs_FormatClock(fmt, tl.hour, tl.minute, text, sizeof(text));
-            else
-                snprintf(text, sizeof(text), "--:--");
-        }
-        if (strcmp(text, shownClock) != 0) {
-            snprintf(shownClock, sizeof(shownClock), "%s", text);
-            lv_label_set_text(clockUiLabel, text);
-            if (text[0])
-                lv_obj_clear_flag(clockUiLabel, LV_OBJ_FLAG_HIDDEN);
-            else
-                lv_obj_add_flag(clockUiLabel, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+    if (clockUiLabel)
+        ApplyDeviceClock(clockUiLabel, shownClock, sizeof(shownClock), (int64_t)time(NULL));
     if (buildUiLabel) {
         const uint32_t upMin = (uint32_t)(esp_timer_get_time() / 60000000LL);
         if (upMin != shownUpMin) {
@@ -2613,6 +2622,7 @@ void app_main()
     // boot_warmup.h for why this prevents the aircraft TLS AES failure.
     AdvDiag_LoadAtBoot();
     ExpertDebug_LoadAtBoot(); // forensic hooks; registers nothing unless ON
+    LogCapture_LoadAtBoot();  // 0.1.8: console-log capture to TF; allocates/creates nothing unless ON (next-boot setting)
     BootWarmup_Crypto();
 
     // Persistent feature switches + dark mode (NVS "radar"); absent keys keep

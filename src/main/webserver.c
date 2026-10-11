@@ -1034,6 +1034,7 @@ static esp_err_t RootHandler(
         "<p><a href='#features'>Features &amp; appearance</a> &middot; "
         "<a href='/airports'>Airports and Special Air Traffic</a> &middot; "
         "<a href='/diag'>Diagnostics</a></p>"
+        "</header>" /* 0.1.4: closes WebStyle_SendHeadOpen's sticky header: title + section links stay visible */
         "<h3>Wi-Fi</h3>"
         "<p>%s &middot; <a href='/wifi'>Manage saved networks</a></p>"
         "<h3>Radar Settings</h3>"
@@ -1240,13 +1241,15 @@ static esp_err_t RootHandler(
     // constants; the page-specific rules below are the setup form's old layout.
     static const char setupCss[] =
         "body{max-width:720px;margin:.4em auto;padding:0 .8em}h2{margin-top:.4em}h3{margin:.8em 0 .3em}"
+        "header.sk h2{margin:.3em 0 .2em}header.sk p{margin:.2em 0 .3em}" /* 0.1.4 sticky title + section links */
+        "html{scroll-padding-top:7.5em}@media(max-width:640px){html{scroll-padding-top:12em}}"
         "label{display:block;margin:.35em 0}"
         "input[type=number],input[type=text],input[type=password]{width:130px}"
         "small{display:block;margin:1px 0 6px 0}"
         "button{margin:.5em 0;padding:4px 14px}";
 
     if (lengthA > 0 && lengthA < 8192 &&
-        WebStyle_SendHead(req, "Flight Radar Setup", WEBPAGE_SETUP, setupCss) == ESP_OK &&
+        WebStyle_SendHeadOpen(req, "Flight Radar Setup", WEBPAGE_SETUP, setupCss) == ESP_OK &&
         httpd_resp_send_chunk(req, html, lengthA) == ESP_OK &&
         SendTimeZoneFieldset(req) == ESP_OK)
     {

@@ -8,7 +8,7 @@
  *  - min-ever heap (internal / DMA-capable / PSRAM) and up to DT_MAX_STACKS task
  *    stack high-water marks, each stamped when a LOWER value was first observed
  *    (the stamp is as precise as the sampling cadence, normally one poll slice);
- *  - four recurring operations with run/failure/skip counters, last and worst
+ *  - recurring operations (DiagOp) with run/failure/skip counters, last and worst
  *    duration and the last failure retained;
  *  - stamped events, silent unless event logging is enabled (Advanced or Expert
  *    diagnostics active). Never put SSIDs, passwords or tokens in event text. */
@@ -52,6 +52,10 @@ typedef enum {
     DT_OP_OPENSKY_TOKEN,
     DT_OP_SEEN_FLUSH,
     DT_OP_TF_FLUSH,
+    /* 0.1.6: the same aircraft-list fetch as DT_OP_PROVIDER_REFRESH (same call, same start time, same
+     * outcome), split by provider. DT_OP_PROVIDER_REFRESH stays the combined row. */
+    DT_OP_FETCH_OPENSKY,
+    DT_OP_FETCH_ADSBLOL,
     DT_OP_COUNT
 } DiagOp;
 

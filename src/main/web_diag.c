@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 
 #include "adv_diag.h"
+#include "diag_export.h"
 #include "aircraft_provider.h"
 #include "boot_warmup.h"
 #include "expert_debug.h"
@@ -41,10 +42,122 @@
 #include "ui_prefs.h"
 #include "universal_value.h"
 #include "web_util.h"
+#include "log_capture.h"
+#include "web_access.h"
+
+/* ---- 0.1.7: one set of core values per /diag request, shared by the HTML page and the exports ----
+ * Read once at the start of the request (getter copies, nothing is reset or started). The HTML rows that show
+ * these metrics and the JSON "metrics" object both use these values, so the two can never disagree. */
+typedef struct {
+    int64_t uptimeUs;
+    int64_t utc; /* 0 = clock not synchronized */
+    uint32_t intFree, intLargest, intMin;
+    uint32_t dmaFree, dmaLargest, dmaMin;
+    uint32_t psFree, psLargest, psMin;
+    uint32_t httpdStackMin;
+    uint32_t fails, failSize, failCaps;
+    char failTask[20];
+    bool failTimeValid;
+    int64_t failUs;
+    bool minHeapValid[DT_HEAP_COUNT];
+    DiagMinHeap minHeap[DT_HEAP_COUNT];
+    size_t nStacks;
+    DiagMinStack stacks[DT_MAX_STACKS];
+    DiagOpStats ops[DT_OP_COUNT];
+    int aircraft, aircraftMax;
+    TfHistoryStats tf;
+    HistoryManagerStats hm;
+    SeenPersistStats seen;
+    size_t seenCount;
+    LogCaptureStatus logcap; /* 0.1.8 console-log capture */
+    bool havePoll[AIRCRAFT_PROVIDER_COUNT]; /* 0.1.9 latest provider poll */
+    ProviderPollDiag poll[AIRCRAFT_PROVIDER_COUNT];
+    WebIf via;               /* interface this request arrived on (log management is station-only) */
+} DiagCore;
+
+#define LOG_DL_CHUNK 4096
+
+typedef struct {
+    DiagCore core;
+    DiagExport ex;
+    char disposition[96]; /* must outlive the response headers */
+    LogFileInfo logFiles[LOGCAP_FILES_MAX]; /* /diag log list */
+    char chunk[LOG_DL_CHUNK];               /* /diag?log= download buffer (PSRAM, never a stack buffer) */
+} DiagReportCtx;
+
+static DiagReportCtx *s_ctx;     /* PSRAM, allocated on the first /diag request and kept (no churn) */
+static const DiagCore *s_core;   /* valid only while a /diag request is being rendered (single httpd task) */
+static DiagExport *s_export;     /* non-NULL while the page body is being converted for an export */
+
+static void DiagCore_Collect(DiagCore *c)
+{
+    memset(c, 0, sizeof(*c));
+    c->uptimeUs = esp_timer_get_time();
+    const int64_t now = (int64_t)time(NULL);
+    c->utc = TimeUtil_IsSynced(now) ? now : 0;
+    c->intFree = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    c->intLargest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    c->intMin = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    c->dmaFree = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    c->dmaLargest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    c->dmaMin = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    c->psFree = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    c->psLargest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    c->psMin = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    c->httpdStackMin = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    c->fails = ExpertDebug_FailedAllocCount();
+    if (c->fails) {
+        c->failSize = ExpertDebug_LastFailedSize();
+        c->failCaps = ExpertDebug_LastFailedCaps();
+        snprintf(c->failTask, sizeof(c->failTask), "%s", ExpertDebug_LastFailedTask());
+        c->failTimeValid = ExpertDebug_LastFailedUptimeUs(&c->failUs);
+    }
+    for (int k = 0; k < DT_HEAP_COUNT; k++)
+        c->minHeapValid[k] = DiagTelemetry_GetHeap((DiagHeapKind)k, &c->minHeap[k]);
+    c->nStacks = DiagTelemetry_GetStacks(c->stacks, DT_MAX_STACKS);
+    for (int i = 0; i < DT_OP_COUNT; i++)
+        DiagTelemetry_GetOp((DiagOp)i, &c->ops[i]);
+    c->aircraft = gAircraftCount;
+    c->aircraftMax = GetMaxAircraftCountSinceBoot();
+    TfHistory_GetStats(&c->tf);
+    HistoryManager_GetStats(&c->hm);
+    SeenAircraft_GetPersistStats(&c->seen);
+    c->seenCount = SeenAircraft_Count();
+    LogCapture_GetStatus(&c->logcap);
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        c->havePoll[p] = ProviderDiag_GetPoll((AircraftProviderType)p, &c->poll[p]);
+}
+
+/* 0.1.9: a stamp for an uptime second recorded earlier (wall time derived from the snapshot's clock). */
+static DiagStamp CoreStampAt(const DiagCore *c, uint32_t uptimeS)
+{
+    const uint32_t nowS = (uint32_t)(c->uptimeUs / 1000000);
+    DiagStamp st = {uptimeS, 0};
+    if (c->utc > 0 && nowS >= uptimeS)
+        st.utc = c->utc - (int64_t)(nowS - uptimeS);
+    return st;
+}
+
+/* Same rule as DiagTelemetry_NeedsAttention(), on the request's snapshot. */
+static bool CoreNeedsAttention(const DiagCore *c)
+{
+    for (int i = 0; i < DT_OP_COUNT; i++)
+        if (c->ops[i].consecutiveFailures >= DT_ATTENTION_CONSECUTIVE)
+            return true;
+    return false;
+}
+
+/* Every byte of the page goes through here: to the browser, or (export) into the converter. */
+static esp_err_t Emit(httpd_req_t *req, const char *data, size_t len)
+{
+    if (s_export)
+        return DiagExport_Feed(s_export, data, len) ? ESP_OK : ESP_FAIL;
+    return httpd_resp_send_chunk(req, data, (ssize_t)len);
+}
 
 static esp_err_t Send(httpd_req_t *req, const char *value)
 {
-    return httpd_resp_send_chunk(req, value, HTTPD_RESP_USE_STRLEN);
+    return Emit(req, value, strlen(value));
 }
 
 static esp_err_t SendFormat(httpd_req_t *req, const char *format, ...)
@@ -56,7 +169,7 @@ static esp_err_t SendFormat(httpd_req_t *req, const char *format, ...)
     va_end(args);
     if (length < 0 || length >= (int)sizeof(buffer))
         return ESP_FAIL;
-    return httpd_resp_send_chunk(req, buffer, length);
+    return Emit(req, buffer, (size_t)length);
 }
 
 /* Defensive default case: esp_reset_reason_t has gained new members across
@@ -134,6 +247,32 @@ static void FormatUsagePercents(uint64_t used, uint64_t total, char *usedOut, ch
     snprintf(freeOut, cap, "%u.%u%%", freeTenths / 10u, freeTenths % 10u);
 }
 
+/* 0.1.6: "<count>" plus when the latest failure happened. Distinguishes "none since boot" from a
+ * failure whose time could not be read. Read-only: nothing is reset by viewing the page. */
+/* 0.1.7: the wall-clock time of the last failure, derived from the snapshot (0 = not available). */
+static int64_t CoreFailUtc(const DiagCore *c)
+{
+    if (!c->fails || !c->failTimeValid || !c->utc || c->uptimeUs < c->failUs)
+        return 0;
+    return c->utc - (c->uptimeUs - c->failUs) / 1000000;
+}
+
+static void FailedAllocText(char *buf, size_t cap)
+{
+    const uint32_t fails = s_core->fails;
+    const int64_t failUs = s_core->failUs;
+    if (fails == 0) {
+        snprintf(buf, cap, "0 (none since boot)");
+    } else if (!s_core->failTimeValid) {
+        snprintf(buf, cap, "%u; time of the last failure unavailable", (unsigned)fails);
+    } else {
+        DiagStamp st = {(uint32_t)(failUs / 1000000), CoreFailUtc(s_core)};
+        char when[64];
+        DiagTelemetry_FormatStampLocal(&st, when, sizeof(when));
+        snprintf(buf, cap, "%u; last at %s", (unsigned)fails, when);
+    }
+}
+
 static esp_err_t Row(httpd_req_t *req, const char *label, const char *value, const char *evidence)
 {
     return SendFormat(req,
@@ -146,8 +285,7 @@ static esp_err_t Row(httpd_req_t *req, const char *label, const char *value, con
  * derived (finish - duration). "Last success" appears only while the latest run is a failure. */
 static esp_err_t OpTimingRows(httpd_req_t *req, DiagOp op, const char *lastLabel, bool withCounts)
 {
-    DiagOpStats o;
-    DiagTelemetry_GetOp(op, &o);
+    const DiagOpStats o = s_core->ops[op];
     char buf[360]; /* room for an escaped failure reason (up to 6x its length) plus the fixed text */
     if (withCounts) {
         snprintf(buf, sizeof(buf), "%u / %u / %u", (unsigned)o.runs, (unsigned)o.failures, (unsigned)o.skipped);
@@ -191,6 +329,7 @@ static esp_err_t GroupClose(httpd_req_t *req)
 }
 
 static esp_err_t SendDiagNotice(httpd_req_t *req, const char *anchor, const char *text);
+static esp_err_t LogForbidden(httpd_req_t *req, WebIf via);
 
 // ---- Debugging (serial-log switches; take effect immediately, persisted in NVS) ----
 // One place for both OpenSky field logging and provider diagnostics (they used to live
@@ -207,16 +346,23 @@ static esp_err_t DebugSection(httpd_req_t *req)
         "<p class='ev'>Dumps every field OpenSky returns for the Selected Craft aircraft to the serial console on each poll.</p>"
         "<label>Provider diagnostics <select name='pdbg'>"
         "<option value='OFF'%s>Off</option><option value='NORMAL'%s>Normal</option>"
-        "<option value='VERBOSE'%s>Verbose</option><option value='RAW'%s>Raw</option></select></label>"
-        "<p class='ev'>Off: nothing. Normal: request/response status and counts. Verbose: adds per-aircraft type resolution. "
-        "Raw: adds a bounded, credential-redacted response preview. Applies to every enabled provider.</p>"
-        "<button type='submit'>Save debugging settings</button></form>",
+        "<option value='VERBOSE'%s>Verbose</option><option value='RAW'%s>Raw</option></select></label>",
         GetRadarOpenSkyDebugEnabled() ? " checked" : "",
         lvl == PROVIDER_DEBUG_OFF ? " selected" : "", lvl == PROVIDER_DEBUG_NORMAL ? " selected" : "",
         lvl == PROVIDER_DEBUG_VERBOSE ? " selected" : "", lvl == PROVIDER_DEBUG_RAW ? " selected" : "");
     if (n <= 0 || n >= (int)sizeof(form))
         return ESP_FAIL;
-    return Send(req, form);
+    if (Send(req, form) != ESP_OK)
+        return ESP_FAIL;
+    return Send(req,
+        "<p class='ev'>Off: no optional provider output. Normal: request start/done lines with request number and "
+        "elapsed time, response status and counts, request failures (timeout, connect/TLS with the esp-tls code, "
+        "incomplete, truncated, HTTP status) and the adsb.lol heap figures before its TLS session. Verbose: adds "
+        "per-aircraft type resolution, request detail and the parse stages (malformed, no id, no position, bad "
+        "position, on ground, not examined). Raw: adds a bounded, credential-redacted response preview and up to 8 "
+        "record samples per poll. Applies to every enabled provider; the latest poll of each is also under "
+        "<a href='#provpoll'>Provider last poll</a>, whatever the level.</p>"
+        "<button type='submit'>Save debugging settings</button></form>");
 }
 
 // ---- Expert Debug Mode (forensic; persistent NVS toggle, effective after reboot) ----
@@ -238,9 +384,9 @@ static esp_err_t ExpertSection(httpd_req_t *req)
             saved != active ? "NVS - reboot required to apply" : "NVS") != ESP_OK) return ESP_FAIL;
     if (active)
     {
-        snprintf(buf, sizeof(buf), "%u", (unsigned)ExpertDebug_FailedAllocCount());
+        FailedAllocText(buf, sizeof(buf));
         if (Row(req, "Failed heap allocations since boot", buf,
-                "Counted by the FAILED_ALLOC hook (details on the serial console)") != ESP_OK) return ESP_FAIL;
+                "Counted by the FAILED_ALLOC hook (details on the serial console); time as in Memory / Resources") != ESP_OK) return ESP_FAIL;
     }
     if (Send(req, "</table>") != ESP_OK)
         return ESP_FAIL;
@@ -354,12 +500,20 @@ static esp_err_t AdvancedPost(httpd_req_t *req)
     }
     bool enable = httpd_query_key_value(body, "enable", val, sizeof(val)) == ESP_OK && val[0] == '1';
     bool reboot = httpd_query_key_value(body, "reboot", val, sizeof(val)) == ESP_OK && val[0] == '1';
-    // Same endpoint serves both persistent diagnostic modes; no extra httpd slot.
-    bool expert = httpd_query_key_value(body, "mode", val, sizeof(val)) == ESP_OK && strcmp(val, "expert") == 0;
-    const char *modeName = expert ? "Expert Debug Mode" : "Advanced Diagnostics";
-    const char *anchor = expert ? "expert" : "advanced";
+    // Same endpoint serves all persistent diagnostic modes; no extra httpd slot.
+    char mode[16] = "";
+    (void)httpd_query_key_value(body, "mode", mode, sizeof(mode));
+    const bool expert = strcmp(mode, "expert") == 0;
+    const bool logcap = strcmp(mode, "logcap") == 0; /* 0.1.8: save console logs to TF card */
+    const char *modeName = logcap ? "Save Console Logs to TF Card" : expert ? "Expert Debug Mode" : "Advanced Diagnostics";
+    const char *anchor = logcap ? "logs" : expert ? "expert" : "advanced";
+    if (logcap) {
+        const WebIf via = WebAccess_RequestInterface(req);
+        if (via != WEBIF_STATION)
+            return LogForbidden(req, via);
+    }
 
-    if ((expert ? ExpertDebug_SetSaved(enable) : AdvDiag_SetSaved(enable)) != ESP_OK)
+    if ((logcap ? LogCapture_SetSaved(enable) : expert ? ExpertDebug_SetSaved(enable) : AdvDiag_SetSaved(enable)) != ESP_OK)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save setting");
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -457,12 +611,10 @@ static esp_err_t StepRow(httpd_req_t *req, const char *label, const TfStepInfo *
 
 static esp_err_t TfSection(httpd_req_t *req)
 {
-    TfHistoryStats tf;
-    TfHistory_GetStats(&tf);
+    const TfHistoryStats tf = s_core->tf;
     TfInitInfo in;
     TfHistory_GetInitInfo(&in);
-    HistoryManagerStats hm;
-    HistoryManager_GetStats(&hm);
+    const HistoryManagerStats hm = s_core->hm;
     char buf[160];
     char esc[192];
 
@@ -571,6 +723,17 @@ static esp_err_t TfSection(httpd_req_t *req)
 
     snprintf(buf, sizeof(buf), "%u / %u (%u dirty)", (unsigned)hm.shadowSlotsUsed, (unsigned)hm.shadowSlotsCap, (unsigned)hm.dirtyNow);
     if (Row(req, "History Manager RAM shadow slots / cap", buf, "Measured / Calculated (one slot per currently-tracked aircraft, not the archive)") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%u clean, %u after a successful write", (unsigned)hm.evictClean, (unsigned)hm.evictAfterWrite);
+    if (Row(req, "History Manager slot reuse (since boot)", buf,
+            "Counted (0.1.5). A full shadow table reuses the least-recently-seen slot whose state is already on the card; "
+            "only if every slot has unsaved changes is the oldest written first. Unsaved history is never dropped") != ESP_OK) return ESP_FAIL;
+    snprintf(buf, sizeof(buf), "%s%u failed write%s, %u new aircraft not admitted%s",
+             (hm.evictWriteFail || hm.admitSkipped) ? "ATTENTION: " : "", (unsigned)hm.evictWriteFail,
+             hm.evictWriteFail == 1 ? "" : "s", (unsigned)hm.admitSkipped, hm.evictWriteBlocked ? " (waiting for the next flush)" : "");
+    if (Row(req, "History pending protection (since boot)", buf,
+            "Counted (0.1.5). All slots held unsaved changes and the card could not take the oldest (write error, full, "
+            "paused or unavailable): every pending record was kept for the next flush and the new aircraft was left to "
+            "Hot Seen until a slot frees. 0 = never happened") != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u bytes", (unsigned)(hm.shadowSlotsCap * (unsigned)(sizeof(TfHistoryRecord) + 16)));
     if (Row(req, "History Manager allocation (PSRAM heap, approx.)", buf, "Calculated") != ESP_OK) return ESP_FAIL;
     if (Send(req, "</table>") != ESP_OK)
@@ -711,8 +874,8 @@ static esp_err_t MinTimingSection(httpd_req_t *req)
         return ESP_FAIL;
     static const char *const kHeapName[DT_HEAP_COUNT] = {"Internal heap min-free", "DMA-capable internal min-free", "PSRAM min-free"};
     for (int k = 0; k < DT_HEAP_COUNT; k++) {
-        DiagMinHeap h;
-        if (DiagTelemetry_GetHeap((DiagHeapKind)k, &h)) {
+        const DiagMinHeap h = s_core->minHeap[k];
+        if (s_core->minHeapValid[k]) {
             snprintf(buf, sizeof(buf), "%u bytes", (unsigned)h.minFree);
             DiagTelemetry_FormatStampLocal(&h.when, when, sizeof(when));
         } else {
@@ -721,8 +884,8 @@ static esp_err_t MinTimingSection(httpd_req_t *req)
         }
         if (Row(req, kHeapName[k], buf, when) != ESP_OK) return ESP_FAIL;
     }
-    DiagMinStack st[DT_MAX_STACKS];
-    size_t n = DiagTelemetry_GetStacks(st, DT_MAX_STACKS);
+    const DiagMinStack *st = s_core->stacks;
+    const size_t n = s_core->nStacks;
     for (size_t i = 0; i < n; i++) {
         char label[48];
         snprintf(label, sizeof(label), "Stack min-free: %s", st[i].name);
@@ -736,9 +899,7 @@ static esp_err_t MinTimingSection(httpd_req_t *req)
 /* 0.0.32: the device's local time when this snapshot was generated. */
 static esp_err_t LocalTimeRow(httpd_req_t *req)
 {
-    DiagStamp now = {(uint32_t)(esp_timer_get_time() / 1000000), 0};
-    const int64_t t = (int64_t)time(NULL);
-    now.utc = TimeUtil_IsSynced(t) ? t : 0;
+    const DiagStamp now = {(uint32_t)(s_core->uptimeUs / 1000000), s_core->utc};
     char text[64];
     DiagTelemetry_FormatStampLocal(&now, text, sizeof(text));
     return Row(req, "Local time (this snapshot)", text,
@@ -808,8 +969,7 @@ static esp_err_t OpsSection(httpd_req_t *req)
                   "<th>Last run (start &rarr; finish)</th><th>Result</th><th>Worst run</th><th>Last failure</th></tr>") != ESP_OK)
         return ESP_FAIL;
     for (int i = 0; i < DT_OP_COUNT; i++) {
-        DiagOpStats o;
-        DiagTelemetry_GetOp((DiagOp)i, &o);
+        const DiagOpStats o = s_core->ops[i];
         char when[80], last[160], run[200], worst[200], result[160];
         if (o.haveFailure) {
             DiagTelemetry_FormatStampLocal(&o.lastFailureWhen, when, sizeof(when));
@@ -836,8 +996,22 @@ static esp_err_t OpsSection(httpd_req_t *req)
                          (unsigned)o.consecutiveFailures, when);
             }
         }
+        /* 0.1.6 per-provider fetch rows: say whether the provider is enabled now (and any 429 backoff),
+         * so an empty row reads as "disabled / not used yet", not as a fault. */
+        char name[112];
+        if (i == DT_OP_FETCH_OPENSKY || i == DT_OP_FETCH_ADSBLOL) {
+            const AircraftProviderType pt = i == DT_OP_FETCH_OPENSKY ? AIRCRAFT_PROVIDER_OPENSKY : AIRCRAFT_PROVIDER_ADSBLOL;
+            const uint32_t backoff = AircraftProvider_GetRateLimitSecondsFor(pt);
+            char bo[48] = "";
+            if (backoff)
+                snprintf(bo, sizeof(bo), ", rate-limit backoff %u s", (unsigned)backoff);
+            snprintf(name, sizeof(name), "%s<br><small>%s%s</small>", DiagTelemetry_OpName((DiagOp)i),
+                     AircraftProvider_IsEnabled(pt) ? "enabled" : (o.runs || o.skipped ? "disabled now" : "disabled"), bo);
+        } else {
+            snprintf(name, sizeof(name), "%s", DiagTelemetry_OpName((DiagOp)i));
+        }
         /* Two sends: each stays well inside SendFormat's 512-byte buffer even with both ends dated. */
-        if (SendFormat(req, "<tr><td>%s</td><td>%u / %u / %u</td><td>%s</td>", DiagTelemetry_OpName((DiagOp)i),
+        if (SendFormat(req, "<tr><td>%s</td><td>%u / %u / %u</td><td>%s</td>", name,
                        (unsigned)o.runs, (unsigned)o.failures, (unsigned)o.skipped, run) != ESP_OK ||
             SendFormat(req, "<td>%s</td><td>%s</td><td class='ev'>%s</td></tr>", result, worst, last) != ESP_OK)
             return ESP_FAIL;
@@ -846,7 +1020,12 @@ static esp_err_t OpsSection(httpd_req_t *req)
                      "(to the second). A skipped run is one that could not start (rate-limit backoff, TF unavailable); "
                      "it is not a failure. History flush only counts passes that had entries to write. "
                      "ATTENTION appears after 3 failures in a row and clears on the next success. "
-                     "The Seen and History flush rows are repeated in Storage / History next to their other metrics.</p>");
+                     "The Seen and History flush rows are repeated in Storage / History next to their other metrics. "
+                     "OpenSky fetch and adsb.lol fetch are the Provider refresh measurements split by provider (the same "
+                     "aircraft-list request, timed from start to response); Provider refresh stays the combined row. "
+                     "The OAuth token row is OpenSky only (adsb.lol needs no token). HTTP status, response size and "
+                     "parse counts are not stored: they are written to the serial log when Provider diagnostics "
+                     "(Debugging) is NORMAL or higher.</p>");
 }
 
 // Manual flush section (Storage group): saves pending Hot Seen changes and asks the poll task to write
@@ -895,10 +1074,295 @@ static esp_err_t FlushAction(httpd_req_t *req)
     return SendDiagNotice(req, "flush", msg);
 }
 
-// POST /diag/tf  act=selftest | unmount | reinit | reboot | flush  (one handler slot for all)
+/* ---- 0.1.8: Console logs on the TF card (status for everyone; files, downloads, deletion and the setting only
+ * for requests that arrived on the station interface - see web_access.h) ---- */
+static const char LOG_STATION_ONLY[] =
+    "Console-log files, downloads, deletion and the capture setting are available only from your own Wi-Fi network. "
+    "This request arrived via %s, which anyone nearby can join without a password, so they are hidden here.";
+
+static esp_err_t LogSection(httpd_req_t *req)
+{
+    const LogCaptureStatus *st = &s_core->logcap;
+    char buf[200], ev[160];
+    if (Send(req, "<h3 id='logs'>Console logs on TF card</h3>"
+                  "<p class='ev'>Optional copy of the serial console (ESP_LOGx lines) written to /sdcard/" LOGCAP_DIR_NAME
+                  "/ on the TF card. Off by default; changing it takes effect after a reboot. Serial output is unchanged. "
+                  "Passwords, tokens, authorization headers, SSIDs/BSSIDs and the decimals of coordinates are masked "
+                  "in the saved copy.</p>"
+                  "<table><tr><th>Item</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
+        return ESP_FAIL;
+    if (Row(req, "Saved setting (next boot)", st->saved ? "ON" : "OFF",
+            st->saved != st->active ? "NVS diag/logcap - reboot required to apply" : "NVS diag/logcap") != ESP_OK)
+        return ESP_FAIL;
+    if (st->active) {
+        if (Row(req, "Active this boot", "ON", "Read once from NVS at boot") != ESP_OK) return ESP_FAIL;
+    } else {
+        snprintf(buf, sizeof(buf), "OFF - %s", st->inactiveReason ? st->inactiveReason : "");
+        if (Row(req, "Active this boot", buf, "No buffer, task or hook exists while off") != ESP_OK) return ESP_FAIL;
+    }
+    if (st->active) {
+        const LogCapCounters *k = &st->ctr;
+        snprintf(buf, sizeof(buf), "%s%s%s", LogWriterState_Name(st->state), st->reason[0] ? " - " : "", st->reason);
+        if (Row(req, "Writer state", buf, "Writer task LogWr") != ESP_OK) return ESP_FAIL;
+        if (st->file[0])
+            snprintf(buf, sizeof(buf), "%s (%u bytes; boot %u, segment %u)", st->file, (unsigned)st->fileSize,
+                     (unsigned)st->boot, (unsigned)st->seg);
+        else
+            snprintf(buf, sizeof(buf), "none yet (boot %u)", (unsigned)st->boot);
+        if (Row(req, "Current file", buf, "L&lt;boot&gt;&lt;segment&gt;.LOG") != ESP_OK) return ESP_FAIL;
+        snprintf(buf, sizeof(buf), "%u of %u bytes used now, high water %u", (unsigned)st->ringUsed,
+                 (unsigned)st->ringSize, (unsigned)st->ringHighWater);
+        if (Row(req, "Capture buffer (PSRAM)", buf, "Measured") != ESP_OK) return ESP_FAIL;
+        snprintf(buf, sizeof(buf), "%u lines, %u bytes", (unsigned)k->lines, (unsigned)k->bytes);
+        if (Row(req, "Captured since boot", buf, "Counted by the log hook") != ESP_OK) return ESP_FAIL;
+        snprintf(buf, sizeof(buf), "buffer full: %u lines (%u bytes); logger busy: %u; interrupt/scheduler context: %u; "
+                 "TF lock held by the logging task: %u",
+                 (unsigned)k->dropFullLines, (unsigned)k->dropFullBytes, (unsigned)k->dropBusyLines,
+                 (unsigned)k->dropContextLines, (unsigned)k->dropLockLines);
+        if (Row(req, "Dropped lines", buf, "Each gap is also marked in the file (=== DROPPED ...)") != ESP_OK) return ESP_FAIL;
+        snprintf(buf, sizeof(buf), "%u truncated (over %u chars), %u redactions, %u writer-own lines not saved",
+                 (unsigned)k->truncated, (unsigned)(LOGCAP_LINE_MAX - 1), (unsigned)k->redactions, (unsigned)k->ownLines);
+        if (Row(req, "Line handling", buf, "Counted by the log hook") != ESP_OK) return ESP_FAIL;
+        snprintf(buf, sizeof(buf), "%u writes, %llu bytes; %u write errors, %u close errors, %u lock timeouts",
+                 (unsigned)st->writes, (unsigned long long)st->bytesWritten, (unsigned)st->writeErrors,
+                 (unsigned)st->closeErrors, (unsigned)st->lockTimeouts);
+        if (Row(req, "Card writes", buf, "Writer task") != ESP_OK) return ESP_FAIL;
+        snprintf(buf, sizeof(buf), "%u files created, %u deleted by retention, %u retention failures, %u interrupted logs "
+                 "marked, %u space suspensions", (unsigned)st->filesCreated, (unsigned)st->filesDeleted,
+                 (unsigned)st->retentionFailures, (unsigned)st->interruptedMarked, (unsigned)st->spaceSuspends);
+        if (Row(req, "Files / retention", buf, "Writer task") != ESP_OK) return ESP_FAIL;
+        if (st->deferring)
+            snprintf(buf, sizeof(buf), "DEFERRING NOW since uptime %u s (largest DMA block %u B); %u cycles in %u episodes; longest %u s",
+                     (unsigned)st->deferStartS, (unsigned)st->lastDeferDmaBytes, (unsigned)st->deferredCycles,
+                     (unsigned)st->deferEpisodes, (unsigned)st->longestDeferS);
+        else
+            snprintf(buf, sizeof(buf), "%u cycles in %u episodes; longest %u s", (unsigned)st->deferredCycles,
+                     (unsigned)st->deferEpisodes, (unsigned)st->longestDeferS);
+        snprintf(ev, sizeof(ev), "A write cycle (about every 5 s) waits while the largest internal DMA block is below %u B",
+                 (unsigned)LOGCAP_DMA_MIN_BYTES);
+        if (Row(req, "Card-write deferrals (DMA memory)", buf, ev) != ESP_OK) return ESP_FAIL;
+        if (st->haveFreeBytes)
+            snprintf(buf, sizeof(buf), "%llu MiB", (unsigned long long)(st->lastFreeBytes / (1024u * 1024u)));
+        else
+            snprintf(buf, sizeof(buf), "not checked yet");
+        if (Row(req, "Card free space (last check)", buf, "Checked before each new file and every 64 writes") != ESP_OK) return ESP_FAIL;
+        if (st->lastError[0])
+            snprintf(buf, sizeof(buf), "%s (uptime %u s)", st->lastError, (unsigned)st->lastErrorUptimeS);
+        else
+            snprintf(buf, sizeof(buf), "none");
+        if (Row(req, "Last error", buf, "Writer task") != ESP_OK) return ESP_FAIL;
+        if (st->writerStackMinBytes)
+            snprintf(buf, sizeof(buf), "%u bytes", (unsigned)st->writerStackMinBytes);
+        else
+            snprintf(buf, sizeof(buf), "not measured yet");
+        if (Row(req, "Writer stack minimum free", buf, "4096-byte internal stack, measured by the task") != ESP_OK) return ESP_FAIL;
+    }
+    snprintf(ev, sizeof(ev), "Oldest files are deleted first; the file being written or downloaded never is");
+    if (Row(req, "Limits", "1 MiB per file; 32 MiB and 64 files in total; writing pauses below 64 MiB free card space", ev) != ESP_OK)
+        return ESP_FAIL;
+    if (Row(req, "Not captured", "bootloader and early boot (before the hook), panic/crash output, esp_rom_printf lines "
+                                 "(including FAILED_ALLOC: a summary line is written instead), LVGL printf warnings",
+            "By design") != ESP_OK)
+        return ESP_FAIL;
+    if (Send(req, "</table>") != ESP_OK)
+        return ESP_FAIL;
+
+    if (s_core->via != WEBIF_STATION) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), LOG_STATION_ONLY, WebIf_Name(s_core->via));
+        return SendFormat(req, "<p><b>%s</b></p>", msg);
+    }
+
+    /* ---- file list (newest first) ---- */
+    size_t n = 0, total = 0;
+    const LogFileResult lr = LogCapture_ListFiles(s_ctx->logFiles, LOGCAP_FILES_MAX, &n, &total);
+    if (lr != LOGF_OK) {
+        if (SendFormat(req, "<p>Log files: unavailable (%s).</p>", LogFileResult_Text(lr)) != ESP_OK)
+            return ESP_FAIL;
+    } else {
+        LogFileInfo *f = s_ctx->logFiles;
+        for (size_t i = 1; i < n; i++) { /* insertion sort, descending name = newest boot/segment first */
+            LogFileInfo t = f[i];
+            size_t j = i;
+            for (; j > 0 && strcmp(f[j - 1].name, t.name) < 0; j--)
+                f[j] = f[j - 1];
+            f[j] = t;
+        }
+        uint64_t bytes = 0;
+        for (size_t i = 0; i < n; i++)
+            bytes += f[i].size;
+        if (SendFormat(req, "<h4>Log files (%u%s, %llu bytes)</h4>", (unsigned)total,
+                       total > n ? " - list shows the first 64" : "", (unsigned long long)bytes) != ESP_OK)
+            return ESP_FAIL;
+        if (n && Send(req, "<table><tr><th>File</th><th>Size</th><th>Modified</th><th>Action</th></tr>") != ESP_OK)
+            return ESP_FAIL;
+        for (size_t i = 0; i < n; i++) {
+            char when[40] = "unknown";
+            TimeLocal tl;
+            if (f[i].mtime > 1577836800 && TimeUtil_ToLocal(f[i].mtime, &tl)) /* after 2020: the clock was set */
+                snprintf(when, sizeof(when), "%04d-%02d-%02d %02d:%02d", tl.year, tl.month, tl.day, tl.hour, tl.minute);
+            const bool active = st->active && strcmp(st->file, f[i].name) == 0;
+            if (SendFormat(req, "<tr><td><a href='/diag?log=%s'>%s</a></td><td>%u</td><td>%s</td><td>", f[i].name,
+                           f[i].name, (unsigned)f[i].size, when) != ESP_OK)
+                return ESP_FAIL;
+            if (active) {
+                if (Send(req, "being written (download shows it up to now)") != ESP_OK)
+                    return ESP_FAIL;
+            } else if (SendFormat(req, "<form method='POST' action='/diag/tf' style='display:inline'>"
+                                       "<input type='hidden' name='act' value='logdel'>"
+                                       "<input type='hidden' name='name' value='%s'>"
+                                       "<label><input type='checkbox' name='confirm' value='1' required> confirm</label> "
+                                       "<button type='submit'>Delete</button></form>", f[i].name) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            if (Send(req, "</td></tr>") != ESP_OK)
+                return ESP_FAIL;
+        }
+        if (n && Send(req, "</table>") != ESP_OK)
+            return ESP_FAIL;
+        if (n && Send(req, "<form method='POST' action='/diag/tf'><input type='hidden' name='act' value='logclr'>"
+                           "<label><input type='checkbox' name='confirm' value='1' required> I want to delete every "
+                           "console-log file</label> <button type='submit'>Delete all log files</button></form>"
+                           "<p class='ev'>Deletes only " LOGCAP_DIR_NAME "/L*.LOG files; the file being written or "
+                           "downloaded is kept. Seen, History and other card data are never touched.</p>") != ESP_OK)
+            return ESP_FAIL;
+    }
+
+    char form[480];
+    snprintf(form, sizeof(form),
+             "<form method='POST' action='/diag/advanced'>"
+             "<input type='hidden' name='mode' value='logcap'>"
+             "<input type='hidden' name='enable' value='%d'>"
+             "<button type='submit' name='reboot' value='0'>%s console-log saving (reboot later)</button> "
+             "<button type='submit' name='reboot' value='1'>%s and reboot now</button>"
+             "</form>",
+             st->saved ? 0 : 1, st->saved ? "Disable" : "Enable", st->saved ? "Disable" : "Enable");
+    return Send(req, form);
+}
+
+static int LogResultStatus(LogFileResult r, const char **status)
+{
+    switch (r) {
+    case LOGF_OK: *status = "200 OK"; return 200;
+    case LOGF_BAD_NAME: *status = "400 Bad Request"; return 400;
+    case LOGF_NOT_FOUND: *status = "404 Not Found"; return 404;
+    case LOGF_ACTIVE:
+    case LOGF_IN_USE: *status = "409 Conflict"; return 409;
+    case LOGF_BUSY:
+    case LOGF_NO_CARD: *status = "503 Service Unavailable"; return 503;
+    default: *status = "500 Internal Server Error"; return 500;
+    }
+}
+
+static esp_err_t LogForbidden(httpd_req_t *req, WebIf via)
+{
+    char msg[320];
+    snprintf(msg, sizeof(msg), LOG_STATION_ONLY, WebIf_Name(via));
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    return httpd_resp_sendstr(req, msg);
+}
+
+/* GET /diag?log=NAME: stream one console-log file in 4 KB pieces. Each piece is read under the storage lock and the
+ * lock is released before it is sent. The file is pinned (retention will not delete it) until the end. The size is
+ * fixed when the download starts; lines the writer appends after that are not included. */
+static esp_err_t LogDownload(httpd_req_t *req, const char *name)
+{
+    const WebIf via = WebAccess_RequestInterface(req);
+    if (via != WEBIF_STATION)
+        return LogForbidden(req, via);
+    uint32_t size = 0;
+    LogFileResult r = LogCapture_DownloadBegin(name, &size);
+    if (r != LOGF_OK) {
+        const char *status;
+        (void)LogResultStatus(r, &status);
+        char msg[120];
+        snprintf(msg, sizeof(msg), "Log file not available: %s.", LogFileResult_Text(r));
+        httpd_resp_set_status(req, status);
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_sendstr(req, msg);
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    snprintf(s_ctx->disposition, sizeof(s_ctx->disposition), "attachment; filename=\"fr7-%s\"", name);
+    httpd_resp_set_hdr(req, "Content-Disposition", s_ctx->disposition);
+
+    esp_err_t res = ESP_OK;
+    uint32_t off = 0;
+    while (off < size) {
+        const size_t want = size - off < LOG_DL_CHUNK ? size - off : LOG_DL_CHUNK;
+        size_t got = 0;
+        r = LogCapture_DownloadRead(name, off, s_ctx->chunk, want, &got);
+        for (int retry = 0; r == LOGF_BUSY && retry < 3; retry++) { /* bounded: 3 more tries, 200 ms apart */
+            vTaskDelay(pdMS_TO_TICKS(200));
+            r = LogCapture_DownloadRead(name, off, s_ctx->chunk, want, &got);
+        }
+        if (r != LOGF_OK || got == 0) {
+            char note[160];
+            const int k = snprintf(note, sizeof(note), "\n=== DOWNLOAD INCOMPLETE: stopped at byte %u of %u (%s) ===\n",
+                                   (unsigned)off, (unsigned)size, r != LOGF_OK ? LogFileResult_Text(r) : "file ended early");
+            res = httpd_resp_send_chunk(req, note, k);
+            break;
+        }
+        if (httpd_resp_send_chunk(req, s_ctx->chunk, (ssize_t)got) != ESP_OK) {
+            res = ESP_FAIL; /* client gone */
+            break;
+        }
+        off += (uint32_t)got;
+    }
+    LogCapture_DownloadEnd();
+    if (res != ESP_OK)
+        return ESP_FAIL;
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/* POST /diag/tf act=logdel name=NAME confirm=1 | act=logclr confirm=1 */
+static esp_err_t LogDeleteAction(httpd_req_t *req, const char *body, bool all)
+{
+    const WebIf via = WebAccess_RequestInterface(req);
+    if (via != WEBIF_STATION)
+        return LogForbidden(req, via);
+    char val[16];
+    if (httpd_query_key_value(body, "confirm", val, sizeof(val)) != ESP_OK || strcmp(val, "1") != 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return SendDiagNotice(req, "logs", "Nothing deleted: tick the confirmation box first.");
+    }
+    char msg[200];
+    LogFileResult r;
+    if (all) {
+        uint32_t deleted = 0, skipped = 0;
+        r = LogCapture_DeleteAll(&deleted, &skipped);
+        if (r == LOGF_OK)
+            snprintf(msg, sizeof(msg), "Deleted %u console-log file%s; %u kept (being written or downloaded).",
+                     (unsigned)deleted, deleted == 1 ? "" : "s", (unsigned)skipped);
+        else
+            snprintf(msg, sizeof(msg), "Delete all: %u deleted, %u kept, then stopped: %s.", (unsigned)deleted,
+                     (unsigned)skipped, LogFileResult_Text(r));
+        DiagTelemetry_Event("Console logs: delete all -> %u deleted, %u kept (%s)", (unsigned)deleted, (unsigned)skipped,
+                            LogFileResult_Text(r));
+    } else {
+        char name[16] = "";
+        (void)httpd_query_key_value(body, "name", name, sizeof(name));
+        r = LogCapture_Delete(name);
+        if (!LogCap_ValidName(name))
+            snprintf(msg, sizeof(msg), "Nothing deleted: %s.", LogFileResult_Text(r));
+        else if (r == LOGF_OK)
+            snprintf(msg, sizeof(msg), "Deleted %s.", name);
+        else
+            snprintf(msg, sizeof(msg), "%s was not deleted: %s.", name, LogFileResult_Text(r));
+        if (LogCap_ValidName(name))
+            DiagTelemetry_Event("Console logs: delete %s -> %s", name, LogFileResult_Text(r));
+    }
+    const char *status;
+    if (LogResultStatus(r, &status) != 200)
+        httpd_resp_set_status(req, status);
+    return SendDiagNotice(req, "logs", msg);
+}
+
+// POST /diag/tf  act=selftest | unmount | reinit | reboot | flush | logdel | logclr  (one handler slot for all)
 static esp_err_t TfActionPost(httpd_req_t *req)
 {
-    char body[48] = {0};
+    char body[96] = {0};
     int total = 0;
     if (req->content_len >= sizeof(body))
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Form too large");
@@ -940,6 +1404,8 @@ static esp_err_t TfActionPost(httpd_req_t *req)
 
     if (strcmp(act, "flush") == 0)
         return FlushAction(req);
+    if (strcmp(act, "logdel") == 0 || strcmp(act, "logclr") == 0)
+        return LogDeleteAction(req, body, act[3] == 'c');
 
     if (strcmp(act, "selftest") == 0)
     {
@@ -967,14 +1433,110 @@ static esp_err_t TfActionPost(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
-static esp_err_t DiagPage(httpd_req_t *req)
+/* ---- 0.1.9: latest poll per provider, side by side (values from s_core; the exports use the same values) ---- */
+static esp_err_t ProviderPollSection(httpd_req_t *req)
 {
-    /* Directly URL-accessible (/diag); intentionally not one of the nav pages. */
-    if (WebStyle_SendHead(req, "Diagnostics", WEBPAGE_NONE,
-            "body{max-width:750px}.ev{color:var(--mut);font-size:.85em}h3{margin:1em 0 .3em}h4{margin:.8em 0 .2em}"
-            "details.gp{border:1px solid var(--bd);border-radius:6px;margin:.6em 0;padding:0 .7em}"
-            "details.gp>summary{cursor:pointer;font-weight:bold;font-size:1.1em;padding:.5em 0}") != ESP_OK ||
-        Send(req,
+    if (Send(req, "<h3 id='provpoll'>Provider last poll</h3><table><tr><th>Item</th>") != ESP_OK)
+        return ESP_FAIL;
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++)
+        if (SendFormat(req, "<th>%s</th>", AircraftProviderType_Name((AircraftProviderType)p)) != ESP_OK)
+            return ESP_FAIL;
+    if (Send(req, "</tr>") != ESP_OK)
+        return ESP_FAIL;
+    static const char *const rows[] = {"Enabled now", "Last request", "Request URL (coordinates shortened)", "Outcome",
+                                       "HTTP status", "Body bytes (kept / received / Content-Length)", "Transport failure",
+                                       "Parse stages", "Last successful poll", "Last failed poll"};
+    char cell[200], esc[260], when[64];
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        if (SendFormat(req, "<tr><td>%s</td>", rows[r]) != ESP_OK)
+            return ESP_FAIL;
+        for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++) {
+            const AircraftProviderType t = (AircraftProviderType)p;
+            const ProviderPollDiag *d = &s_core->poll[p];
+            const bool any = s_core->havePoll[p] && d->polled;
+            cell[0] = 0;
+            if (r == 0) {
+                snprintf(cell, sizeof(cell), "%s", AircraftProvider_IsEnabled(t) ? "yes" : "no");
+            } else if (!s_core->havePoll[p]) {
+                snprintf(cell, sizeof(cell), "n/a (not recorded)");
+            } else if (!any) {
+                snprintf(cell, sizeof(cell), "no request this boot");
+            } else if (r == 1) {
+                const DiagStamp st = CoreStampAt(s_core, d->startUptimeS);
+                DiagTelemetry_FormatStampLocal(&st, when, sizeof(when));
+                snprintf(cell, sizeof(cell), "#%u at %s, %u ms", (unsigned)d->seq, when, (unsigned)d->durationMs);
+            } else if (r == 2) {
+                snprintf(cell, sizeof(cell), "GET %s", d->url);
+                LogCap_Redact(cell, strlen(cell)); /* same rule as the saved logs: one decimal of the position */
+            } else if (r == 3) {
+                snprintf(cell, sizeof(cell), "%s", ProviderPollOutcome_Name(d->outcome));
+            } else if (r == 4) {
+                if (d->httpStatus)
+                    snprintf(cell, sizeof(cell), "%d", d->httpStatus);
+                else
+                    snprintf(cell, sizeof(cell), "none (no HTTP response)");
+            } else if (r == 5) {
+                char cl[24];
+                if (d->contentLength >= 0)
+                    snprintf(cl, sizeof(cl), "%lld", (long long)d->contentLength);
+                else
+                    snprintf(cl, sizeof(cl), "unknown");
+                snprintf(cell, sizeof(cell), "%u / %u / %s%s%s", (unsigned)d->bytes, (unsigned)d->received, cl,
+                         d->truncated ? "; TRUNCATED (buffer full)" : "",
+                         d->fetchOutcome == PPOLL_FETCHED && !d->complete ? "; client reports incomplete" : "");
+            } else if (r == 6) {
+                if (d->transport == PXPORT_NONE)
+                    snprintf(cell, sizeof(cell), "none");
+                else
+                    snprintf(cell, sizeof(cell), "%s (esp_err 0x%x, esp-tls 0x%x)", ProviderTransportKind_Name(d->transport),
+                             (unsigned)d->espErr, (unsigned)d->tlsErr);
+            } else if (r == 7) {
+                if (!d->haveParse) {
+                    if ((d->outcome == PPOLL_JSON_INVALID || d->outcome == PPOLL_TRUNCATED) && d->jsonErrorOffset >= 0)
+                        snprintf(cell, sizeof(cell), "not parsed (JSON stopped near byte %d)", d->jsonErrorOffset);
+                    else
+                        snprintf(cell, sizeof(cell), "not parsed");
+                } else {
+                    const ProviderParseStats *ps = &d->parse;
+                    snprintf(cell, sizeof(cell), "%d entries: %d malformed, %d no id, %d no position, %d bad position, "
+                             "%d on ground (%d shown), %d not examined (list full); %d admitted",
+                             ps->entries, ps->malformed, ps->missingId, ps->missingPosition, ps->invalidPosition, ps->onGround,
+                             ps->groundShown, ps->notExamined, ps->admitted);
+                }
+            } else if (r == 8) {
+                if (d->haveSuccess) {
+                    const DiagStamp st = CoreStampAt(s_core, d->lastSuccessUptimeS);
+                    DiagTelemetry_FormatStampLocal(&st, cell, sizeof(cell));
+                } else {
+                    snprintf(cell, sizeof(cell), "none this boot");
+                }
+            } else {
+                if (d->haveError) {
+                    const DiagStamp st = CoreStampAt(s_core, d->lastErrorUptimeS);
+                    DiagTelemetry_FormatStampLocal(&st, when, sizeof(when));
+                    snprintf(cell, sizeof(cell), "%s; %s", when, d->lastError);
+                } else {
+                    snprintf(cell, sizeof(cell), "none this boot");
+                }
+            }
+            WebUtil_EscapeHtml(esc, sizeof(esc), cell);
+            if (SendFormat(req, "<td>%s</td>", esc) != ESP_OK)
+                return ESP_FAIL;
+        }
+        if (Send(req, "</tr>") != ESP_OK)
+            return ESP_FAIL;
+    }
+    return Send(req, "</table><p class='ev'>Recorded for every request whatever the Provider diagnostics level; the serial "
+                     "log adds detail by level (Normal: request lines, failures, adsb.lol heap before TLS; Verbose: parse "
+                     "stages; Raw: up to 8 record samples per poll). Parse stages count each array element once, at the "
+                     "first check it fails; \"not examined\" means the 200-aircraft list was already full.</p>");
+}
+
+/* The report body: everything after the page head. Rendered once per request, either to the browser (HTML) or
+ * through the export converter (0.1.7: ?fmt=txt / ?fmt=json). Values shown come from s_core or live getters. */
+static esp_err_t DiagReportBody(httpd_req_t *req)
+{
+    if (Send(req,
         "<h1>Runtime capacity report</h1>"
         "<p>Every value below is read live from this device right now - reload the page for a fresh "
         "snapshot. \"Since boot\" values reset on reboot, not on reload. This page adds negligible "
@@ -982,9 +1544,14 @@ static esp_err_t DiagPage(httpd_req_t *req)
         "for it. Copy the numbers below into a Claude conversation for capacity/design questions - see "
         "PROJECT_STATE.md's \"Runtime diagnostics\" section for what each row is used for.</p>") != ESP_OK)
         return ESP_FAIL;
+    if (!s_export &&
+        Send(req, "<p id='export'><b>Download this report:</b> <a href='/diag?fmt=txt'>plain text (.txt)</a> &middot; "
+                  "<a href='/diag?fmt=json'>JSON (.json)</a> <span class='ev'>- the same rows as this page, read when you "
+                  "click; nothing is reset. Format: README, \"Diagnostics export\".</span></p>") != ESP_OK)
+        return ESP_FAIL;
 
     // ---- Uptime / identity ----
-    int64_t uptimeUs = esp_timer_get_time();
+    int64_t uptimeUs = s_core->uptimeUs;
     // 80, not a tighter "reasonable" bound: gcc's -Werror=format-truncation
     // can't know esp_timer_get_time() won't return something huge, so it
     // sizes against %lld's full int64 range (up to 20 digits) for every one
@@ -1058,40 +1625,42 @@ static esp_err_t DiagPage(httpd_req_t *req)
     // ---- RAM ----
     if (GroupOpen(req, "memory", "Memory / Resources", true) != ESP_OK)
         return ESP_FAIL;
-    unsigned internalFree = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    unsigned internalLargest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    unsigned internalMinEver = (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    unsigned psramFree = (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    unsigned psramLargest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    unsigned psramMinEver = (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    unsigned internalFree = (unsigned)s_core->intFree;
+    unsigned internalLargest = (unsigned)s_core->intLargest;
+    unsigned internalMinEver = (unsigned)s_core->intMin;
+    unsigned psramFree = (unsigned)s_core->psFree;
+    unsigned psramLargest = (unsigned)s_core->psLargest;
+    unsigned psramMinEver = (unsigned)s_core->psMin;
     if (Send(req, "<h3>RAM</h3><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
         return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u bytes", internalFree);
     if (Row(req, "Internal heap free (now)", buf, "Measured (heap_caps_get_free_size)") != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u bytes", internalLargest);
     if (Row(req, "Internal heap largest free block", buf, "Measured (heap_caps_get_largest_free_block)") != ESP_OK) return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)s_core->dmaLargest);
     if (Row(req, "DMA-capable internal largest free block", buf,
             "Measured (MALLOC_CAP_DMA|INTERNAL). This, not the row above, limits TLS: hardware AES needs 1600-byte "
             "DMA bounce buffers. The row above can read ~7680 from the non-DMA RTC FAST region.") != ESP_OK) return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)s_core->dmaFree);
     if (Row(req, "DMA-capable internal free (now)", buf,
             "Measured (heap_caps_get_free_size, MALLOC_CAP_DMA|INTERNAL). Compare with the largest-block row: "
             "plenty free but a small largest block means fragmentation") != ESP_OK) return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)s_core->dmaMin);
     if (Row(req, "DMA-capable internal min-ever free (since boot)", buf,
             "Measured (heap_caps_get_minimum_free_size, MALLOC_CAP_DMA|INTERNAL)") != ESP_OK) return ESP_FAIL;
     {
-        uint32_t fails = ExpertDebug_FailedAllocCount();
-        snprintf(buf, sizeof(buf), "%u", (unsigned)fails);
+        uint32_t fails = s_core->fails;
+        FailedAllocText(buf, sizeof(buf));
         if (Row(req, "Failed heap allocations (since boot)", buf,
-                "Counted by the failed-allocation hook in every mode (details on the serial console only in Expert Debug)") != ESP_OK) return ESP_FAIL;
+                "Counted by the failed-allocation hook in every mode (details on the serial console only in Expert Debug). "
+                "Last-failure time: the hook stores the uptime (esp_timer, safe in that context); it is converted to "
+                "local time when this page is drawn, or shown as T+seconds while the clock is not synchronized") != ESP_OK) return ESP_FAIL;
         if (fails)
         {
             char task[20];
-            WebUtil_EscapeHtml(task, sizeof(task), ExpertDebug_LastFailedTask());
+            WebUtil_EscapeHtml(task, sizeof(task), s_core->failTask);
             snprintf(buf, sizeof(buf), "%u bytes, caps 0x%08x, task %s",
-                     (unsigned)ExpertDebug_LastFailedSize(), (unsigned)ExpertDebug_LastFailedCaps(), task);
+                     (unsigned)s_core->failSize, (unsigned)s_core->failCaps, task);
             if (Row(req, "Last failed allocation", buf,
                     "caps 0x80c = 8BIT|DMA|INTERNAL (Wi-Fi driver), 0x8 = DMA (AES), 0x808 = DMA|INTERNAL (SHA)") != ESP_OK) return ESP_FAIL;
         }
@@ -1104,7 +1673,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     if (Row(req, "PSRAM largest free block", buf, "Measured") != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u bytes", psramMinEver);
     if (Row(req, "PSRAM min-ever free (since boot)", buf, "Measured") != ESP_OK) return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    snprintf(buf, sizeof(buf), "%u bytes", (unsigned)s_core->httpdStackMin);
     if (Row(req, "This HTTP request's task, stack min-free (since boot)", buf,
             "Measured (uxTaskGetStackHighWaterMark; httpd task, stack_size=16384)") != ESP_OK ||
         Send(req, "</table>") != ESP_OK)
@@ -1205,12 +1774,12 @@ static esp_err_t DiagPage(httpd_req_t *req)
         return ESP_FAIL;
 
     // ---- Aircraft / tracking ----
-    if (GroupOpen(req, "radar", DiagTelemetry_NeedsAttention() ? "Radar / Provider <span style='color:#c00'>- ATTENTION</span>" : "Radar / Provider", true) != ESP_OK)
+    if (GroupOpen(req, "radar", CoreNeedsAttention(s_core) ? "Radar / Provider <span style='color:#c00'>- ATTENTION</span>" : "Radar / Provider", true) != ESP_OK)
         return ESP_FAIL;
-    int maxEver = GetMaxAircraftCountSinceBoot();
+    int maxEver = s_core->aircraftMax;
     if (Send(req, "<h3>Aircraft tracking</h3><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
         return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%d / %d", gAircraftCount, MAX_AIRCRAFT);
+    snprintf(buf, sizeof(buf), "%d / %d", s_core->aircraft, MAX_AIRCRAFT);
     if (Row(req, "Current aircraft / capacity", buf, "Measured / Calculated (gAircraftCount vs MAX_AIRCRAFT)") != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%d", maxEver);
     if (Row(req, "Max aircraft observed since boot", buf, "Measured (tracked since this build; see main.c)") != ESP_OK) return ESP_FAIL;
@@ -1218,7 +1787,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     if (Row(req, "gAircraft[] static allocation", buf, "Calculated (MAX_AIRCRAFT * sizeof(Aircraft))") != ESP_OK) return ESP_FAIL;
     if (Send(req, "</table>") != ESP_OK)
         return ESP_FAIL;
-    if (OpsSection(req) != ESP_OK || NorthRefSection(req) != ESP_OK)
+    if (OpsSection(req) != ESP_OK || ProviderPollSection(req) != ESP_OK || NorthRefSection(req) != ESP_OK)
         return ESP_FAIL;
 
     if (GroupClose(req) != ESP_OK)
@@ -1227,8 +1796,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     // ---- Configuration storage (custom rules, operators, airports, seen history) ----
     {
         // Open the Storage group automatically when the History index needs attention.
-        TfHistoryStats tfs;
-        TfHistory_GetStats(&tfs);
+        const TfHistoryStats tfs = s_core->tf;
         TfInitInfo tfi;
         TfHistory_GetInitInfo(&tfi);
         bool attention = tfs.indexLoadState == TF_LOAD_CAP || tfs.indexLoadState == TF_LOAD_WARN ||
@@ -1244,7 +1812,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     if (Row(req, "Operator rows / cap", buf, "Measured / Calculated") != ESP_OK) return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u", (unsigned)Airports_Count());
     if (Row(req, "Locations configured (airports & special air traffic, cap 100)", buf, "Measured") != ESP_OK) return ESP_FAIL;
-    snprintf(buf, sizeof(buf), "%u / %u", (unsigned)SeenAircraft_Count(), (unsigned)SEEN_MAX_RECORDS);
+    snprintf(buf, sizeof(buf), "%u / %u", (unsigned)s_core->seenCount, (unsigned)SEEN_MAX_RECORDS);
     if (Row(req, "Seen Aircraft records / cap", buf, "Measured / Calculated") != ESP_OK) return ESP_FAIL;
     if (Row(req, "Hot Seen eviction policy", SeenEvictionPolicy_Name(SeenAircraft_GetEvictionPolicy()),
             "Setting (NVS radar/seenpol); decides which record is dropped when the table is full") != ESP_OK) return ESP_FAIL;
@@ -1257,8 +1825,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
     // measure the incremental (dirty-records-only) rewrite that replaced
     // the original full-file-every-flush design. See PROJECT_STATE.md
     // "Persistence timing diagnostics".
-    SeenPersistStats ps;
-    SeenAircraft_GetPersistStats(&ps);
+    const SeenPersistStats ps = s_core->seen;
     if (Send(req, "<h3>Persistence (Seen history flush)</h3><table><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr>") != ESP_OK)
         return ESP_FAIL;
     snprintf(buf, sizeof(buf), "%u", (unsigned)ps.flushCount);
@@ -1315,7 +1882,7 @@ static esp_err_t DiagPage(httpd_req_t *req)
         return ESP_FAIL;
 
     // ---- TF (persistent) history ----
-    if (TfSection(req) != ESP_OK || FlushSection(req) != ESP_OK)
+    if (TfSection(req) != ESP_OK || FlushSection(req) != ESP_OK || LogSection(req) != ESP_OK)
         return ESP_FAIL;
 
     if (GroupClose(req) != ESP_OK)
@@ -1344,7 +1911,469 @@ static esp_err_t DiagPage(httpd_req_t *req)
         "</body></html>") != ESP_OK)
         return ESP_FAIL;
 
+    return ESP_OK;
+}
+
+/* ---- 0.1.7: /diag?fmt=txt | fmt=json ---- */
+
+static int ExportSink(void *ctx, const char *data, size_t len)
+{
+    return httpd_resp_send_chunk((httpd_req_t *)ctx, data, (ssize_t)len) == ESP_OK ? 0 : -1;
+}
+
+static void JsonU(DiagExport *ex, const char *key, uint64_t v, bool comma)
+{
+    DiagExport_Printf(ex, "%s\"%s\":%llu", comma ? "," : "", key, (unsigned long long)v);
+}
+
+static void JsonB(DiagExport *ex, const char *key, bool v, bool comma)
+{
+    DiagExport_Printf(ex, "%s\"%s\":%s", comma ? "," : "", key, v ? "true" : "false");
+}
+
+static void JsonS(DiagExport *ex, const char *key, const char *v, bool comma)
+{
+    DiagExport_Printf(ex, "%s\"%s\":", comma ? "," : "", key);
+    DiagExport_JsonString(ex, v);
+}
+
+/* "<key>_uptime_s":n,"<key>_utc":n|null[,"<key>_utc_null_reason":"..."] */
+static void JsonStamp(DiagExport *ex, const char *key, const DiagStamp *st, bool comma)
+{
+    DiagExport_Printf(ex, "%s\"%s_uptime_s\":%u,\"%s_utc\":", comma ? "," : "", key, (unsigned)st->uptimeSec, key);
+    if (st->utc > 0)
+        DiagExport_Printf(ex, "%lld", (long long)st->utc);
+    else
+        DiagExport_Printf(ex, "null,\"%s_utc_null_reason\":\"clock not synchronized when recorded\"", key);
+}
+
+static void JsonHeap(DiagExport *ex, const char *key, uint32_t freeB, uint32_t largest, uint32_t minEver, bool comma)
+{
+    DiagExport_Printf(ex, "%s\"%s\":{\"free_bytes\":%u,\"largest_free_block_bytes\":%u,\"min_ever_free_bytes\":%u}",
+                      comma ? "," : "", key, (unsigned)freeB, (unsigned)largest, (unsigned)minEver);
+}
+
+static const char *IndexLoadName(uint8_t st)
+{
+    return st == TF_LOAD_CAP ? "cap" : st == TF_LOAD_WARN ? "warn" : "ok";
+}
+
+/* 0.1.8 console-log capture: ,"log_capture":{...}. Counters are null (with a reason) while capture is not active. */
+static void JsonLogCapture(DiagExport *ex, const LogCaptureStatus *st)
+{
+    DiagExport_Write(ex, ",\"log_capture\":{");
+    JsonB(ex, "saved_setting", st->saved, false);
+    JsonB(ex, "active", st->active, true);
+    if (!st->active) {
+        JsonS(ex, "inactive_reason", st->inactiveReason ? st->inactiveReason : "", true);
+        DiagExport_Write(ex, ",\"counters\":null,\"counters_null_reason\":\"capture not active this boot\"}");
+        return;
+    }
+    const LogCapCounters *k = &st->ctr;
+    JsonS(ex, "writer_state", LogWriterState_Name(st->state), true);
+    JsonS(ex, "writer_reason", st->reason, true);
+    JsonU(ex, "boot", st->boot, true);
+    JsonU(ex, "segment", st->seg, true);
+    if (st->file[0]) {
+        JsonS(ex, "current_file", st->file, true);
+        JsonU(ex, "current_file_bytes", st->fileSize, true);
+    } else {
+        DiagExport_Write(ex, ",\"current_file\":null,\"current_file_bytes\":null,\"current_file_null_reason\":\"no file open yet\"");
+    }
+    DiagExport_Write(ex, ",\"counters\":{");
+    JsonU(ex, "buffer_bytes", st->ringSize, false);
+    JsonU(ex, "buffer_used_bytes", st->ringUsed, true);
+    JsonU(ex, "buffer_high_water_bytes", st->ringHighWater, true);
+    JsonU(ex, "lines", k->lines, true);
+    JsonU(ex, "bytes", k->bytes, true);
+    JsonU(ex, "dropped_full_lines", k->dropFullLines, true);
+    JsonU(ex, "dropped_full_bytes", k->dropFullBytes, true);
+    JsonU(ex, "dropped_busy_lines", k->dropBusyLines, true);
+    JsonU(ex, "dropped_context_lines", k->dropContextLines, true);
+    JsonU(ex, "dropped_storage_lock_lines", k->dropLockLines, true);
+    JsonU(ex, "writer_own_lines_not_saved", k->ownLines, true);
+    JsonU(ex, "truncated_lines", k->truncated, true);
+    JsonU(ex, "redactions", k->redactions, true);
+    JsonU(ex, "writes", st->writes, true);
+    JsonU(ex, "bytes_written", st->bytesWritten, true);
+    JsonU(ex, "write_errors", st->writeErrors, true);
+    JsonU(ex, "close_errors", st->closeErrors, true);
+    JsonU(ex, "lock_timeouts", st->lockTimeouts, true);
+    JsonU(ex, "files_created", st->filesCreated, true);
+    JsonU(ex, "files_deleted_by_retention", st->filesDeleted, true);
+    JsonU(ex, "retention_failures", st->retentionFailures, true);
+    JsonU(ex, "interrupted_logs_marked", st->interruptedMarked, true);
+    JsonU(ex, "space_suspensions", st->spaceSuspends, true);
+    JsonU(ex, "dma_deferred_write_cycles", st->deferredCycles, true);
+    JsonU(ex, "dma_deferral_episodes", st->deferEpisodes, true);
+    JsonU(ex, "dma_longest_deferral_s", st->longestDeferS, true);
+    DiagExport_Write(ex, "}");
+    JsonB(ex, "dma_deferring_now", st->deferring, true);
+    if (st->deferring)
+        JsonU(ex, "dma_deferring_since_uptime_s", st->deferStartS, true);
+    else
+        DiagExport_Write(ex, ",\"dma_deferring_since_uptime_s\":null,\"dma_deferring_since_uptime_s_null_reason\":\"not deferring\"");
+    JsonU(ex, "dma_min_block_for_writes_bytes", LOGCAP_DMA_MIN_BYTES, true);
+    if (st->haveFreeBytes)
+        JsonU(ex, "card_free_bytes_last_check", st->lastFreeBytes, true);
+    else
+        DiagExport_Write(ex, ",\"card_free_bytes_last_check\":null,\"card_free_bytes_last_check_null_reason\":\"not checked yet\"");
+    if (st->lastError[0]) {
+        JsonS(ex, "last_error", st->lastError, true);
+        JsonU(ex, "last_error_uptime_s", st->lastErrorUptimeS, true);
+    } else {
+        DiagExport_Write(ex, ",\"last_error\":null,\"last_error_null_reason\":\"no error since boot\"");
+    }
+    if (st->writerStackMinBytes)
+        JsonU(ex, "writer_stack_min_free_bytes", st->writerStackMinBytes, true);
+    else
+        DiagExport_Write(ex, ",\"writer_stack_min_free_bytes\":null,\"writer_stack_min_free_bytes_null_reason\":\"not measured yet\"");
+    DiagExport_Write(ex, "}");
+}
+
+/* 0.1.9: ,"last_poll":{...} for provider p, or null with a reason. */
+static void JsonLastPoll(DiagExport *ex, const DiagCore *c, int p)
+{
+    const ProviderPollDiag *d = &c->poll[p];
+    if (!c->havePoll[p] || !d->polled) {
+        DiagExport_Printf(ex, ",\"last_poll\":null,\"last_poll_null_reason\":\"%s\"",
+                          c->havePoll[p] ? "no request this boot" : "not recorded (no memory for the record)");
+        return;
+    }
+    char url[sizeof(d->url)];
+    snprintf(url, sizeof(url), "%s", d->url);
+    LogCap_Redact(url, strlen(url));
+    DiagExport_Write(ex, ",\"last_poll\":{");
+    JsonU(ex, "request_seq", d->seq, false);
+    JsonU(ex, "start_uptime_s", d->startUptimeS, true);
+    JsonU(ex, "duration_ms", d->durationMs, true);
+    JsonS(ex, "url_redacted", url, true);
+    JsonS(ex, "outcome", ProviderPollOutcome_Name(d->outcome), true);
+    JsonS(ex, "fetch_outcome", ProviderPollOutcome_Name(d->fetchOutcome), true);
+    if (d->httpStatus)
+        DiagExport_Printf(ex, ",\"http_status\":%d", d->httpStatus);
+    else
+        DiagExport_Write(ex, ",\"http_status\":null,\"http_status_null_reason\":\"no HTTP response\"");
+    JsonU(ex, "body_bytes_kept", d->bytes, true);
+    JsonU(ex, "body_bytes_received", d->received, true);
+    if (d->contentLength >= 0)
+        DiagExport_Printf(ex, ",\"content_length_bytes\":%lld", (long long)d->contentLength);
+    else
+        DiagExport_Write(ex, ",\"content_length_bytes\":null,\"content_length_bytes_null_reason\":\"not sent (chunked) or no response\"");
+    JsonB(ex, "truncated", d->truncated, true);
+    JsonB(ex, "client_reports_complete", d->complete, true);
+    JsonS(ex, "transport_failure", ProviderTransportKind_Name(d->transport), true);
+    DiagExport_Printf(ex, ",\"esp_err\":%d,\"esp_tls_error\":%d,\"esp_tls_flags\":%d", d->espErr, d->tlsErr, d->tlsFlags);
+    if (d->haveParse) {
+        const ProviderParseStats *s = &d->parse;
+        DiagExport_Printf(ex, ",\"parse\":{\"entries\":%d,\"malformed\":%d,\"missing_id\":%d,\"missing_position\":%d,"
+                              "\"invalid_position\":%d,\"on_ground\":%d,\"ground_shown\":%d,\"not_examined_list_full\":%d,"
+                              "\"admitted\":%d}",
+                          s->entries, s->malformed, s->missingId, s->missingPosition, s->invalidPosition, s->onGround,
+                          s->groundShown, s->notExamined, s->admitted);
+    } else {
+        DiagExport_Write(ex, ",\"parse\":null,\"parse_null_reason\":\"the response was not parsed (see outcome)\"");
+    }
+    if (d->jsonErrorOffset >= 0)
+        DiagExport_Printf(ex, ",\"json_error_offset\":%d", d->jsonErrorOffset);
+    if (d->haveSuccess)
+        JsonU(ex, "last_success_uptime_s", d->lastSuccessUptimeS, true);
+    else
+        DiagExport_Write(ex, ",\"last_success_uptime_s\":null,\"last_success_uptime_s_null_reason\":\"no successful poll this boot\"");
+    if (d->haveError) {
+        JsonU(ex, "last_error_uptime_s", d->lastErrorUptimeS, true);
+        JsonS(ex, "last_error", d->lastError, true);
+    } else {
+        DiagExport_Write(ex, ",\"last_error\":null,\"last_error_null_reason\":\"no failed poll this boot\"");
+    }
+    DiagExport_Write(ex, "}");
+}
+
+/* Typed core metrics (schema 1, documented in README "Diagnostics export"). Units are in the key names. */
+static void JsonMetrics(DiagExport *ex, const DiagCore *c)
+{
+    DiagExport_Write(ex, ",\n\"metrics\":{");
+    JsonS(ex, "firmware", FW_VERSION_STRING, false);
+    JsonU(ex, "uptime_s", (uint64_t)(c->uptimeUs / 1000000), true);
+    DiagExport_Write(ex, ",\"clock\":{");
+    JsonB(ex, "synced", c->utc > 0, false);
+    if (c->utc > 0)
+        DiagExport_Printf(ex, ",\"utc\":%lld", (long long)c->utc);
+    else
+        DiagExport_Write(ex, ",\"utc\":null,\"utc_null_reason\":\"clock not synchronized\"");
+    {
+        TimeZoneConfig tz;
+        TimeUtil_GetConfig(&tz);
+        JsonS(ex, "time_zone", tz.zoneId, true);
+        JsonB(ex, "auto_dst", tz.autoDst, true);
+        TimeLocal tl;
+        if (c->utc > 0 && TimeUtil_ToLocal(c->utc, &tl)) {
+            char local[48];
+            snprintf(local, sizeof(local), "%04d-%02d-%02d %02d:%02d:%02d %s", tl.year, tl.month, tl.day, tl.hour,
+                     tl.minute, tl.second, tl.abbr);
+            JsonS(ex, "local", local, true);
+            JsonB(ex, "dst_active", tl.isDst, true);
+            DiagExport_Printf(ex, ",\"utc_offset_min\":%d", tl.utcOffsetMinutes);
+        } else {
+            DiagExport_Write(ex, ",\"local\":null,\"dst_active\":null,\"utc_offset_min\":null,"
+                                 "\"local_null_reason\":\"clock not synchronized\"");
+        }
+    }
+    DiagExport_Write(ex, "},\"heap\":{");
+    JsonHeap(ex, "internal", c->intFree, c->intLargest, c->intMin, false);
+    JsonHeap(ex, "dma_internal", c->dmaFree, c->dmaLargest, c->dmaMin, true);
+    JsonHeap(ex, "psram", c->psFree, c->psLargest, c->psMin, true);
+    JsonU(ex, "httpd_stack_min_free_bytes", c->httpdStackMin, true);
+    DiagExport_Write(ex, "},\"heap_minimum_first_seen\":[");
+    static const char *const kHeapKey[DT_HEAP_COUNT] = {"internal", "dma_internal", "psram"};
+    for (int k = 0; k < DT_HEAP_COUNT; k++) {
+        DiagExport_Printf(ex, "%s{\"heap\":\"%s\"", k ? "," : "", kHeapKey[k]);
+        if (c->minHeapValid[k]) {
+            JsonU(ex, "min_free_bytes", c->minHeap[k].minFree, true);
+            JsonStamp(ex, "first_seen", &c->minHeap[k].when, true);
+        } else {
+            DiagExport_Write(ex, ",\"min_free_bytes\":null,\"min_free_bytes_null_reason\":\"not sampled yet\"");
+        }
+        DiagExport_Write(ex, "}");
+    }
+    DiagExport_Write(ex, "],\"stack_minimums\":[");
+    for (size_t i = 0; i < c->nStacks; i++) {
+        DiagExport_Printf(ex, "%s{", i ? "," : "");
+        JsonS(ex, "task", c->stacks[i].name, false);
+        JsonU(ex, "min_free_bytes", c->stacks[i].minFreeBytes, true);
+        JsonStamp(ex, "first_seen", &c->stacks[i].when, true);
+        DiagExport_Write(ex, "}");
+    }
+    DiagExport_Write(ex, "],\"failed_allocations\":{");
+    JsonU(ex, "count", c->fails, false);
+    if (!c->fails) {
+        DiagExport_Write(ex, ",\"last\":null,\"last_null_reason\":\"no failed allocation since boot\"}");
+    } else {
+        DiagExport_Write(ex, ",\"last\":{");
+        JsonU(ex, "size_bytes", c->failSize, false);
+        JsonU(ex, "caps", c->failCaps, true);
+        char hex[16];
+        snprintf(hex, sizeof(hex), "0x%08x", (unsigned)c->failCaps);
+        JsonS(ex, "caps_hex", hex, true);
+        JsonS(ex, "task", c->failTask, true);
+        if (c->failTimeValid) {
+            const DiagStamp st = {(uint32_t)(c->failUs / 1000000), CoreFailUtc(c)};
+            JsonStamp(ex, "at", &st, true);
+        } else {
+            DiagExport_Write(ex, ",\"at_uptime_s\":null,\"at_utc\":null,\"at_null_reason\":\"time of the last failure unavailable\"");
+        }
+        DiagExport_Write(ex, "}}");
+    }
+    DiagExport_Write(ex, ",\"operations\":[");
+    for (int i = 0; i < DT_OP_COUNT; i++) {
+        const DiagOpStats *o = &c->ops[i];
+        DiagExport_Printf(ex, "%s{", i ? "," : "");
+        JsonS(ex, "name", DiagTelemetry_OpName((DiagOp)i), false);
+        JsonU(ex, "runs", o->runs, true);
+        JsonU(ex, "ok", o->ok, true);
+        JsonU(ex, "failures", o->failures, true);
+        JsonU(ex, "skipped", o->skipped, true);
+        JsonU(ex, "consecutive_failures", o->consecutiveFailures, true);
+        if (o->runs) {
+            JsonU(ex, "last_ms", o->lastMs, true);
+            JsonU(ex, "worst_ms", o->worstMs, true);
+            JsonStamp(ex, "last_finish", &o->lastRun, true);
+            JsonStamp(ex, "worst_finish", &o->worstWhen, true);
+        } else {
+            DiagExport_Write(ex, ",\"last_ms\":null,\"worst_ms\":null,\"last_ms_null_reason\":\"no completed run since boot\"");
+        }
+        if (o->haveFailure) {
+            JsonS(ex, "last_failure", o->lastFailure, true);
+            JsonStamp(ex, "last_failure_at", &o->lastFailureWhen, true);
+        } else {
+            DiagExport_Write(ex, ",\"last_failure\":null");
+        }
+        DiagExport_Write(ex, "}");
+    }
+    DiagExport_Write(ex, "],\"providers\":[");
+    for (int p = 0; p < AIRCRAFT_PROVIDER_COUNT; p++) {
+        const AircraftProviderType t = (AircraftProviderType)p;
+        DiagExport_Printf(ex, "%s{", p ? "," : "");
+        JsonS(ex, "name", AircraftProviderType_Name(t), false);
+        JsonB(ex, "enabled", AircraftProvider_IsEnabled(t), true);
+        JsonU(ex, "interval_s", AircraftProvider_GetIntervalSeconds(t), true);
+        JsonU(ex, "rate_limit_backoff_s", AircraftProvider_GetRateLimitSecondsFor(t), true);
+        JsonS(ex, "fetch_operation", DiagTelemetry_OpName(t == AIRCRAFT_PROVIDER_ADSBLOL ? DT_OP_FETCH_ADSBLOL : DT_OP_FETCH_OPENSKY), true);
+        JsonLastPoll(ex, c, p);
+        DiagExport_Write(ex, "}");
+    }
+    DiagExport_Write(ex, "],\"aircraft\":{");
+    JsonU(ex, "current", (uint64_t)(c->aircraft > 0 ? c->aircraft : 0), false);
+    JsonU(ex, "capacity", MAX_AIRCRAFT, true);
+    JsonU(ex, "max_since_boot", (uint64_t)(c->aircraftMax > 0 ? c->aircraftMax : 0), true);
+    DiagExport_Write(ex, "},\"storage\":{\"tf\":{");
+    const TfHistoryStats *tf = &c->tf;
+    JsonB(ex, "mounted", tf->mounted, false);
+    JsonB(ex, "history_available", tf->historyAvailable, true);
+    if (tf->mounted) {
+        JsonU(ex, "capacity_bytes", tf->capacityBytes, true);
+        JsonU(ex, "used_bytes", tf->usedBytes, true);
+        JsonU(ex, "free_bytes", tf->freeBytes, true);
+    } else {
+        DiagExport_Write(ex, ",\"capacity_bytes\":null,\"used_bytes\":null,\"free_bytes\":null,"
+                             "\"capacity_bytes_null_reason\":\"card not mounted\"");
+    }
+    JsonU(ex, "index_slots_used", tf->indexSlotsUsed, true);
+    JsonU(ex, "index_slots_total", tf->indexSlotsTotal, true);
+    JsonS(ex, "index_load", IndexLoadName(tf->indexLoadState), true);
+    JsonU(ex, "writes", tf->writes, true);
+    JsonU(ex, "creates", tf->creates, true);
+    JsonU(ex, "lookups", tf->lookups, true);
+    JsonU(ex, "lookup_misses", tf->lookupMisses, true);
+    JsonU(ex, "io_or_crc_errors", tf->errors, true);
+    JsonU(ex, "index_insert_cap_rejected", tf->indexInsertCapRejected, true);
+    JsonU(ex, "index_insert_io_fail", tf->indexInsertIoFail, true);
+    DiagExport_Write(ex, "},\"history_manager\":{");
+    JsonU(ex, "shadow_slots_used", c->hm.shadowSlotsUsed, false);
+    JsonU(ex, "shadow_slots_cap", c->hm.shadowSlotsCap, true);
+    JsonU(ex, "dirty", c->hm.dirtyNow, true);
+    JsonU(ex, "evict_clean", c->hm.evictClean, true);
+    JsonU(ex, "evict_after_write", c->hm.evictAfterWrite, true);
+    JsonU(ex, "evict_write_fail", c->hm.evictWriteFail, true);
+    JsonU(ex, "admit_skipped", c->hm.admitSkipped, true);
+    DiagExport_Write(ex, "},\"seen\":{");
+    JsonU(ex, "records", c->seenCount, false);
+    JsonU(ex, "capacity", SEEN_MAX_RECORDS, true);
+    JsonU(ex, "flushes", c->seen.flushCount, true);
+    if (c->seen.flushCount) {
+        JsonU(ex, "last_flush_ms", c->seen.lastDurationMs, true);
+        JsonU(ex, "worst_flush_ms", c->seen.worstDurationMs, true);
+    } else {
+        DiagExport_Write(ex, ",\"last_flush_ms\":null,\"worst_flush_ms\":null,\"last_flush_ms_null_reason\":\"no flush since boot\"");
+    }
+    DiagExport_Write(ex, "}}");
+    JsonLogCapture(ex, &c->logcap);
+    DiagExport_Write(ex, "}");
+}
+
+/* Download file name: fr7-diag_<fw>_<local YYYYMMDD-HHMMSS> or _T<uptime>s when the clock is not synchronized. */
+static void ExportFileName(const DiagCore *c, bool json, char *out, size_t cap)
+{
+    char fw[24];
+    size_t n = 0;
+    for (const char *p = FW_VERSION_STRING; *p && n + 1 < sizeof(fw); p++)
+        fw[n++] = ((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '.' || *p == '-') ? *p : '_';
+    fw[n] = 0;
+    char when[24];
+    TimeLocal tl;
+    if (c->utc > 0 && TimeUtil_ToLocal(c->utc, &tl))
+        snprintf(when, sizeof(when), "%04d%02d%02d-%02d%02d%02d", tl.year, tl.month, tl.day, tl.hour, tl.minute, tl.second);
+    else
+        snprintf(when, sizeof(when), "T%llus", (unsigned long long)(c->uptimeUs / 1000000));
+    snprintf(out, cap, "attachment; filename=\"fr7-diag_%s_%s.%s\"", fw, when, json ? "json" : "txt");
+}
+
+static esp_err_t DiagExportRun(httpd_req_t *req, bool json)
+{
+    const DiagCore *c = s_core;
+    httpd_resp_set_type(req, json ? "application/json" : "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    ExportFileName(c, json, s_ctx->disposition, sizeof(s_ctx->disposition));
+    httpd_resp_set_hdr(req, "Content-Disposition", s_ctx->disposition);
+
+    DiagExport *ex = &s_ctx->ex;
+    DiagExport_Begin(ex, json ? DIAG_EXPORT_JSON : DIAG_EXPORT_TEXT, ExportSink, req);
+    char when[64];
+    const DiagStamp gen = {(uint32_t)(c->uptimeUs / 1000000), c->utc};
+    DiagTelemetry_FormatStampLocal(&gen, when, sizeof(when));
+    if (json) {
+        DiagExport_Write(ex, "{\"format\":\"flight-radar-7 diagnostics\",\"schema\":1,\"firmware\":");
+        DiagExport_JsonString(ex, FW_VERSION_STRING);
+        DiagExport_Printf(ex, ",\"generated\":{\"uptime_s\":%llu", (unsigned long long)(c->uptimeUs / 1000000));
+        if (c->utc > 0)
+            DiagExport_Printf(ex, ",\"utc\":%lld", (long long)c->utc);
+        else
+            DiagExport_Write(ex, ",\"utc\":null,\"utc_null_reason\":\"clock not synchronized\"");
+        JsonS(ex, "display", when, true);
+        DiagExport_Write(ex, ",\"note\":\"metrics were read once at the start of the export; report rows are rendered "
+                             "section by section right after (not one atomic snapshot)\"}");
+        JsonMetrics(ex, c);
+        DiagExport_Write(ex, ",\n\"report\":[");
+    } else {
+        DiagExport_Printf(ex, "Flight-radar-7 runtime diagnostics export (text, format 1)\nFirmware: %s\nGenerated: %s; uptime %llu s\n",
+                          FW_VERSION_STRING, when, (unsigned long long)(c->uptimeUs / 1000000));
+        DiagExport_Write(ex, "Note: memory, failed-allocation, minimum, operation, aircraft and storage counters were read once at "
+                             "the start; the other rows are read section by section while the report is generated "
+                             "(not one atomic snapshot). Table rows are \"cell | cell | cell\".\n");
+    }
+
+    s_export = ex;
+    const esp_err_t body = DiagReportBody(req);
+    s_export = NULL;
+    DiagExport_Finish(ex);
+    if (ex->failed)
+        return ESP_FAIL; /* client gone: nothing more can be sent, and no completion marker was written */
+
+    if (json)
+        DiagExport_Printf(ex, "\n],\"rows\":%u,\"items\":%u,\"render_ok\":%s%s,\"complete\":%s}\n",
+                          (unsigned)ex->rows, (unsigned)ex->items, body == ESP_OK ? "true" : "false",
+                          body == ESP_OK ? "" : ",\"render_error\":\"a report section could not be generated; the rows above are partial\"",
+                          body == ESP_OK ? "true" : "false");
+    else if (body == ESP_OK)
+        DiagExport_Printf(ex, "\n=== END OF REPORT (complete, %u table rows) ===\n", (unsigned)ex->rows);
+    else
+        DiagExport_Write(ex, "\n=== END OF REPORT (INCOMPLETE: a report section could not be generated; the rows above are partial) ===\n");
+    if (!DiagExport_Flush(ex))
+        return ESP_FAIL;
     return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static esp_err_t DiagPage(httpd_req_t *req)
+{
+    /* Directly URL-accessible (/diag); intentionally not one of the nav pages. */
+    char fmt[8] = "", logName[16] = "";
+    {
+        char q[96];
+        const size_t ql = httpd_req_get_url_query_len(req);
+        if (ql > 0 && ql < sizeof(q) && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+            (void)httpd_query_key_value(q, "fmt", fmt, sizeof(fmt));
+            const esp_err_t le = httpd_query_key_value(q, "log", logName, sizeof(logName));
+            if (le == ESP_ERR_NOT_FOUND)
+                logName[0] = 0;
+            else if (le != ESP_OK || !LogCap_ValidName(logName)) /* includes a truncated (too long) value */
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a console-log file name (L#######.LOG)");
+        }
+    }
+    const bool txt = strcmp(fmt, "txt") == 0, json = strcmp(fmt, "json") == 0;
+    if (fmt[0] && !txt && !json)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown export format (use fmt=txt or fmt=json)");
+
+    if (!s_ctx)
+        s_ctx = heap_caps_malloc(sizeof(*s_ctx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_ctx) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Diagnostics unavailable: no memory for the report context (%u bytes of PSRAM). "
+                                   "Nothing was changed; try again.", (unsigned)sizeof(DiagReportCtx));
+        return httpd_resp_sendstr(req, msg);
+    }
+    if (logName[0])
+        return LogDownload(req, logName); /* no report rendering; s_ctx supplies the 4 KB chunk buffer */
+    DiagCore_Collect(&s_ctx->core);
+    s_ctx->core.via = WebAccess_RequestInterface(req);
+    s_core = &s_ctx->core;
+
+    esp_err_t r;
+    if (txt || json) {
+        r = DiagExportRun(req, json);
+    } else {
+        r = WebStyle_SendHead(req, "Diagnostics", WEBPAGE_NONE,
+                "body{max-width:750px}.ev{color:var(--mut);font-size:.85em}h3{margin:1em 0 .3em}h4{margin:.8em 0 .2em}"
+                "details.gp{border:1px solid var(--bd);border-radius:6px;margin:.6em 0;padding:0 .7em}"
+                "details.gp>summary{cursor:pointer;font-weight:bold;font-size:1.1em;padding:.5em 0}");
+        if (r == ESP_OK)
+            r = DiagReportBody(req);
+        if (r == ESP_OK)
+            r = httpd_resp_send_chunk(req, NULL, 0);
+    }
+    s_core = NULL;
+    return r;
 }
 
 esp_err_t WebDiag_Register(httpd_handle_t server)

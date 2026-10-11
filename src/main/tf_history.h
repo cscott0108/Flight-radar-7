@@ -74,6 +74,24 @@ bool TfHistory_Init(void);
 /* False in every degraded case (absent, unmounted, full, index unusable). */
 bool TfHistory_IsAvailable(void);
 
+/* 0.1.8: shared access to the card for the console-log writer and the /diag log pages (log_capture.c).
+ * StorageLock takes the SAME recursive mutex that serializes every History operation, unmount and reinit,
+ * so log files are never touched while the card is being unmounted. Hold it only for file operations:
+ * never while sending an HTTP response or waiting for anything else. ms = UINT32_MAX waits forever. */
+bool TfHistory_StorageLock(uint32_t ms);
+void TfHistory_StorageUnlock(void);
+/* 0.1.8: true only when the CALLING task currently holds the storage lock. Read from the mutex itself
+ * (xSemaphoreGetMutexHolder on the device), so it cannot disagree with real ownership: only the calling task can
+ * make itself the holder. Used by the log hook to obey "never take the log-buffer lock while holding the TF
+ * lock". Task context only. */
+bool TfHistory_StorageLockHeldByMe(void);
+/* Filesystem mounted (independent of whether the History layer itself is usable). */
+bool TfHistory_IsMounted(void);
+/* Free bytes on the card right now (f_getfree). False when not mounted or unreadable. Caller holds the lock. */
+bool TfHistory_GetFreeBytes(uint64_t *out);
+/* "/sdcard" on the device. */
+const char *TfHistory_MountPoint(void);
+
 /* Finds the persisted record for icao24 in ANY bucket. Used to restore an
  * aircraft's true history when it returns after aging out of the RAM Hot
  * Seen cache (PROMPT.md section 19). */
@@ -85,6 +103,14 @@ bool TfHistory_Lookup(const char *icao24, TfHistoryRecord *out, uint32_t *bucket
  * responsible for coalescing - this always performs the write it is asked
  * to do (PROMPT.md section 23). */
 bool TfHistory_Upsert(uint32_t bucketFingerprint, const TfHistoryRecord *rec);
+/* 0.1.4: the same, with newRecord = true meaning "this is a new historical
+ * record for the aircraft" (History Manager: its call sign changed since the
+ * stored record). When the aircraft's current record is in the same bucket it
+ * is then NOT overwritten: the new record is appended and the index slot moves
+ * to it, exactly as for a move to another bucket, so the previous record stays
+ * on the card as superseded. New aircraft and bucket moves behave as before
+ * whatever newRecord is. TfHistory_Upsert() = newRecord false (unchanged). */
+bool TfHistory_UpsertRecord(uint32_t bucketFingerprint, const TfHistoryRecord *rec, bool newRecord);
 
 /* Rebuilds the index from scratch by scanning EVERY bucket file in the
  * history folder (special buckets and all operator-fingerprint buckets) and

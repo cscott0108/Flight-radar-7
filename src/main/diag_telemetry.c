@@ -41,7 +41,8 @@ static uint32_t s_lastMarkerSec = 0;
 static DiagTelemetryHooks s_hooks;
 
 static const char *const kOpName[DT_OP_COUNT] = {
-    "Provider refresh", "OpenSky OAuth token", "Seen flush (SPIFFS)", "History flush (TF)"};
+    "Provider refresh", "OpenSky OAuth token", "Seen flush (SPIFFS)", "History flush (TF)",
+    "OpenSky fetch", "adsb.lol fetch"};
 
 static uint32_t DefaultUpMs(void)
 {

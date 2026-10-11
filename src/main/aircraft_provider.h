@@ -276,7 +276,8 @@ uint32_t AircraftProvider_MinPollIntervalSeconds(void);
  * and redact credentials - see PROJECT_STATE.md "Provider diagnostics". */
 
 void ProviderDiag_RequestStart(const char *provider, const char *what, const char *urlRedacted);
-void ProviderDiag_RequestDone(const char *provider, const char *what, int httpStatus, size_t bytes, bool ok);
+/* 0.1.9: elapsedMs added to the existing Normal line (request start to the end of the response). */
+void ProviderDiag_RequestDone(const char *provider, const char *what, int httpStatus, size_t bytes, bool ok, uint32_t elapsedMs);
 void ProviderDiag_ParseResult(const char *provider, bool parseOk, int rawCount, int normalizedCount, int rejectedCount);
 void ProviderDiag_Warning(const char *provider, const char *msg);
 
@@ -293,6 +294,114 @@ void ProviderDiag_TypeResolution(
 /* Raw/Deep only: a bounded, credential-redacted preview of a response body.
  * Truncates internally; safe to pass the full buffer. */
 void ProviderDiag_RawPreview(const char *provider, const char *body, size_t bodyLen);
+
+/* ---- 0.1.9: per-provider poll diagnostics (recorded always, logged by level; /diag shows the latest) ----
+ *
+ * Request (fetch) stage, both providers: request number, start (uptime), duration, HTTP status, bytes stored,
+ * Content-Length, whether the response was truncated by the bounded response buffer, the transport failure kind
+ * (esp_http_client error) and the mbedTLS/esp-tls error code when the request failed. The URL recorded is the
+ * exact string handed to esp_http_client (esp_http_client_get_url() is NOT used: it drops the query string).
+ *
+ * Parse stage (one reason per array element; the first failing check wins, nothing is counted twice):
+ *   entries = malformed + missingId + missingPosition + invalidPosition + onGround + airborneAdmitted + notExamined
+ *   admitted = airborneAdmitted + groundShown        (groundShown is a subset of onGround)
+ * notExamined: elements never looked at because the 200-aircraft list was already full (partial result). */
+typedef struct {
+    int entries;         /* elements in the provider's aircraft array (0 for "states":null / "ac":null) */
+    int malformed;       /* element of the wrong JSON type (OpenSky: not an array; adsb.lol: not an object) */
+    int missingId;       /* no ICAO24 / hex string */
+    int missingPosition; /* latitude or longitude absent or not a number */
+    int invalidPosition; /* latitude/longitude not finite or outside -90..90 / -180..180 */
+    int onGround;        /* valid, excluded by the on-ground rule in the airborne pass */
+    int groundShown;     /* of onGround: shown by a ground visibility / retention policy (second pass) */
+    int notExamined;     /* never examined: the 200-aircraft list was full */
+    int admitted;        /* aircraft in this provider's list after parsing (before any cross-provider merge) */
+} ProviderParseStats;
+
+typedef enum {
+    PPOLL_NONE = 0,        /* nothing recorded yet */
+    PPOLL_OK,              /* aircraft list parsed */
+    PPOLL_OK_EMPTY,        /* valid response with no aircraft */
+    PPOLL_OK_PARTIAL,      /* parsed, but elements were left unexamined because the list was full */
+    PPOLL_FETCHED,         /* fetch stage only: HTTP 200 with a complete body (parse not yet recorded) */
+    PPOLL_JSON_INVALID,    /* the body is not valid JSON */
+    PPOLL_UNEXPECTED_SHAPE,/* valid JSON without the expected "states" / "ac" list */
+    PPOLL_HTTP_STATUS,     /* HTTP status other than 200 (not a rate limit) */
+    PPOLL_RATE_LIMITED,    /* 429 (adsb.lol also 503): the provider's back-off was started */
+    PPOLL_TRANSPORT,       /* esp_http_client_perform failed (see transport kind) */
+    PPOLL_TRUNCATED,       /* the body did not fit the bounded response buffer */
+    PPOLL_CLIENT_INIT,     /* the HTTP client could not be created */
+    PPOLL_IN_PROGRESS,     /* request started, no result yet (the fields below belong to it, not to the previous one) */
+    PPOLL_COUNT
+} ProviderPollOutcome;
+
+typedef enum {
+    PXPORT_NONE = 0,
+    PXPORT_TIMEOUT,     /* ESP_ERR_HTTP_EAGAIN / READ_TIMEOUT / CONNECTING (timed out before connecting) */
+    PXPORT_CONNECT,     /* ESP_ERR_HTTP_CONNECT: TCP or TLS connection failed (see tlsErr) */
+    PXPORT_INCOMPLETE,  /* ESP_ERR_HTTP_INCOMPLETE_DATA: less than Content-Length / last chunk */
+    PXPORT_CLOSED,      /* ESP_ERR_HTTP_CONNECTION_CLOSED */
+    PXPORT_HEADER,      /* ESP_ERR_HTTP_FETCH_HEADER */
+    PXPORT_WRITE,       /* ESP_ERR_HTTP_WRITE_DATA */
+    PXPORT_OTHER
+} ProviderTransportKind;
+
+typedef struct {
+    bool polled;               /* at least one request this boot */
+    uint32_t seq;              /* request number this boot (1 = first) */
+    uint32_t startUptimeS, durationMs;
+    char url[176];             /* as handed to the HTTP client (render it redacted: it holds the radar position) */
+    int httpStatus;            /* 0 = no HTTP response */
+    uint32_t bytes;            /* body bytes stored */
+    uint32_t received;         /* body bytes received (> bytes when truncated) */
+    int64_t contentLength;     /* -1 = not known (chunked or no response) */
+    bool complete;             /* esp_http_client_is_complete_data_received() after a successful perform */
+    bool truncated;
+    ProviderPollOutcome fetchOutcome, outcome; /* outcome = final (fetch, then parse) */
+    ProviderTransportKind transport;
+    int espErr, tlsErr, tlsFlags;
+    bool haveParse;
+    ProviderParseStats parse;
+    int jsonErrorOffset;       /* PPOLL_JSON_INVALID: byte offset where cJSON stopped, -1 unknown */
+    bool haveSuccess;
+    uint32_t lastSuccessUptimeS;
+    bool haveError;
+    char lastError[80];
+    uint32_t lastErrorUptimeS;
+} ProviderPollDiag;
+
+/* Filled by the provider clients (RadarTask). */
+typedef struct {
+    AircraftProviderType type;
+    uint32_t t0Ms;
+    int httpStatus;
+    uint32_t bytes, received;
+    int64_t contentLength;
+    bool complete, truncated;
+    int espErr, tlsErr, tlsFlags;
+    ProviderTransportKind transport;
+} ProviderFetch;
+
+const char *ProviderPollOutcome_Name(ProviderPollOutcome o);
+const char *ProviderTransportKind_Name(ProviderTransportKind k);
+/* Starts request #N (returns N) and records the URL. No allocation; never fails. */
+uint32_t ProviderDiag_FetchStart(ProviderFetch *f, AircraftProviderType type, const char *url);
+/* Records the fetch result. Logs at Normal only when the request did not succeed (outcome, transport kind,
+ * TLS code), and a detail line at Verbose. */
+void ProviderDiag_FetchEnd(const ProviderFetch *f, ProviderPollOutcome outcome);
+/* Records the parse result (final outcome) and logs the stage counts at Verbose. If the fetch stage flagged a
+ * truncated body, a failed parse is recorded as PPOLL_TRUNCATED. */
+void ProviderDiag_ParseStats(AircraftProviderType type, ProviderPollOutcome outcome, const ProviderParseStats *s,
+                             int jsonErrorOffset);
+/* Normal and above: the same heap figures OpenSky logs before its TLS session, for the other providers. */
+void ProviderDiag_HeapBeforeTls(const char *provider);
+/* Raw only: one bounded record sample (callers allow at most PROVIDER_DIAG_SAMPLES_MAX per poll). */
+#define PROVIDER_DIAG_SAMPLES_MAX 8
+void ProviderDiag_Sample(const char *provider, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* /diag: a copy of the latest record (false when none is available). */
+bool ProviderDiag_GetPoll(AircraftProviderType type, ProviderPollDiag *out);
+/* Allocates the record (PSRAM, once); called by AircraftProvider_Init. Without it nothing is recorded. */
+void ProviderPollDiag_Init(void);
 
 /* A provider position is usable only if it is a finite point on Earth. Out of
  * range values (a provider bug, a units mix-up, 1e999 overflowing to infinity)

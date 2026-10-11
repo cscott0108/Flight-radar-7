@@ -14,6 +14,8 @@
 #include "nvs.h"
 
 #include "adv_diag.h"
+#include "esp_timer.h"
+#include "failed_alloc_stamp.h"
 
 static const char *TAG = "EXPERT";
 
@@ -27,6 +29,7 @@ static DRAM_ATTR volatile uint32_t s_failedAllocCount;
 static DRAM_ATTR volatile uint32_t s_lastFailedSize;
 static DRAM_ATTR volatile uint32_t s_lastFailedCaps;
 static DRAM_ATTR char s_lastFailedTask[16];
+static DRAM_ATTR FailedAllocStamp s_lastFailedWhen; /* 0.1.6: uptime of the latest failure (see failed_alloc_stamp.h) */
 
 bool ExpertDebug_Active(void)
 {
@@ -51,6 +54,11 @@ uint32_t ExpertDebug_LastFailedCaps(void)
 const char *ExpertDebug_LastFailedTask(void)
 {
     return s_lastFailedTask;
+}
+
+bool ExpertDebug_LastFailedUptimeUs(int64_t *uptimeUs)
+{
+    return FailedAllocStamp_Read(&s_lastFailedWhen, uptimeUs);
 }
 
 bool ExpertDebug_GetSaved(void)
@@ -113,6 +121,9 @@ static IRAM_ATTR void FailedAllocHook(size_t size, uint32_t caps, const char *fu
 {
     s_lastFailedSize = (uint32_t)size;
     s_lastFailedCaps = caps;
+    /* 0.1.6: uptime only (IRAM systimer read, no lock); stored before the count so a reader that sees
+     * the new count normally sees this failure's time. Wall time is derived at /diag render. */
+    FailedAllocStamp_Record(&s_lastFailedWhen, esp_timer_get_time());
     uint32_t n = ++s_failedAllocCount;
 
     if (!spi_flash_cache_enabled())
